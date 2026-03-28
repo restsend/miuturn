@@ -1,0 +1,55 @@
+[package]
+name = "miuturn"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+async-trait = "0.1"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+hmac = "0.12"
+sha1 = "0.10"
+md5 = "0.7"
+hex = "0.4"
+base64 = "0.22"
+
+# TLS support
+tokio-rustls = "0.26"
+rustls = "0.23"
+pem = "3"
+rcgen = "0.11"
+
+# Prometheus metrics (custom implementation)
+prometheus = "0.13"
+
+# Time utilities
+time = "0.3"
+
+# CPU detection for worker pool sizing
+num_cpus = "0.2"
+
+# Session management for admin console
+axum-extra = { version = "0.9", features = ["cookie"] }
+
+[dev-dependencies]
+turn = "0.11"
+tokio-test = "0.4"
+tower = "0.5"
+anyhow = "1"
+webrtc-util = "0.12"
+futures = "0.3"
+
+[[test]]
+name = "integration_tests"
+path = "tests/integration_tests.rs"

@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>miuturn Admin | miuda.ai </title>
+    <style>
+        [x-cloak] {
+            display: none !important;
+        }
+    </style>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+
+<body class="bg-gray-900 text-gray-100 min-h-screen" x-data="adminApp()">
+    <nav class="bg-gray-800 border-b border-gray-700 px-6 py-4">
+        <div class="flex items-center justify-between">
+            <h1 class="text-xl font-bold text-blue-400">miuturn</h1>
+            <div class="flex items-center gap-4">
+                <a href="https://miuda.ai" target="_blank" class="text-sm text-blue-400 hover:text-blue-300">miuda.ai</a>
+                <span class="text-sm text-gray-400">Realm: <span x-text="realm" class="text-gray-200"></span></span>
+                <button @click="logout()"
+                    class="px-3 py-1 bg-red-600 hover:bg-red-700 rounded text-sm">Logout</button>
+            </div>
+        </div>
+    </nav>
+
+    <main class="p-6">
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                <div class="text-sm text-gray-400">Active Allocations</div>
+                <div class="text-3xl font-bold text-blue-400" x-text="stats.active_allocations">0</div>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                <div class="text-sm text-gray-400">Total Allocations</div>
+                <div class="text-3xl font-bold text-green-400" x-text="stats.total_allocations">0</div>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                <div class="text-sm text-gray-400">Total Bytes</div>
+                <div class="text-3xl font-bold text-purple-400" x-text="formatBytes(stats.total_bytes_relayed)">0</div>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                <div class="text-sm text-gray-400">Total Messages</div>
+                <div class="text-3xl font-bold text-yellow-400" x-text="stats.total_messages">0</div>
+            </div>
+        </div>
+
+        <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 mb-6">
+            <h2 class="font-semibold text-lg mb-4">Server Metrics</h2>
+            <canvas id="metricsChart" height="60"></canvas>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div class="bg-gray-800 rounded-lg border border-gray-700">
+                <div class="px-4 py-3 border-b border-gray-700 flex items-center justify-between">
+                    <h2 class="font-semibold text-lg">Users</h2>
+                    <button @click="showUserModal = true"
+                        class="px-3 py-1 bg-green-600 hover:bg-green-700 rounded text-sm">Add User</button>
+                </div>
+                <div class="p-4">
+                    <table class="w-full text-sm">
+                        <thead>
+                            <tr class="text-left text-gray-400 border-b border-gray-700">
+                                <th class="pb-2">Username</th>
+                                <th class="pb-2">Type</th>
+                                <th class="pb-2">Max Allocs</th>
+                                <th class="pb-2">Active</th>
+                                <th class="pb-2">Bandwidth</th>
+                                <th class="pb-2">Duration</th>
+                                <th class="pb-2">IP Whitelist</th>
+                                <th class="pb-2">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <template x-for="user in users" :key="user.username">
+                                <tr class="border-b border-gray-700/50">
+                                    <td class="py-2" x-text="user.username"></td>
+                                    <td class="py-2">
+                                        <span class="px-2 py-0.5 rounded text-xs"
+                                            :class="user.user_type === 'Temporary' ? 'bg-yellow-900 text-yellow-200' : user.user_type === 'ApiKey' ? 'bg-purple-900 text-purple-200' : 'bg-blue-900 text-blue-200'"
+                                            x-text="user.user_type"></span>
+                                    </td>
+                                    <td class="py-2" x-text="user.max_allocations"></td>
+                                    <td class="py-2" x-text="user.active_allocations || 0"></td>
+                                    <td class="py-2" x-text="user.bandwidth_limit ? formatBytes(user.bandwidth_limit) + '/s' : 'Unlimited'"></td>
+                                    <td class="py-2" x-text="user.max_allocation_duration_secs ? user.max_allocation_duration_secs + 's' : 'Default'"></td>
+                                    <td class="py-2 font-mono text-xs" x-text="user.ip_whitelist ? user.ip_whitelist.join(', ') : 'Any'"></td>
+                                    <td class="py-2">
+                                        <button @click="openEditUser(user)"
+                                            class="text-blue-400 hover:text-blue-300 mr-2">Edit</button>
+                                        <button @click="openDeleteUser(user.username)"
+                                            class="text-red-400 hover:text-red-300">Delete</button>
+                                    </td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="bg-gray-800 rounded-lg border border-gray-700">
+                <div class="px-4 py-3 border-b border-gray-700 flex items-center justify-between">
+                    <h2 class="font-semibold text-lg">ACL Rules</h2>
+                    <button @click="showAclModal = true"
+                        class="px-3 py-1 bg-green-600 hover:bg-green-700 rounded text-sm">Add Rule</button>
+                </div>
+                <div class="p-4">
+                    <table class="w-full text-sm">
+                        <thead>
+                            <tr class="text-left text-gray-400 border-b border-gray-700">
+                                <th class="pb-2">IP Range</th>
+                                <th class="pb-2">Action</th>
+                                <th class="pb-2">Priority</th>
+                                <th class="pb-2">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <template x-for="rule in acl_rules" :key="rule.ip_range + rule.priority">
+                                <tr class="border-b border-gray-700/50">
+                                    <td class="py-2 font-mono" x-text="rule.ip_range"></td>
+                                    <td class="py-2">
+                                        <span class="px-2 py-0.5 rounded text-xs"
+                                            :class="rule.action === 'Allow' ? 'bg-green-900 text-green-200' : 'bg-red-900 text-red-200'"
+                                            x-text="rule.action"></span>
+                                    </td>
+                                    <td class="py-2" x-text="rule.priority"></td>
+                                    <td class="py-2">
+                                        <button @click="openEditAcl(rule)"
+                                            class="text-blue-400 hover:text-blue-300 mr-2">Edit</button>
+                                        <button @click="openDeleteAcl(rule.ip_range, rule.priority)"
+                                            class="text-red-400 hover:text-red-300">Delete</button>
+                                    </td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <div x-show="showUserModal" x-cloak class="fixed inset-0 bg-black/50 flex items-center justify-center p-4">
+        <div class="bg-gray-800 rounded-lg p-6 w-[600px] border border-gray-700 max-h-[90vh] overflow-y-auto">
+            <h3 class="text-lg font-semibold mb-4">Add User</h3>
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Username</label>
+                    <input x-model="newUser.username" type="text"
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white">
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Password</label>
+                    <input x-model="newUser.password" type="password"
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white">
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Type</label>
+                    <select x-model="newUser.user_type" class="w-full bg-gray-700 rounded px-3 py-2 text-white">
+                        <option value="Fixed">Fixed</option>
+                        <option value="Temporary">Temporary</option>
+                        <option value="ApiKey">API Key</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Max Allocations</label>
+                    <input x-model="newUser.max_allocations" type="number" value="10"
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white">
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Bandwidth Limit (bytes/sec)</label>
+                    <input x-model="newUser.bandwidth_limit" type="number"
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white"
+                        placeholder="e.g., 1048576">
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Duration (secs)</label>
+                    <input x-model="newUser.max_allocation_duration_secs" type="number"
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white"
+                        placeholder="e.g., 600">
+                </div>
+                <div class="col-span-2">
+                    <label class="block text-sm text-gray-400 mb-1">IP Whitelist (comma-separated, empty = any)</label>
+                    <input x-model="newUser.ip_whitelist" type="text"
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white"
+                        placeholder="e.g., 192.168.1.1,10.0.0.0/8">
+                </div>
+                <div class="col-span-2 flex gap-2 justify-end pt-2">
+                    <button @click="showUserModal = false"
+                        class="px-4 py-2 bg-gray-600 hover:bg-gray-500 rounded">Cancel</button>
+                    <button @click="addUser()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded">Add</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div x-show="showAclModal" x-cloak class="fixed inset-0 bg-black/50 flex items-center justify-center">
+        <div class="bg-gray-800 rounded-lg p-6 w-96 border border-gray-700">
+            <h3 class="text-lg font-semibold mb-4">Add ACL Rule</h3>
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">IP Range (CIDR)</label>
+                    <input x-model="newAcl.ip_range" type="text" placeholder="192.168.1.0/24"
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white">
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Action</label>
+                    <select x-model="newAcl.action" class="w-full bg-gray-700 rounded px-3 py-2 text-white">
+                        <option value="Allow">Allow</option>
+                        <option value="Deny">Deny</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Priority</label>
+                    <input x-model="newAcl.priority" type="number" value="10"
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white">
+                </div>
+                <div class="flex gap-2 justify-end pt-2">
+                    <button @click="showAclModal = false"
+                        class="px-4 py-2 bg-gray-600 hover:bg-gray-500 rounded">Cancel</button>
+                    <button @click="addAcl()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded">Add</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div x-show="showDeleteModal" x-cloak class="fixed inset-0 bg-black/50 flex items-center justify-center">
+        <div class="bg-gray-800 rounded-lg p-6 w-96 border border-gray-700">
+            <h3 class="text-lg font-semibold mb-4 text-red-400">Confirm Delete</h3>
+            <div class="mb-6 text-gray-300">
+                <template x-if="deleteTarget.type === 'user'">
+                    <p>Are you sure you want to delete user <strong x-text="deleteTarget.username" class="text-white"></strong>?</p>
+                </template>
+                <template x-if="deleteTarget.type === 'acl'">
+                    <p>Are you sure you want to delete ACL rule <strong x-text="deleteTarget.ip_range" class="text-white"></strong> (priority: <span x-text="deleteTarget.priority"></span>)?</p>
+                </template>
+            </div>
+            <div class="flex gap-2 justify-end">
+                <button @click="showDeleteModal = false"
+                    class="px-4 py-2 bg-gray-600 hover:bg-gray-500 rounded">Cancel</button>
+                <button @click="confirmDelete()" class="px-4 py-2 bg-red-600 hover:bg-red-700 rounded">Delete</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit User Modal -->
+    <div x-show="showEditUserModal" x-cloak class="fixed inset-0 bg-black/50 flex items-center justify-center p-4">
+        <div class="bg-gray-800 rounded-lg p-6 w-[600px] border border-gray-700 max-h-[90vh] overflow-y-auto">
+            <h3 class="text-lg font-semibold mb-4">Edit User</h3>
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Username</label>
+                    <input x-model="editUser.username" type="text" disabled
+                        class="w-full bg-gray-600 rounded px-3 py-2 text-gray-400 cursor-not-allowed">
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Password (leave empty to keep unchanged)</label>
+                    <input x-model="editUser.password" type="password"
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white">
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Type</label>
+                    <select x-model="editUser.user_type" class="w-full bg-gray-700 rounded px-3 py-2 text-white">
+                        <option value="Fixed">Fixed</option>
+                        <option value="Temporary">Temporary</option>
+                        <option value="ApiKey">API Key</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Max Allocations</label>
+                    <input x-model="editUser.max_allocations" type="number"
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white">
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Bandwidth Limit (bytes/sec)</label>
+                    <input x-model="editUser.bandwidth_limit" type="number"
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white"
+                        placeholder="e.g., 1048576">
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Duration (secs)</label>
+                    <input x-model="editUser.max_allocation_duration_secs" type="number"
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white"
+                        placeholder="e.g., 600">
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">IP Whitelist (comma-separated)</label>
+                    <input x-model="editUser.ip_whitelist" type="text"
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white"
+                        placeholder="e.g., 192.168.1.1,10.0.0.0/8">
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Admin Access</label>
+                    <select x-model="editUser.is_admin" class="w-full bg-gray-700 rounded px-3 py-2 text-white">
+                        <option :value="true">Yes</option>
+                        <option :value="false">No</option>
+                    </select>
+                </div>
+                <div class="col-span-2 flex gap-2 justify-end pt-2">
+                    <button @click="showEditUserModal = false"
+                        class="px-4 py-2 bg-gray-600 hover:bg-gray-500 rounded">Cancel</button>
+                    <button @click="updateUser()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded">Update</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit ACL Modal -->
+    <div x-show="showEditAclModal" x-cloak class="fixed inset-0 bg-black/50 flex items-center justify-center p-4">
+        <div class="bg-gray-800 rounded-lg p-6 w-96 border border-gray-700">
+            <h3 class="text-lg font-semibold mb-4">Edit ACL Rule</h3>
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">IP Range (CIDR)</label>
+                    <input x-model="editAcl.ip_range" type="text"
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white">
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Action</label>
+                    <select x-model="editAcl.action" class="w-full bg-gray-700 rounded px-3 py-2 text-white">
+                        <option value="Allow">Allow</option>
+                        <option value="Deny">Deny</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-1">Priority</label>
+                    <input x-model="editAcl.priority" type="number"
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white">
+                </div>
+                <div class="flex gap-2 justify-end pt-2">
+                    <button @click="showEditAclModal = false"
+                        class="px-4 py-2 bg-gray-600 hover:bg-gray-500 rounded">Cancel</button>
+                    <button @click="updateAcl()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded">Update</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function adminApp() {
+            return {
+                stats: { total_allocations: 0, active_allocations: 0, total_bytes_relayed: 0, total_messages: 0 },
+                realm: '',
+                users: [],
+                acl_rules: [],
+                showUserModal: false,
+                showAclModal: false,
+                showDeleteModal: false,
+                showEditUserModal: false,
+                showEditAclModal: false,
+                deleteTarget: { type: '', username: '', ip_range: '', priority: null },
+                newUser: { username: '', password: '', user_type: 'Fixed', max_allocations: 10, bandwidth_limit: '', max_allocation_duration_secs: '', ip_whitelist: '' },
+                newAcl: { ip_range: '', action: 'Allow', priority: 10 },
+                editUser: { username: '', password: '', user_type: 'Fixed', max_allocations: 10, bandwidth_limit: '', max_allocation_duration_secs: '', ip_whitelist: '', is_admin: false },
+                editAcl: { ip_range: '', action: 'Allow', priority: 10 },
+                metricsChart: null,
+                lastBytes: 0,
+
+                async init() {
+                    await this.fetchStats();
+                    this.initChart();
+                    setInterval(() => this.fetchStats(), 5000);
+                    setInterval(() => this.updateChart(), 5000);
+                },
+
+                initChart() {
+                    const ctx = document.getElementById('metricsChart').getContext('2d');
+                    this.metricsChart = new Chart(ctx, {
+                        type: 'line',
+                        data: {
+                            labels: [],
+                            datasets: [{
+                                label: 'Throughput (bytes/5s)',
+                                data: [],
+                                borderColor: 'rgb(59, 130, 246)',
+                                backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                                fill: true,
+                                tension: 0.3,
+                                yAxisID: 'y'
+                            }, {
+                                label: 'Active Allocations',
+                                data: [],
+                                borderColor: 'rgb(34, 197, 94)',
+                                backgroundColor: 'rgba(34, 197, 94, 0.1)',
+                                fill: true,
+                                tension: 0.3,
+                                yAxisID: 'y1'
+                            }]
+                        },
+                        options: {
+                            responsive: true,
+                            interaction: {
+                                mode: 'index',
+                                intersect: false,
+                            },
+                            scales: {
+                                y: {
+                                    type: 'linear',
+                                    display: true,
+                                    position: 'left',
+                                    beginAtZero: true,
+                                    title: { display: true, text: 'Bytes/5s', color: 'rgba(255,255,255,0.5)' },
+                                    grid: { color: 'rgba(255,255,255,0.1)' },
+                                    ticks: { color: 'rgba(255,255,255,0.5)' }
+                                },
+                                y1: {
+                                    type: 'linear',
+                                    display: true,
+                                    position: 'right',
+                                    beginAtZero: true,
+                                    title: { display: true, text: 'Allocations', color: 'rgba(255,255,255,0.5)' },
+                                    grid: { drawOnChartArea: false },
+                                    ticks: { color: 'rgba(255,255,255,0.5)' }
+                                },
+                                x: {
+                                    grid: { color: 'rgba(255,255,255,0.1)' },
+                                    ticks: { color: 'rgba(255,255,255,0.5)' }
+                                }
+                            },
+                            plugins: {
+                                legend: { labels: { color: 'rgba(255,255,255,0.7)' } }
+                            }
+                        }
+                    });
+                },
+
+                updateChart() {
+                    if (!this.metricsChart) return;
+                    const now = new Date().toLocaleTimeString();
+                    const bytesDelta = this.stats.total_bytes_relayed - this.lastBytes;
+                    this.lastBytes = this.stats.total_bytes_relayed;
+
+                    this.metricsChart.data.labels.push(now);
+                    this.metricsChart.data.datasets[0].data.push(bytesDelta);
+                    this.metricsChart.data.datasets[1].data.push(this.stats.active_allocations);
+                    if (this.metricsChart.data.labels.length > 20) {
+                        this.metricsChart.data.labels.shift();
+                        this.metricsChart.data.datasets[0].data.shift();
+                        this.metricsChart.data.datasets[1].data.shift();
+                    }
+                    this.metricsChart.update();
+                },
+
+                async fetchStats() {
+                    try {
+                        const res = await fetch('/health');
+                        const data = await res.json();
+                        this.stats = data;
+                    } catch (e) {
+                        console.error('Failed to fetch health:', e);
+                    }
+
+                    try {
+                        const res = await fetch('/api/v1/stats');
+                        const data = await res.json();
+                        this.realm = data.realm || '';
+                        this.users = data.users || [];
+                        this.acl_rules = data.acl_rules || [];
+                    } catch (e) {
+                        console.error('Failed to fetch admin data:', e);
+                    }
+                },
+
+                formatBytes(bytes) {
+                    if (bytes === 0) return '0 B';
+                    const k = 1024;
+                    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+                    const i = Math.floor(Math.log(bytes) / Math.log(k));
+                    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+                },
+
+                async logout() {
+                    try {
+                        await fetch('/logout', {
+                            method: 'POST',
+                            credentials: 'same-origin'
+                        });
+                    } catch (e) {
+                        console.error('Failed to logout:', e);
+                    }
+                    window.location.href = '/console';
+                },
+
+                async addUser() {
+                    try {
+                        // Process the newUser data before sending
+                        const userData = {
+                            username: this.newUser.username,
+                            password: this.newUser.password,
+                            user_type: this.newUser.user_type,
+                            max_allocations: parseInt(this.newUser.max_allocations) || 10,
+                            bandwidth_limit: this.newUser.bandwidth_limit ? parseInt(this.newUser.bandwidth_limit) : null,
+                            max_allocation_duration_secs: this.newUser.max_allocation_duration_secs ? parseInt(this.newUser.max_allocation_duration_secs) : null,
+                            ip_whitelist: this.newUser.ip_whitelist ? this.newUser.ip_whitelist.split(',').map(ip => ip.trim()).filter(ip => ip) : null
+                        };
+                        const res = await fetch('/api/v1/users', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(userData)
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            this.showUserModal = false;
+                            this.newUser = { username: '', password: '', user_type: 'Fixed', max_allocations: 10, bandwidth_limit: '', max_allocation_duration_secs: '', ip_whitelist: '' };
+                            await this.fetchStats();
+                        }
+                    } catch (e) {
+                        console.error('Failed to add user:', e);
+                    }
+                },
+
+                async deleteUser(username) {
+                    try {
+                        await fetch(`/api/v1/users?username=${encodeURIComponent(username)}`, { method: 'DELETE' });
+                        await this.fetchStats();
+                    } catch (e) {
+                        console.error('Failed to delete user:', e);
+                    }
+                },
+
+                async addAcl() {
+                    try {
+                        const res = await fetch('/api/v1/acl', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(this.newAcl)
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            this.showAclModal = false;
+                            this.newAcl = { ip_range: '', action: 'Allow', priority: 10 };
+                            await this.fetchStats();
+                        }
+                    } catch (e) {
+                        console.error('Failed to add ACL:', e);
+                    }
+                },
+
+                async deleteAcl(ip_range, priority) {
+                    try {
+                        await fetch(`/api/v1/acl?ip_range=${encodeURIComponent(ip_range)}&priority=${priority}`, { method: 'DELETE' });
+                        await this.fetchStats();
+                    } catch (e) {
+                        console.error('Failed to delete ACL:', e);
+                    }
+                },
+
+                openDeleteUser(username) {
+                    this.deleteTarget = { type: 'user', username: username, ip_range: '', priority: null };
+                    this.showDeleteModal = true;
+                },
+
+                openDeleteAcl(ip_range, priority) {
+                    this.deleteTarget = { type: 'acl', username: '', ip_range: ip_range, priority: priority };
+                    this.showDeleteModal = true;
+                },
+
+                async confirmDelete() {
+                    if (this.deleteTarget.type === 'user') {
+                        await this.deleteUser(this.deleteTarget.username);
+                    } else if (this.deleteTarget.type === 'acl') {
+                        await this.deleteAcl(this.deleteTarget.ip_range, this.deleteTarget.priority);
+                    }
+                    this.showDeleteModal = false;
+                    this.deleteTarget = { type: '', username: '', ip_range: '', priority: null };
+                },
+
+                openEditUser(user) {
+                    this.editUser = {
+                        username: user.username,
+                        password: '',
+                        user_type: user.user_type,
+                        max_allocations: user.max_allocations,
+                        bandwidth_limit: user.bandwidth_limit || '',
+                        max_allocation_duration_secs: user.max_allocation_duration_secs || '',
+                        ip_whitelist: user.ip_whitelist ? user.ip_whitelist.join(', ') : '',
+                        is_admin: user.is_admin || false
+                    };
+                    this.showEditUserModal = true;
+                },
+
+                openEditAcl(rule) {
+                    this.editAcl = {
+                        original_ip_range: rule.ip_range,
+                        original_priority: rule.priority,
+                        ip_range: rule.ip_range,
+                        action: rule.action,
+                        priority: rule.priority
+                    };
+                    this.showEditAclModal = true;
+                },
+
+                async updateUser() {
+                    try {
+                        const userData = {
+                            username: this.editUser.username,
+                            password: this.editUser.password || undefined,
+                            user_type: this.editUser.user_type,
+                            max_allocations: parseInt(this.editUser.max_allocations) || 10,
+                            bandwidth_limit: this.editUser.bandwidth_limit ? parseInt(this.editUser.bandwidth_limit) : null,
+                            max_allocation_duration_secs: this.editUser.max_allocation_duration_secs ? parseInt(this.editUser.max_allocation_duration_secs) : null,
+                            ip_whitelist: this.editUser.ip_whitelist ? this.editUser.ip_whitelist.split(',').map(ip => ip.trim()).filter(ip => ip) : null,
+                            is_admin: this.editUser.is_admin
+                        };
+                        const res = await fetch('/api/v1/users', {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(userData)
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            this.showEditUserModal = false;
+                            await this.fetchStats();
+                        }
+                    } catch (e) {
+                        console.error('Failed to update user:', e);
+                    }
+                },
+
+                async updateAcl() {
+                    try {
+                        const res = await fetch('/api/v1/acl', {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                original_ip_range: this.editAcl.original_ip_range,
+                                original_priority: this.editAcl.original_priority,
+                                ip_range: this.editAcl.ip_range,
+                                action: this.editAcl.action,
+                                priority: parseInt(this.editAcl.priority) || 0
+                            })
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            this.showEditAclModal = false;
+                            await this.fetchStats();
+                        }
+                    } catch (e) {
+                        console.error('Failed to update ACL:', e);
+                    }
+                }
+            }
+        }
+    </script>
+</body>
+
+</html>
