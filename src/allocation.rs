@@ -277,11 +277,13 @@ pub struct AllocationTable {
     port_allocator: PortAllocator,
     addr: Ipv4Addr,
     realm: String,
-    stats: ServerStats,
+    stats: Arc<ServerStats>,
     max_concurrent_allocations: Option<usize>,
     max_allocation_duration_secs: Option<u32>,
     _current_bandwidth_bytes_per_sec: AtomicUsize,
     _max_bandwidth_bytes_per_sec: Option<usize>,
+    /// Bandwidth manager for tracking per-allocation bandwidth
+    bandwidth_manager: Arc<crate::bandwidth::BandwidthManager>,
 }
 
 #[derive(Debug)]
@@ -290,6 +292,17 @@ pub struct ServerStats {
     pub active_allocations: AtomicU64,
     pub total_bytes_relayed: AtomicU64,
     pub total_messages: AtomicU64,
+}
+
+impl Clone for ServerStats {
+    fn clone(&self) -> Self {
+        Self {
+            total_allocations: AtomicU64::new(self.total_allocations.load(Ordering::Relaxed)),
+            active_allocations: AtomicU64::new(self.active_allocations.load(Ordering::Relaxed)),
+            total_bytes_relayed: AtomicU64::new(self.total_bytes_relayed.load(Ordering::Relaxed)),
+            total_messages: AtomicU64::new(self.total_messages.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl Default for ServerStats {
@@ -340,11 +353,12 @@ impl AllocationTable {
             port_allocator: PortAllocator::new(49152, 65535),
             addr,
             realm,
-            stats: ServerStats::default(),
+            stats: Arc::new(ServerStats::default()),
             max_concurrent_allocations,
             max_allocation_duration_secs,
             _current_bandwidth_bytes_per_sec: AtomicUsize::new(0),
             _max_bandwidth_bytes_per_sec: max_bandwidth_bytes_per_sec,
+            bandwidth_manager: Arc::new(crate::bandwidth::BandwidthManager::new(None)),
         }
     }
 
@@ -363,16 +377,17 @@ impl AllocationTable {
             port_allocator: PortAllocator::new(min_port, max_port),
             addr,
             realm,
-            stats: ServerStats::default(),
+            stats: Arc::new(ServerStats::default()),
             max_concurrent_allocations,
             max_allocation_duration_secs,
             _current_bandwidth_bytes_per_sec: AtomicUsize::new(0),
             _max_bandwidth_bytes_per_sec: max_bandwidth_bytes_per_sec,
+            bandwidth_manager: Arc::new(crate::bandwidth::BandwidthManager::new(None)),
         }
     }
 
-    pub fn stats(&self) -> &ServerStats {
-        &self.stats
+    pub fn stats(&self) -> Arc<ServerStats> {
+        self.stats.clone()
     }
 
     pub async fn create_allocation(
@@ -432,7 +447,7 @@ impl AllocationTable {
 
         // Spawn the per-allocation task
         let relay =
-            spawn_allocation_task(relay_socket.clone(), client_addr, relayed_addr, &self.stats)
+            spawn_allocation_task(relay_socket.clone(), client_addr, relayed_addr, self.stats.clone())
                 .await;
 
         let allocation = Arc::new(RwLock::new(Allocation::with_relay(
@@ -451,6 +466,10 @@ impl AllocationTable {
         self.stats
             .active_allocations
             .fetch_add(1, Ordering::Relaxed);
+
+        // Register with bandwidth manager for tracking
+        self.bandwidth_manager
+            .register_allocation(&relayed_addr.to_string(), None);
 
         Ok(allocation)
     }
@@ -473,6 +492,9 @@ impl AllocationTable {
             self.stats
                 .active_allocations
                 .fetch_sub(1, Ordering::Relaxed);
+            // Unregister from bandwidth manager to prevent memory leak
+            self.bandwidth_manager
+                .unregister_allocation(&relayed_addr.to_string());
         }
         result
     }
@@ -561,8 +583,16 @@ impl AllocationTable {
             .collect();
 
         for addr in expired {
-            if allocations.remove(&addr).is_some() {
+            if let Some(alloc) = allocations.remove(&addr) {
+                // Abort the allocation task
+                if let Some(ref relay) = alloc.read().relay {
+                    relay.task_handle.abort();
+                }
+                // Release port back to allocator
                 self.port_allocator.release(addr.port());
+                // Unregister from bandwidth manager to prevent memory leak
+                self.bandwidth_manager
+                    .unregister_allocation(&addr.to_string());
                 count += 1;
             }
         }
@@ -595,15 +625,11 @@ async fn spawn_allocation_task(
     socket: Arc<UdpSocket>,
     client_addr: SocketAddr,
     _relayed_addr: SocketAddr,
-    stats: &ServerStats,
+    stats: Arc<ServerStats>,
 ) -> AllocationRelay {
     let (tx, mut rx) = mpsc::channel::<AllocationMessage>(1024);
 
     let socket_clone = socket.clone();
-    let stats_ref = unsafe {
-        // SAFETY: ServerStats lives as long as AllocationTable which lives as long as the server
-        &*(stats as *const ServerStats)
-    };
 
     let task_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
@@ -615,8 +641,8 @@ async fn spawn_allocation_task(
                     match result {
                         Ok((len, _peer_addr)) => {
                             // Update stats using atomics - no lock contention
-                            stats_ref.total_bytes_relayed.fetch_add(len as u64, Ordering::Relaxed);
-                            stats_ref.total_messages.fetch_add(1, Ordering::Relaxed);
+                            stats.total_bytes_relayed.fetch_add(len as u64, Ordering::Relaxed);
+                            stats.total_messages.fetch_add(1, Ordering::Relaxed);
 
                             // Forward to client as Data Indication
                             // For now, just forward raw data
@@ -678,6 +704,20 @@ pub struct ChannelBinding {
     pub relayed_addr: SocketAddr,
     pub created_at: Instant,
     pub lifetime: Duration,
+}
+
+impl ChannelBinding {
+    pub fn is_expired(&self) -> bool {
+        self.created_at.elapsed() > self.lifetime
+    }
+
+    pub fn remaining_lifetime(&self) -> u32 {
+        let elapsed = self.created_at.elapsed();
+        if elapsed >= self.lifetime {
+            return 0;
+        }
+        (self.lifetime - elapsed).as_secs() as u32
+    }
 }
 
 impl ChannelTable {
@@ -748,6 +788,25 @@ impl ChannelTable {
             self.next_channel = 0x4000;
         }
         id
+    }
+
+    /// Clean up expired channel bindings
+    /// Returns the number of expired channels removed
+    pub fn cleanup_expired(&self) -> usize {
+        let mut channels = self.channels.write();
+        let initial_count = channels.len();
+        channels.retain(|_, binding| !binding.is_expired());
+        initial_count.saturating_sub(channels.len())
+    }
+
+    /// Get the number of active channel bindings
+    pub fn len(&self) -> usize {
+        self.channels.read().len()
+    }
+
+    /// Check if there are no channel bindings
+    pub fn is_empty(&self) -> bool {
+        self.channels.read().is_empty()
     }
 }
 

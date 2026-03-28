@@ -3,10 +3,10 @@
 //! Provides OAuth 2.0 bearer token authentication and JWT validation.
 
 use hmac::{Hmac, Mac};
-use sha1::Sha1;
+use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-type HmacSha1 = Hmac<Sha1>;
+type HmacSha256 = Hmac<Sha256>;
 
 /// OAuth 2.0 configuration
 #[derive(Debug, Clone)]
@@ -108,7 +108,7 @@ impl OAuthValidator {
 
         // Verify signature
         let signature_input = format!("{}.{}", parts[0], parts[1]);
-        let expected_sig = compute_hmac_sha1(&signature_input, &self.config.jwt_secret);
+        let expected_sig = compute_hmac_sha256(&signature_input, &self.config.jwt_secret);
 
         // Decode provided signature
         let provided_sig = base64_decode(parts[2])?;
@@ -183,9 +183,9 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     Some(decoded)
 }
 
-// HMAC-SHA1 computation
-fn compute_hmac_sha1(message: &str, key: &str) -> Vec<u8> {
-    let mut mac = HmacSha1::new_from_slice(key.as_bytes()).unwrap();
+// HMAC-SHA256 computation
+fn compute_hmac_sha256(message: &str, key: &str) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).unwrap();
     mac.update(message.as_bytes());
     mac.finalize().into_bytes().to_vec()
 }
@@ -229,7 +229,7 @@ mod tests {
             format!(r#"{{"sub":"{}","exp":{}}}"#, user_id, exp),
         );
         let signature_input = format!("{}.{}", header, payload);
-        let sig = compute_hmac_sha1(&signature_input, secret);
+        let sig = compute_hmac_sha256(&signature_input, secret);
         let signature = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &sig);
         format!("{}.{}.{}", header, payload, signature)
     }
@@ -351,14 +351,14 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_hmac_sha1() {
-        let sig = compute_hmac_sha1("message", "key");
+    fn test_compute_hmac_sha256() {
+        let sig = compute_hmac_sha256("message", "key");
         assert!(!sig.is_empty());
         // Same input should produce same output
-        let sig2 = compute_hmac_sha1("message", "key");
+        let sig2 = compute_hmac_sha256("message", "key");
         assert_eq!(sig, sig2);
         // Different input should produce different output
-        let sig3 = compute_hmac_sha1("message", "key2");
+        let sig3 = compute_hmac_sha256("message", "key2");
         assert_ne!(sig, sig3);
     }
 
@@ -405,7 +405,7 @@ mod tests {
         );
 
         let signature_input = format!("{}.{}", header, payload);
-        let sig = compute_hmac_sha1(&signature_input, secret);
+        let sig = compute_hmac_sha256(&signature_input, secret);
         let signature = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &sig);
         let token = format!("{}.{}.{}", header, payload, signature);
 

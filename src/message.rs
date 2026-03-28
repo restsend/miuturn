@@ -99,6 +99,10 @@ impl MessageHeader {
         }
 
         // RFC 3489 format fallback
+        // Need at least 16 bytes for the transaction ID
+        if data.len() < 16 {
+            return None;
+        }
         let msg_type = u16::from_be_bytes([data[0], data[1]]);
         let first_byte = (msg_type >> 8) as u8;
         let second_byte = (msg_type & 0xFF) as u8;
@@ -185,9 +189,17 @@ impl Attribute {
         }
         let attr_type = u16::from_be_bytes([data[0], data[1]]);
         let length = u16::from_be_bytes([data[2], data[3]]) as usize;
-        if data.len() < 4 + length {
+
+        // Validate length - must not exceed remaining data
+        if length > data.len().saturating_sub(4) {
             return None;
         }
+
+        // Validate maximum reasonable attribute size (RFC 5389 says 65535 bytes)
+        if length > 65535 {
+            return None;
+        }
+
         let value = Bytes::copy_from_slice(&data[4..4 + length]);
         Some(Attribute { attr_type, value })
     }
@@ -298,19 +310,46 @@ pub struct Message {
 
 impl Message {
     pub fn parse(data: &[u8]) -> Option<Self> {
+        // Minimum STUN message size is 20 bytes (header only)
+        if data.len() < 20 {
+            return None;
+        }
+
         let header = MessageHeader::parse(data)?;
+
+        // Validate that the message length doesn't exceed the actual data
+        let total_length = 20 + header.message_length as usize;
+        if total_length > data.len() {
+            return None;
+        }
+
         let mut offset = 20;
+        let end_offset = total_length;
         let mut attributes = Vec::new();
-        while offset < 20 + header.message_length as usize {
-            if let Some(attr) = Attribute::decode(&data[offset..]) {
+
+        while offset < end_offset {
+            // Need at least 4 bytes for attribute header
+            if offset + 4 > end_offset {
+                return None;
+            }
+
+            if let Some(attr) = Attribute::decode(&data[offset..end_offset]) {
                 let attr_len = attr.value.len() + 4;
                 let padding = (4 - (attr_len % 4)) % 4;
+
+                // Check that padding doesn't overflow
+                let total_attr_size = attr_len.saturating_add(padding);
+                if total_attr_size == 0 || offset.saturating_add(total_attr_size) > end_offset {
+                    return None;
+                }
+
                 attributes.push(attr);
-                offset += attr_len + padding;
+                offset += total_attr_size;
             } else {
                 break;
             }
         }
+
         Some(Message { header, attributes })
     }
 

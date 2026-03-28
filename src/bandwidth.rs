@@ -17,7 +17,7 @@ pub struct BandwidthLimiter {
     /// Tokens added per second
     rate_bytes_per_sec: u64,
     /// Last update timestamp
-    last_update: Instant,
+    last_update: parking_lot::RwLock<Instant>,
 }
 
 impl BandwidthLimiter {
@@ -29,7 +29,7 @@ impl BandwidthLimiter {
             max_tokens: burst_bytes,
             tokens: AtomicU64::new(burst_bytes),
             rate_bytes_per_sec,
-            last_update: Instant::now(),
+            last_update: parking_lot::RwLock::new(Instant::now()),
         }
     }
 
@@ -39,7 +39,7 @@ impl BandwidthLimiter {
     pub fn try_consume(&self, size: usize) -> Option<u64> {
         let size = size as u64;
         let now = Instant::now();
-        let elapsed = now.duration_since(self.last_update);
+        let elapsed = now.duration_since(*self.last_update.read());
 
         // For very high rates, avoid overflow by using saturating arithmetic
         let tokens_to_add = elapsed
@@ -70,7 +70,8 @@ impl BandwidthLimiter {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    // Successfully consumed tokens
+                    // Successfully consumed tokens - update last_update
+                    *self.last_update.write() = now;
                     return Some(new_tokens);
                 }
                 Err(e) => current = e,
@@ -81,7 +82,7 @@ impl BandwidthLimiter {
     /// Get current available bandwidth (in bytes)
     pub fn available_tokens(&self) -> u64 {
         let now = Instant::now();
-        let elapsed = now.duration_since(self.last_update);
+        let elapsed = now.duration_since(*self.last_update.read());
         let tokens_to_add = elapsed.as_secs() * self.rate_bytes_per_sec;
         let current = self.tokens.load(Ordering::Relaxed);
         std::cmp::min(current + tokens_to_add, self.max_tokens)

@@ -50,8 +50,8 @@ impl Default for HttpConfig {
             turn_rest_enabled: Some(false),
             turn_rest_secret: None,
             turn_rest_default_lifetime: Some(3600),
-            admin_username: Some("admin".to_string()),
-            admin_password: Some("changeme".to_string()),
+            admin_username: None,
+            admin_password: None,
         }
     }
 }

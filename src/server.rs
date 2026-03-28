@@ -58,7 +58,7 @@ impl TurnServer {
         min_port: u16,
         max_port: u16,
     ) -> Self {
-        TurnServer {
+        let server = TurnServer {
             allocation_table: Arc::new(AllocationTable::with_port_range(
                 relay_addr,
                 realm.clone(),
@@ -74,7 +74,10 @@ impl TurnServer {
             nonce_map: Arc::new(RwLock::new(HashMap::new())),
             password: String::new(),
             auth_disabled: true,
-        }
+        };
+        server.start_nonce_cleanup_task();
+        server.start_channel_cleanup_task();
+        server
     }
 
     pub fn with_limits(
@@ -104,7 +107,7 @@ impl TurnServer {
         password: String,
         auth_disabled: bool,
     ) -> Self {
-        TurnServer {
+        let server = TurnServer {
             allocation_table: Arc::new(AllocationTable::with_limits(
                 relay_addr,
                 realm.clone(),
@@ -118,11 +121,74 @@ impl TurnServer {
             nonce_map: Arc::new(RwLock::new(HashMap::new())),
             password,
             auth_disabled,
-        }
+        };
+        server.start_nonce_cleanup_task();
+        server.start_channel_cleanup_task();
+        server
     }
 
     pub fn stats(&self) -> ServerStatsSnapshot {
         self.allocation_table.stats().snapshot()
+    }
+
+    /// Start a background task to clean up expired nonces
+    pub fn start_nonce_cleanup_task(&self) {
+        let nonce_map = self.nonce_map.clone();
+        const NONCE_EXPIRY_SECONDS: u64 = 60;
+        const CLEANUP_INTERVAL_SECONDS: u64 = 30;
+
+        // Check if we're running in a Tokio runtime context
+        if tokio::runtime::Handle::try_current().is_err() {
+            // Not in a runtime context, skip spawning (will be called again from run methods)
+            return;
+        }
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(CLEANUP_INTERVAL_SECONDS));
+            loop {
+                interval.tick().await;
+
+                let now = std::time::Instant::now();
+                let mut nonce_map = nonce_map.write();
+                let initial_count = nonce_map.len();
+                nonce_map.retain(|_, entry| {
+                    now.duration_since(entry.created_at).as_secs() < NONCE_EXPIRY_SECONDS
+                });
+                let removed_count = initial_count.saturating_sub(nonce_map.len());
+                drop(nonce_map);
+
+                if removed_count > 0 {
+                    tracing::debug!("Cleaned up {} expired nonces", removed_count);
+                }
+            }
+        });
+    }
+
+    /// Start a background task to clean up expired channel bindings
+    pub fn start_channel_cleanup_task(&self) {
+        let channel_table = self.channel_table.clone();
+        const CLEANUP_INTERVAL_SECONDS: u64 = 60; // Check every minute
+
+        // Check if we're running in a Tokio runtime context
+        if tokio::runtime::Handle::try_current().is_err() {
+            // Not in a runtime context, skip spawning (will be called again from run methods)
+            return;
+        }
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(CLEANUP_INTERVAL_SECONDS));
+            loop {
+                interval.tick().await;
+
+                let channel_table = channel_table.read().await;
+                let removed_count = channel_table.cleanup_expired();
+                drop(channel_table);
+
+                if removed_count > 0 {
+                    tracing::debug!("Cleaned up {} expired channel bindings", removed_count);
+                }
+            }
+        });
     }
 
     pub async fn run_tcp(
@@ -135,9 +201,17 @@ impl TurnServer {
             let (mut socket, peer_addr) = listener.accept().await?;
             let server = self.clone();
             tokio::spawn(async move {
+                const MAX_TCP_BUFFER_SIZE: usize = 10 * 1024 * 1024; // 10MB limit
                 let mut buf = BytesMut::with_capacity(65536);
                 loop {
                     buf.reserve(1024);
+
+                    // Check buffer size limit to prevent memory exhaustion
+                    if buf.capacity() > MAX_TCP_BUFFER_SIZE {
+                        error!("TCP buffer exceeded maximum size from {}", peer_addr);
+                        break;
+                    }
+
                     match socket.read_buf(&mut buf).await {
                         Ok(0) => break,
                         Ok(_n) => {
@@ -165,6 +239,10 @@ impl TurnServer {
         &self,
         addr: SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Start cleanup tasks now that we're in an async runtime context
+        self.start_nonce_cleanup_task();
+        self.start_channel_cleanup_task();
+
         let socket = Arc::new(UdpSocket::bind(addr).await?);
         info!("TURN UDP server listening on {}", addr);
 
