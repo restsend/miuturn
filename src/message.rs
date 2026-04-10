@@ -9,6 +9,7 @@ pub enum Method {
     Refresh = 0x0004,
     Send = 0x0006,
     Data = 0x0007,
+    CreatePermission = 0x0008,
     ChannelBind = 0x0009,
 }
 
@@ -77,6 +78,7 @@ impl MessageHeader {
                 0x0004 => Method::Refresh,
                 0x0006 => Method::Send,
                 0x0007 => Method::Data,
+                0x0008 => Method::CreatePermission,
                 0x0009 => Method::ChannelBind,
                 _ => return None,
             };
@@ -117,6 +119,7 @@ impl MessageHeader {
             0x0004 => Method::Refresh,
             0x0006 => Method::Send,
             0x0007 => Method::Data,
+            0x0008 => Method::CreatePermission,
             0x0009 => Method::ChannelBind,
             _ => return None,
         };
@@ -260,7 +263,7 @@ pub fn create_binding_response_fast(transaction_id: [u8; 12], client_addr: Socke
     buf.freeze()
 }
 
-pub fn encode_xor_address(addr: SocketAddr, magic_cookie: u32, tid: &[u8; 12]) -> Bytes {
+pub fn encode_xor_address(addr: SocketAddr, magic_cookie: u32, _tid: &[u8; 12]) -> Bytes {
     let mut buf = BytesMut::with_capacity(8);
     match addr {
         SocketAddr::V4(v4) => {
@@ -273,29 +276,25 @@ pub fn encode_xor_address(addr: SocketAddr, magic_cookie: u32, tid: &[u8; 12]) -
                 ip[2] ^ ((magic_cookie >> 8) as u8),
                 ip[3] ^ (magic_cookie as u8),
             ];
-            buf.put_u16(
-                v4.port() ^ (magic_cookie as u16 >> 1) ^ (u16::from_be_bytes([tid[10], tid[11]])),
-            );
+            buf.put_u16(v4.port() ^ (magic_cookie >> 16) as u16);
             buf.put_slice(&xored);
         }
         SocketAddr::V6(_) => {
             buf.put_u8(0); // byte 0: padding
             buf.put_u8(0x02); // byte 1: family
-            buf.put_u16(addr.port() ^ (magic_cookie as u16 >> 1));
+            buf.put_u16(addr.port() ^ (magic_cookie >> 16) as u16);
             buf.put_u32(0); // placeholder
         }
     }
     buf.freeze()
 }
 
-pub fn decode_xor_address(data: &[u8], magic_cookie: u32, tid: &[u8; 12]) -> Option<SocketAddr> {
+pub fn decode_xor_address(data: &[u8], magic_cookie: u32, _tid: &[u8; 12]) -> Option<SocketAddr> {
     if data.len() < 8 {
         return None;
     }
     let family = data[1];
-    let port = u16::from_be_bytes([data[2], data[3]])
-        ^ (magic_cookie as u16 >> 1)
-        ^ u16::from_be_bytes([tid[10], tid[11]]);
+    let port = u16::from_be_bytes([data[2], data[3]]) ^ (magic_cookie >> 16) as u16;
     if family == 0x01 {
         let mut ip = [0u8; 4];
         ip[0] = data[4] ^ ((magic_cookie >> 24) as u8);
@@ -523,7 +522,10 @@ mod tests {
 
         // 401: class=4, number=1 → u32 = (4 << 8) | 1 = 0x00000401
         assert_eq!(val.len(), 4 + "Unauthorized".len());
-        assert_eq!(u32::from_be_bytes([val[0], val[1], val[2], val[3]]), 0x00000401);
+        assert_eq!(
+            u32::from_be_bytes([val[0], val[1], val[2], val[3]]),
+            0x00000401
+        );
         assert_eq!(&val[4..], b"Unauthorized");
 
         // Verify 300 (TryAlternate): class=3, number=0 → 0x00000300

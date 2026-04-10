@@ -239,7 +239,7 @@ async fn test_add_user_api() {
                 .method("POST")
                 .uri("/api/v1/users")
                 .header("Content-Type", "application/json")
-                .body(Body::from(r#"{"username":"testuser","password":"testpass","user_type":"Fixed","max_allocations":20}"#))
+                .body(Body::from(r#"{"username":"testuser","password":"testpass","user_type":"fixed","max_allocations":20}"#))
                 .unwrap(),
         )
         .await
@@ -251,7 +251,7 @@ async fn test_add_user_api() {
     let data: serde_json::Value = serde_json::from_str(&body_str).unwrap();
     assert_eq!(data["success"], true);
     assert_eq!(data["user"]["username"], "testuser");
-    assert_eq!(data["user"]["user_type"], "Fixed");
+    assert_eq!(data["user"]["user_type"], "fixed");
     assert_eq!(data["user"]["max_allocations"], 20);
 }
 
@@ -419,7 +419,7 @@ async fn test_add_user_with_bandwidth_limit_api() {
                 .method("POST")
                 .uri("/api/v1/users")
                 .header("Content-Type", "application/json")
-                .body(Body::from(r#"{"username":"limiteduser","password":"testpass","user_type":"Fixed","max_allocations":5,"bandwidth_limit":1048576}"#))
+                .body(Body::from(r#"{"username":"limiteduser","password":"testpass","user_type":"fixed","max_allocations":5,"bandwidth_limit":1048576}"#))
                 .unwrap(),
         )
         .await
@@ -469,7 +469,7 @@ async fn test_add_user_with_ip_whitelist_api() {
                 .method("POST")
                 .uri("/api/v1/users")
                 .header("Content-Type", "application/json")
-                .body(Body::from(r#"{"username":"ipuser","password":"testpass","user_type":"Fixed","ip_whitelist":["192.168.1.0/24","10.0.0.1"]}"#))
+                .body(Body::from(r#"{"username":"ipuser","password":"testpass","user_type":"fixed","ip_whitelist":["192.168.1.0/24","10.0.0.1"]}"#))
                 .unwrap(),
         )
         .await
@@ -524,7 +524,7 @@ async fn test_add_user_with_max_allocation_duration_api() {
                 .method("POST")
                 .uri("/api/v1/users")
                 .header("Content-Type", "application/json")
-                .body(Body::from(r#"{"username":"durationuser","password":"testpass","user_type":"Fixed","max_allocation_duration_secs":600}"#))
+                .body(Body::from(r#"{"username":"durationuser","password":"testpass","user_type":"fixed","max_allocation_duration_secs":600}"#))
                 .unwrap(),
         )
         .await
@@ -579,7 +579,7 @@ async fn test_add_user_with_all_fields_api() {
                 .method("POST")
                 .uri("/api/v1/users")
                 .header("Content-Type", "application/json")
-                .body(Body::from(r#"{"username":"fulluser","password":"testpass","user_type":"Temporary","max_allocations":10,"bandwidth_limit":5242880,"max_allocation_duration_secs":3600,"ip_whitelist":["192.168.0.0/16"]}"#))
+                .body(Body::from(r#"{"username":"fulluser","password":"testpass","user_type":"temporary","max_allocations":10,"bandwidth_limit":5242880,"max_allocation_duration_secs":3600,"ip_whitelist":["192.168.0.0/16"]}"#))
                 .unwrap(),
         )
         .await
@@ -591,7 +591,7 @@ async fn test_add_user_with_all_fields_api() {
     let data: serde_json::Value = serde_json::from_str(&body_str).unwrap();
     assert_eq!(data["success"], true);
     assert_eq!(data["user"]["username"], "fulluser");
-    assert_eq!(data["user"]["user_type"], "Temporary");
+    assert_eq!(data["user"]["user_type"], "temporary");
     assert_eq!(data["user"]["max_allocations"], 10);
     assert_eq!(data["user"]["bandwidth_limit"], 5242880);
     assert_eq!(data["user"]["max_allocation_duration_secs"], 3600);

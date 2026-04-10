@@ -1,4 +1,5 @@
 use crate::allocation::{AllocationTable, ChannelTable, ServerStatsSnapshot};
+use crate::auth::AuthManager;
 use crate::message::{
     Attribute, ErrorCode, EventType, Message, MessageHeader, Method, encode_xor_address,
 };
@@ -24,6 +25,7 @@ pub struct TurnServer {
     nonce_map: Arc<RwLock<HashMap<String, NonceEntry>>>,
     password: String,
     auth_disabled: bool,
+    auth_manager: Option<Arc<AuthManager>>,
 }
 
 struct NonceEntry {
@@ -75,9 +77,11 @@ impl TurnServer {
             nonce_map: Arc::new(RwLock::new(HashMap::new())),
             password,
             auth_disabled: false,
+            auth_manager: None,
         };
         server.start_nonce_cleanup_task();
         server.start_channel_cleanup_task();
+        server.start_allocation_cleanup_task();
         server
     }
 
@@ -103,9 +107,11 @@ impl TurnServer {
             nonce_map: Arc::new(RwLock::new(HashMap::new())),
             password: String::new(),
             auth_disabled: true,
+            auth_manager: None,
         };
         server.start_nonce_cleanup_task();
         server.start_channel_cleanup_task();
+        server.start_allocation_cleanup_task();
         server
     }
 
@@ -150,14 +156,59 @@ impl TurnServer {
             nonce_map: Arc::new(RwLock::new(HashMap::new())),
             password,
             auth_disabled,
+            auth_manager: None,
         };
         server.start_nonce_cleanup_task();
         server.start_channel_cleanup_task();
+        server.start_allocation_cleanup_task();
         server
+    }
+
+    /// Set the auth manager for per-user password lookup
+    pub fn set_auth_manager(&mut self, auth_manager: Arc<AuthManager>) {
+        self.auth_manager = Some(auth_manager);
+    }
+
+    /// Look up password for a given username.
+    /// First tries auth_manager, then falls back to the global password.
+    fn get_password_for_user(&self, username: &str) -> Option<String> {
+        if let Some(ref am) = self.auth_manager {
+            if let Some(pw) = am.get_user_password(username) {
+                return Some(pw);
+            }
+        }
+        // Fallback to global password if non-empty
+        if !self.password.is_empty() {
+            Some(self.password.clone())
+        } else {
+            None
+        }
     }
 
     pub fn stats(&self) -> ServerStatsSnapshot {
         self.allocation_table.stats().snapshot()
+    }
+
+    /// Start a background task to clean up expired allocations
+    pub fn start_allocation_cleanup_task(&self) {
+        let allocation_table = self.allocation_table.clone();
+        const CLEANUP_INTERVAL_SECONDS: u64 = 30;
+
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(CLEANUP_INTERVAL_SECONDS));
+            loop {
+                interval.tick().await;
+                let removed_count = allocation_table.cleanup_expired();
+                if removed_count > 0 {
+                    tracing::info!("Cleaned up {} expired allocations", removed_count);
+                }
+            }
+        });
     }
 
     /// Start a background task to clean up expired nonces
@@ -173,7 +224,8 @@ impl TurnServer {
         }
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(CLEANUP_INTERVAL_SECONDS));
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(CLEANUP_INTERVAL_SECONDS));
             loop {
                 interval.tick().await;
 
@@ -205,7 +257,8 @@ impl TurnServer {
         }
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(CLEANUP_INTERVAL_SECONDS));
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(CLEANUP_INTERVAL_SECONDS));
             loop {
                 interval.tick().await;
 
@@ -247,9 +300,10 @@ impl TurnServer {
                             let data = buf.split().freeze();
                             if let Some(response) =
                                 handle_tcp_message(&data, &server, peer_addr).await
-                                && socket.write_all(&response).await.is_err() {
-                                    break;
-                                }
+                                && socket.write_all(&response).await.is_err()
+                            {
+                                break;
+                            }
                             if buf.is_empty() {
                                 break;
                             }
@@ -271,6 +325,7 @@ impl TurnServer {
         // Start cleanup tasks now that we're in an async runtime context
         self.start_nonce_cleanup_task();
         self.start_channel_cleanup_task();
+        self.start_allocation_cleanup_task();
 
         let socket = Arc::new(UdpSocket::bind(addr).await?);
         info!("TURN UDP server listening on {}", addr);
@@ -295,9 +350,10 @@ impl TurnServer {
                 while let Some((data, peer_addr)) = rx.recv().await {
                     if let Some(response) =
                         handle_udp_message(&socket, data, peer_addr, &server).await
-                        && let Err(e) = socket.send_to(&response, &peer_addr).await {
-                            error!("UDP send error: {}", e);
-                        }
+                        && let Err(e) = socket.send_to(&response, &peer_addr).await
+                    {
+                        error!("UDP send error: {}", e);
+                    }
                 }
             });
         }
@@ -357,18 +413,40 @@ async fn handle_udp_message(
     }
     let channel_num = (data[0] as u16) << 8 | (data[1] as u16);
     if (0x4000..=0x7FFF).contains(&channel_num) {
-        if let Some(relayed_addr) = server
+        let data_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+        let payload_end = 4 + data_len.min(data.len().saturating_sub(4));
+        let payload = data.slice(4..payload_end);
+
+        let has_allocation = server
             .allocation_table
             .find_allocation_by_client(&peer_addr)
-            && let Some(channel) = server
-                .channel_table
-                .read()
-                .await
-                .get_by_channel(channel_num)
-            {
-                let _ = socket.send_to(&data[4..], &channel.peer_addr).await;
-                let _ = socket.send_to(&data[4..], &relayed_addr).await;
+            .is_some();
+        let channel_binding = server
+            .channel_table
+            .read()
+            .await
+            .get_by_channel(channel_num);
+
+        if has_allocation && let Some(channel) = channel_binding {
+            // Get the relay socket from the allocation (must release lock before await)
+            let relay_socket = server
+                .allocation_table
+                .get_allocation_by_client(&peer_addr)
+                .and_then(|alloc| {
+                    let a = alloc.read();
+                    a.relay.as_ref().map(|r| r.socket.clone())
+                });
+
+            if let Some(relay_sock) = relay_socket {
+                let _ = relay_sock.send_to(&payload, &channel.peer_addr).await;
             }
+        } else {
+            tracing::debug!(
+                "ChannelData dropped: has_alloc={} binding={}",
+                has_allocation,
+                channel_binding.is_some()
+            );
+        }
         return None;
     }
 
@@ -445,7 +523,9 @@ async fn process_message(
         Method::Binding => handle_binding(msg, client_addr).await,
         Method::Allocate => handle_allocate(msg, server, client_addr).await,
         Method::Refresh => handle_refresh(msg, server, client_addr).await,
+        Method::CreatePermission => handle_create_permission(msg, server, client_addr).await,
         Method::ChannelBind => handle_channel_bind(msg, server, client_addr).await,
+        Method::Send => handle_send(msg, server, client_addr).await,
         _ => None,
     }
 }
@@ -519,60 +599,87 @@ fn verify_message_integrity(msg: &Message, key: &[u8]) -> bool {
     computed[..20] == integrity_attr.value[..20]
 }
 
+/// Verify TURN long-term credential auth (nonce + username + MESSAGE-INTEGRITY).
+/// Returns Ok(username) on success, or a 401 response bytes on failure.
+fn verify_turn_auth(msg: &Message, server: &TurnServer) -> Result<String, Bytes> {
+    if server.auth_disabled {
+        // Return username from attribute if present, or empty string
+        if let Some(username_attr) = msg.get_attribute(Attribute::USERNAME) {
+            return Ok(String::from_utf8_lossy(&username_attr.value).to_string());
+        }
+        return Ok(String::new());
+    }
+
+    let nonce_attr = msg.get_attribute(Attribute::NONCE);
+    let username_attr = msg.get_attribute(Attribute::USERNAME);
+
+    if nonce_attr.is_none() || username_attr.is_none() {
+        return Err(create_401_response(msg, server, None));
+    }
+
+    let nonce = String::from_utf8_lossy(&nonce_attr.unwrap().value).to_string();
+    let username = String::from_utf8_lossy(&username_attr.unwrap().value).to_string();
+
+    // Validate nonce exists and hasn't expired
+    let nonce_map = server.nonce_map.read();
+    if !nonce_map.contains_key(&nonce) {
+        drop(nonce_map);
+        return Err(create_401_response(
+            msg,
+            server,
+            Some("Invalid nonce".to_string()),
+        ));
+    }
+    let nonce_entry = nonce_map.get(&nonce).unwrap();
+    let nonce_age = nonce_entry.created_at.elapsed();
+    drop(nonce_map);
+
+    // Nonce expires after 60 seconds
+    if nonce_age.as_secs() > 60 {
+        return Err(create_401_response(
+            msg,
+            server,
+            Some("Nonce expired".to_string()),
+        ));
+    }
+
+    // Look up password for this user (from AuthManager or global password)
+    let password = match server.get_password_for_user(&username) {
+        Some(pw) => pw,
+        None => {
+            return Err(create_401_response(
+                msg,
+                server,
+                Some("Unknown user".to_string()),
+            ));
+        }
+    };
+
+    let key = compute_message_integrity_key(&username, &server.realm, &password);
+
+    if !verify_message_integrity(msg, &key) {
+        return Err(create_401_response(
+            msg,
+            server,
+            Some("Bad integrity".to_string()),
+        ));
+    }
+
+    // Do NOT remove the nonce after successful auth.
+    // The turn crate client reuses the same nonce for CreatePermission, ChannelBind, etc.
+    // Nonce will expire naturally after 60 seconds via the cleanup task.
+
+    Ok(username)
+}
+
 async fn handle_allocate(
     msg: Message,
     server: &TurnServer,
     client_addr: SocketAddr,
 ) -> Option<Bytes> {
-    let realm = server.realm.clone();
-
-    // Skip auth if disabled
-    if !server.auth_disabled {
-        let nonce_attr = msg.get_attribute(Attribute::NONCE);
-        let username_attr = msg.get_attribute(Attribute::USERNAME);
-
-        if nonce_attr.is_none() || username_attr.is_none() {
-            return Some(create_401_response(&msg, server, None));
-        }
-
-        let nonce = String::from_utf8_lossy(&nonce_attr.unwrap().value).to_string();
-        let username = String::from_utf8_lossy(&username_attr.unwrap().value).to_string();
-
-        // Validate nonce exists and hasn't expired
-        let nonce_map = server.nonce_map.read();
-        if !nonce_map.contains_key(&nonce) {
-            drop(nonce_map);
-            return Some(create_401_response(
-                &msg,
-                server,
-                Some("Invalid nonce".to_string()),
-            ));
-        }
-        let nonce_entry = nonce_map.get(&nonce).unwrap();
-        let nonce_age = nonce_entry.created_at.elapsed();
-        drop(nonce_map);
-
-        // Nonce expires after 60 seconds
-        if nonce_age.as_secs() > 60 {
-            return Some(create_401_response(
-                &msg,
-                server,
-                Some("Nonce expired".to_string()),
-            ));
-        }
-
-        let key = compute_message_integrity_key(&username, &realm, &server.password);
-
-        if !verify_message_integrity(&msg, &key) {
-            return Some(create_401_response(
-                &msg,
-                server,
-                Some("Bad integrity".to_string()),
-            ));
-        }
-
-        // Remove used nonce to prevent replay attacks
-        server.nonce_map.write().remove(&nonce);
+    // Verify auth
+    if let Err(resp) = verify_turn_auth(&msg, server) {
+        return Some(resp);
     }
 
     let lifetime = get_lifetime(&msg);
@@ -614,7 +721,7 @@ async fn handle_allocate(
     });
     response.attributes.push(Attribute {
         attr_type: Attribute::REALM,
-        value: Bytes::from(realm.as_bytes().to_vec()),
+        value: Bytes::from(server.realm.as_bytes().to_vec()),
     });
 
     Some(response.encode())
@@ -625,20 +732,87 @@ async fn handle_refresh(
     server: &TurnServer,
     client_addr: SocketAddr,
 ) -> Option<Bytes> {
+    // Verify auth
+    if let Err(resp) = verify_turn_auth(&msg, server) {
+        return Some(resp);
+    }
+
     let lifetime = get_lifetime(&msg);
     if let Some(relayed) = server
         .allocation_table
         .find_allocation_by_client(&client_addr)
-        && server
+    {
+        if server
             .allocation_table
-            .refresh_allocation(&relayed, lifetime).is_err()
+            .refresh_allocation(&relayed, lifetime)
+            .is_err()
         {
             return Some(create_error_response_bytes(
                 &msg,
                 ErrorCode::AllocationMismatch,
             ));
         }
-    None
+        // Return Refresh Success with LIFETIME
+        let mut response = crate::message::create_success_response(&msg.header);
+        response.attributes.push(Attribute {
+            attr_type: Attribute::LIFETIME,
+            value: Bytes::from(lifetime.to_be_bytes().to_vec()),
+        });
+        return Some(response.encode());
+    }
+    Some(create_error_response_bytes(
+        &msg,
+        ErrorCode::AllocationMismatch,
+    ))
+}
+
+/// Handle CreatePermission (RFC 5766 Section 9).
+/// Creates a permission for the client to send data to peers via the relay.
+async fn handle_create_permission(
+    msg: Message,
+    server: &TurnServer,
+    client_addr: SocketAddr,
+) -> Option<Bytes> {
+    // Verify auth
+    if let Err(resp) = verify_turn_auth(&msg, server) {
+        return Some(resp);
+    }
+
+    // Client must have an active allocation
+    if server
+        .allocation_table
+        .find_allocation_by_client(&client_addr)
+        .is_none()
+    {
+        return Some(create_error_response_bytes(
+            &msg,
+            ErrorCode::AllocationMismatch,
+        ));
+    }
+
+    // Parse XOR-PEER-ADDRESS attributes and add permissions
+    let mut peers = Vec::new();
+    for attr in &msg.attributes {
+        if attr.attr_type == Attribute::PEER_ADDRESS {
+            if let Some(peer_addr) = crate::message::decode_xor_address(
+                &attr.value,
+                0x2112A442,
+                &msg.header.transaction_id,
+            ) {
+                peers.push(peer_addr);
+            }
+        }
+    }
+
+    if peers.is_empty() {
+        return Some(create_error_response_bytes(&msg, ErrorCode::BadRequest));
+    }
+
+    server.allocation_table.add_permissions(&client_addr, &peers);
+
+    // Return CreatePermission Success
+    let response = crate::message::create_success_response(&msg.header);
+    Some(response.encode())
 }
 
 async fn handle_channel_bind(
@@ -646,6 +820,11 @@ async fn handle_channel_bind(
     server: &TurnServer,
     client_addr: SocketAddr,
 ) -> Option<Bytes> {
+    // Verify auth
+    if let Err(resp) = verify_turn_auth(&msg, server) {
+        return Some(resp);
+    }
+
     if let Some(relayed_addr) = server
         .allocation_table
         .find_allocation_by_client(&client_addr)
@@ -675,6 +854,39 @@ async fn handle_channel_bind(
             }
         }
     }
+    None
+}
+
+/// Handle Send Indication (RFC 5766 Section 11).
+/// Relays data from the client to a peer via the XOR-PEER-ADDRESS.
+async fn handle_send(
+    msg: Message,
+    server: &TurnServer,
+    client_addr: SocketAddr,
+) -> Option<Bytes> {
+    // Send indications don't require MESSAGE-INTEGRITY (they're indications, not requests)
+    // But the client must have an allocation
+    let _relayed_addr = server
+        .allocation_table
+        .find_allocation_by_client(&client_addr)?;
+
+    let peer_attr = msg.get_attribute(Attribute::PEER_ADDRESS)?;
+    let peer_addr = crate::message::decode_xor_address(
+        &peer_attr.value,
+        0x2112A442,
+        &msg.header.transaction_id,
+    )?;
+
+    let data_attr = msg.get_attribute(Attribute::DATA)?;
+    let data = &data_attr.value;
+
+    // Relay data through the allocation's relay socket (enforces permission check)
+    server
+        .allocation_table
+        .send_to_peer(&client_addr, peer_addr, data)
+        .await?;
+
+    // Send indication doesn't generate a response
     None
 }
 

@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .external_ip
         .parse()
         .unwrap_or(std::net::Ipv4Addr::new(0, 0, 0, 0));
-    let server = TurnServer::with_limits(
+    let mut server = TurnServer::with_limits(
         relay_addr,
         config.server.realm.clone(),
         config.server.max_concurrent_allocations,
@@ -61,13 +61,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let auth_manager: SharedAuthManager = Arc::new(AuthManager::new(config.server.realm.clone()));
 
+    // Set auth_manager so TURN protocol uses per-user passwords
+    server.set_auth_manager(auth_manager.clone());
+
+    let server = server; // remove mut
+
     for user_config in &config.auth.users {
         let user = User {
             username: user_config.username.clone(),
             password: user_config.password.clone(),
             user_type: match user_config.user_type.as_str() {
-                "Temporary" => UserType::Temporary,
-                "ApiKey" => UserType::ApiKey,
+                "temporary" => UserType::Temporary,
+                "api_key" => UserType::ApiKey,
                 _ => UserType::Fixed,
             },
             created_at: std::time::SystemTime::now()

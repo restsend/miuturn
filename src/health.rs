@@ -74,9 +74,9 @@ fn save_config(state: &AppState) -> Result<(), Box<dyn std::error::Error + Send 
             username: u.username,
             password: u.password,
             user_type: match u.user_type {
-                UserType::Temporary => "Temporary".to_string(),
-                UserType::Fixed => "Fixed".to_string(),
-                UserType::ApiKey => "ApiKey".to_string(),
+                UserType::Temporary => "temporary".to_string(),
+                UserType::Fixed => "fixed".to_string(),
+                UserType::ApiKey => "api_key".to_string(),
             },
             expires_at: u.expires_at,
             max_allocations: Some(u.max_allocations),
@@ -172,11 +172,15 @@ pub async fn create_admin_routes(
         .route("/api/reload", post(reload_handler))
         .route(
             "/api/v1/users",
-            post(add_user_handler).delete(delete_user_handler).put(update_user_handler),
+            post(add_user_handler)
+                .delete(delete_user_handler)
+                .put(update_user_handler),
         )
         .route(
             "/api/v1/acl",
-            post(add_acl_handler).delete(delete_acl_handler).put(update_acl_handler),
+            post(add_acl_handler)
+                .delete(delete_acl_handler)
+                .put(update_acl_handler),
         )
         .route("/api/v1/turn-credentials", post(turn_credentials_handler))
         .route("/logout", post(logout_handler))
@@ -194,7 +198,10 @@ async fn root_handler() -> Redirect {
     Redirect::to("/console")
 }
 
-async fn console_handler(jar: CookieJar, State(state): State<AppState>) -> impl axum::response::IntoResponse {
+async fn console_handler(
+    jar: CookieJar,
+    State(state): State<AppState>,
+) -> impl axum::response::IntoResponse {
     // If already authenticated, redirect to dashboard
     if check_auth(&jar, &state.admin) {
         return Redirect::to("/console/dashboard").into_response();
@@ -241,15 +248,17 @@ async fn login_handler(
 ) -> (CookieJar, Redirect) {
     if let (Some(username), Some(password)) =
         (&state.admin.admin_username, &state.admin.admin_password)
-        && form.username == *username && form.password == *password {
-            // Set session cookie
-            let cookie = Cookie::build((SESSION_COOKIE, SESSION_VALUE))
-                .path("/")
-                .http_only(true)
-                .same_site(axum_extra::extract::cookie::SameSite::Lax);
-            let jar = jar.add(cookie);
-            return (jar, Redirect::to("/console/dashboard"));
-        }
+        && form.username == *username
+        && form.password == *password
+    {
+        // Set session cookie
+        let cookie = Cookie::build((SESSION_COOKIE, SESSION_VALUE))
+            .path("/")
+            .http_only(true)
+            .same_site(axum_extra::extract::cookie::SameSite::Lax);
+        let jar = jar.add(cookie);
+        return (jar, Redirect::to("/console/dashboard"));
+    }
 
     (jar, Redirect::to("/console?error=1"))
 }
@@ -327,18 +336,20 @@ async fn api_login_handler(
 ) -> (CookieJar, Json<serde_json::Value>) {
     if let (Some(username), Some(password)) =
         (&state.admin.admin_username, &state.admin.admin_password)
-        && form.username == *username && form.password == *password {
-            // Set session cookie
-            let cookie = Cookie::build((SESSION_COOKIE, SESSION_VALUE))
-                .path("/")
-                .http_only(true)
-                .same_site(axum_extra::extract::cookie::SameSite::Lax);
-            let jar = jar.add(cookie);
-            return (
-                jar,
-                Json(serde_json::json!({"success": true, "token": "admin-token"})),
-            );
-        }
+        && form.username == *username
+        && form.password == *password
+    {
+        // Set session cookie
+        let cookie = Cookie::build((SESSION_COOKIE, SESSION_VALUE))
+            .path("/")
+            .http_only(true)
+            .same_site(axum_extra::extract::cookie::SameSite::Lax);
+        let jar = jar.add(cookie);
+        return (
+            jar,
+            Json(serde_json::json!({"success": true, "token": "admin-token"})),
+        );
+    }
 
     (
         jar,
@@ -403,8 +414,8 @@ async fn add_user_handler(
     }
 
     let user_type = match req.user_type.as_str() {
-        "Temporary" => UserType::Temporary,
-        "ApiKey" => UserType::ApiKey,
+        "temporary" => UserType::Temporary,
+        "api_key" => UserType::ApiKey,
         _ => UserType::Fixed,
     };
 
@@ -579,8 +590,8 @@ async fn update_user_handler(
 
     // Then add the updated user
     let user_type = match req.user_type.as_str() {
-        "Temporary" => UserType::Temporary,
-        "ApiKey" => UserType::ApiKey,
+        "temporary" => UserType::Temporary,
+        "api_key" => UserType::ApiKey,
         _ => UserType::Fixed,
     };
 
@@ -640,7 +651,9 @@ async fn update_acl_handler(
     }
 
     // Remove the old rule
-    state.auth.remove_acl_rule(&req.original_ip_range, req.original_priority);
+    state
+        .auth
+        .remove_acl_rule(&req.original_ip_range, req.original_priority);
 
     // Add the new rule
     let action = if req.action == "Allow" {
@@ -715,7 +728,6 @@ async fn turn_credentials_handler(
 async fn prometheus_metrics_handler(
     State(state): State<AppState>,
 ) -> impl axum::response::IntoResponse {
-    
     if let Some(metrics) = &state.metrics {
         metrics.export_prometheus()
     } else {

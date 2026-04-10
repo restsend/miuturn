@@ -55,6 +55,8 @@ pub struct Allocation {
     pub five_tuple: (SocketAddr, SocketAddr),
     /// Active relay connection (socket + task channel)
     pub relay: Option<AllocationRelay>,
+    /// Permitted peer addresses (IP-only, port is ignored per RFC 5766)
+    pub permissions: std::collections::HashSet<std::net::IpAddr>,
 }
 
 impl Allocation {
@@ -74,6 +76,7 @@ impl Allocation {
             lifetime,
             five_tuple: (src, dst),
             relay: None,
+            permissions: std::collections::HashSet::new(),
         }
     }
 
@@ -94,6 +97,7 @@ impl Allocation {
             lifetime,
             five_tuple: (src, dst),
             relay: Some(relay),
+            permissions: std::collections::HashSet::new(),
         }
     }
 
@@ -404,9 +408,10 @@ impl AllocationTable {
 
         let mut lifetime_secs = requested_lifetime.unwrap_or(600);
         if let Some(max_lifetime) = self.max_allocation_duration_secs
-            && lifetime_secs > max_lifetime {
-                lifetime_secs = max_lifetime;
-            }
+            && lifetime_secs > max_lifetime
+        {
+            lifetime_secs = max_lifetime;
+        }
         let lifetime = Duration::from_secs(lifetime_secs as u64);
 
         // Fast port allocation - O(1)
@@ -446,9 +451,13 @@ impl AllocationTable {
         getrandom(&mut id);
 
         // Spawn the per-allocation task
-        let relay =
-            spawn_allocation_task(relay_socket.clone(), client_addr, relayed_addr, self.stats.clone())
-                .await;
+        let relay = spawn_allocation_task(
+            relay_socket.clone(),
+            client_addr,
+            relayed_addr,
+            self.stats.clone(),
+        )
+        .await;
 
         let allocation = Arc::new(RwLock::new(Allocation::with_relay(
             id,
@@ -521,6 +530,81 @@ impl AllocationTable {
             if a.client_addr == *client_addr {
                 return Some(a.relayed_addr);
             }
+        }
+        None
+    }
+
+    /// Get the allocation for a client, returning the Arc for direct access
+    pub fn get_allocation_by_client(&self, client_addr: &SocketAddr) -> Option<Arc<RwLock<Allocation>>> {
+        let allocations = self.allocations.read();
+        for alloc in allocations.values() {
+            let a = alloc.read();
+            if a.client_addr == *client_addr {
+                return Some(alloc.clone());
+            }
+        }
+        None
+    }
+
+    /// Add permissions for peer addresses on a client's allocation
+    pub fn add_permissions(&self, client_addr: &SocketAddr, peers: &[SocketAddr]) -> bool {
+        let allocations = self.allocations.read();
+        for alloc in allocations.values() {
+            let mut a = alloc.write();
+            if a.client_addr == *client_addr {
+                for peer in peers {
+                    a.permissions.insert(peer.ip());
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a peer address is permitted for a client's allocation
+    pub fn check_permission(&self, client_addr: &SocketAddr, peer: &SocketAddr) -> bool {
+        let allocations = self.allocations.read();
+        for alloc in allocations.values() {
+            let a = alloc.read();
+            if a.client_addr == *client_addr {
+                return a.permissions.contains(&peer.ip());
+            }
+        }
+        false
+    }
+
+    /// Send data from a client's allocation relay to a peer
+    pub async fn send_to_peer(
+        &self,
+        client_addr: &SocketAddr,
+        peer: SocketAddr,
+        data: &[u8],
+    ) -> Option<()> {
+        // Look up the relay socket under lock, then release before await
+        let socket: Option<Arc<UdpSocket>> = {
+            let allocations = self.allocations.read();
+            let mut found = None;
+            for alloc in allocations.values() {
+                let a = alloc.read();
+                if a.client_addr == *client_addr {
+                    // Check permission
+                    if !a.permissions.contains(&peer.ip()) {
+                        return None;
+                    }
+                    // Clone the socket Arc so we can send after releasing the lock
+                    if let Some(ref relay) = a.relay {
+                        found = Some(relay.socket.clone());
+                    }
+                    break;
+                }
+            }
+            found
+        };
+        if let Some(socket) = socket {
+            let _ = socket.send_to(data, &peer).await;
+            self.stats.total_bytes_relayed.fetch_add(data.len() as u64, Ordering::Relaxed);
+            self.stats.total_messages.fetch_add(1, Ordering::Relaxed);
+            return Some(());
         }
         None
     }

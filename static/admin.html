@@ -20,10 +20,10 @@
         <div class="flex items-center justify-between">
             <h1 class="text-xl font-bold text-blue-400">miuturn</h1>
             <div class="flex items-center gap-4">
-                <a href="https://miuda.ai" target="_blank" class="text-sm text-blue-400 hover:text-blue-300">miuda.ai</a>
+                <a href="https://miuda.ai" target="_blank"
+                    class="text-sm text-blue-400 hover:text-blue-300">miuda.ai</a>
                 <span class="text-sm text-gray-400">Realm: <span x-text="realm" class="text-gray-200"></span></span>
-                <button @click="logout()"
-                    class="px-3 py-1 bg-red-600 hover:bg-red-700 rounded text-sm">Logout</button>
+                <button @click="logout()" class="px-3 py-1 bg-red-600 hover:bg-red-700 rounded text-sm">Logout</button>
             </div>
         </div>
     </nav>
@@ -85,9 +85,14 @@
                                     </td>
                                     <td class="py-2" x-text="user.max_allocations"></td>
                                     <td class="py-2" x-text="user.active_allocations || 0"></td>
-                                    <td class="py-2" x-text="user.bandwidth_limit ? formatBytes(user.bandwidth_limit) + '/s' : 'Unlimited'"></td>
-                                    <td class="py-2" x-text="user.max_allocation_duration_secs ? user.max_allocation_duration_secs + 's' : 'Default'"></td>
-                                    <td class="py-2 font-mono text-xs" x-text="user.ip_whitelist ? user.ip_whitelist.join(', ') : 'Any'"></td>
+                                    <td class="py-2"
+                                        x-text="user.bandwidth_limit ? formatBytes(user.bandwidth_limit) + '/s' : 'Unlimited'">
+                                    </td>
+                                    <td class="py-2"
+                                        x-text="user.max_allocation_duration_secs ? user.max_allocation_duration_secs + 's' : 'Default'">
+                                    </td>
+                                    <td class="py-2 font-mono text-xs"
+                                        x-text="user.ip_whitelist ? user.ip_whitelist.join(', ') : 'Any'"></td>
                                     <td class="py-2">
                                         <button @click="openEditUser(user)"
                                             class="text-blue-400 hover:text-blue-300 mr-2">Edit</button>
@@ -159,9 +164,9 @@
                 <div>
                     <label class="block text-sm text-gray-400 mb-1">Type</label>
                     <select x-model="newUser.user_type" class="w-full bg-gray-700 rounded px-3 py-2 text-white">
-                        <option value="Fixed">Fixed</option>
-                        <option value="Temporary">Temporary</option>
-                        <option value="ApiKey">API Key</option>
+                        <option value="fixed">Fixed</option>
+                        <option value="temporary">Temporary</option>
+                        <option value="api_key">API Key</option>
                     </select>
                 </div>
                 <div>
@@ -172,14 +177,12 @@
                 <div>
                     <label class="block text-sm text-gray-400 mb-1">Bandwidth Limit (bytes/sec)</label>
                     <input x-model="newUser.bandwidth_limit" type="number"
-                        class="w-full bg-gray-700 rounded px-3 py-2 text-white"
-                        placeholder="e.g., 1048576">
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white" placeholder="e.g., 1048576">
                 </div>
                 <div>
                     <label class="block text-sm text-gray-400 mb-1">Duration (secs)</label>
                     <input x-model="newUser.max_allocation_duration_secs" type="number"
-                        class="w-full bg-gray-700 rounded px-3 py-2 text-white"
-                        placeholder="e.g., 600">
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white" placeholder="e.g., 600">
                 </div>
                 <div class="col-span-2">
                     <label class="block text-sm text-gray-400 mb-1">IP Whitelist (comma-separated, empty = any)</label>
@@ -231,10 +234,12 @@
             <h3 class="text-lg font-semibold mb-4 text-red-400">Confirm Delete</h3>
             <div class="mb-6 text-gray-300">
                 <template x-if="deleteTarget.type === 'user'">
-                    <p>Are you sure you want to delete user <strong x-text="deleteTarget.username" class="text-white"></strong>?</p>
+                    <p>Are you sure you want to delete user <strong x-text="deleteTarget.username"
+                            class="text-white"></strong>?</p>
                 </template>
                 <template x-if="deleteTarget.type === 'acl'">
-                    <p>Are you sure you want to delete ACL rule <strong x-text="deleteTarget.ip_range" class="text-white"></strong> (priority: <span x-text="deleteTarget.priority"></span>)?</p>
+                    <p>Are you sure you want to delete ACL rule <strong x-text="deleteTarget.ip_range"
+                            class="text-white"></strong> (priority: <span x-text="deleteTarget.priority"></span>)?</p>
                 </template>
             </div>
             <div class="flex gap-2 justify-end">
@@ -263,9 +268,9 @@
                 <div>
                     <label class="block text-sm text-gray-400 mb-1">Type</label>
                     <select x-model="editUser.user_type" class="w-full bg-gray-700 rounded px-3 py-2 text-white">
-                        <option value="Fixed">Fixed</option>
-                        <option value="Temporary">Temporary</option>
-                        <option value="ApiKey">API Key</option>
+                        <option value="fixed">Fixed</option>
+                        <option value="temporary">Temporary</option>
+                        <option value="api_key">API Key</option>
                     </select>
                 </div>
                 <div>
@@ -276,14 +281,12 @@
                 <div>
                     <label class="block text-sm text-gray-400 mb-1">Bandwidth Limit (bytes/sec)</label>
                     <input x-model="editUser.bandwidth_limit" type="number"
-                        class="w-full bg-gray-700 rounded px-3 py-2 text-white"
-                        placeholder="e.g., 1048576">
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white" placeholder="e.g., 1048576">
                 </div>
                 <div>
                     <label class="block text-sm text-gray-400 mb-1">Duration (secs)</label>
                     <input x-model="editUser.max_allocation_duration_secs" type="number"
-                        class="w-full bg-gray-700 rounded px-3 py-2 text-white"
-                        placeholder="e.g., 600">
+                        class="w-full bg-gray-700 rounded px-3 py-2 text-white" placeholder="e.g., 600">
                 </div>
                 <div>
                     <label class="block text-sm text-gray-400 mb-1">IP Whitelist (comma-separated)</label>
@@ -301,7 +304,8 @@
                 <div class="col-span-2 flex gap-2 justify-end pt-2">
                     <button @click="showEditUserModal = false"
                         class="px-4 py-2 bg-gray-600 hover:bg-gray-500 rounded">Cancel</button>
-                    <button @click="updateUser()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded">Update</button>
+                    <button @click="updateUser()"
+                        class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded">Update</button>
                 </div>
             </div>
         </div>

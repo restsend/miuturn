@@ -66,7 +66,7 @@ turn_rest_default_lifetime = 3600
 [[auth.users]]
 username = "regular_user"
 password = "userpass"
-user_type = "Fixed"
+user_type = "fixed"
 max_allocations = 5
 bandwidth_limit = 1048576  # 1 MB/s limit
 ip_whitelist = ["192.168.0.0/16"]
@@ -74,7 +74,7 @@ ip_whitelist = ["192.168.0.0/16"]
 [[auth.users]]
 username = "temp_user"
 password = "temp123"
-user_type = "Temporary"
+user_type = "temporary"
 expires_at = 1735689600
 max_allocations = 2
 

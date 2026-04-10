@@ -22,7 +22,7 @@ address = "0.0.0.0:3478"
 [[auth.users]]
 username = "miuturn.admin"
 password = "miuturn.pwd.changeme"
-user_type = "Fixed"
+user_type = "fixed"
 max_allocations = 10
 
 [[auth.acl_rules]]

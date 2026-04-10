@@ -276,10 +276,9 @@ impl BandwidthManager {
     /// Returns true if allowed, false if bandwidth limit exceeded
     pub fn try_relay(&self, relayed_addr: &str, size: usize) -> bool {
         // Check global limit first
-        if self.global_limit.is_some()
-            && self.global_limiter.try_consume(size).is_none() {
-                return false;
-            }
+        if self.global_limit.is_some() && self.global_limiter.try_consume(size).is_none() {
+            return false;
+        }
 
         // Check allocation-specific limit
         let trackers = self.trackers.read();

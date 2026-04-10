@@ -265,7 +265,7 @@ priority = 0
         let user = UserConfig {
             username: "testuser".to_string(),
             password: "testpass".to_string(),
-            user_type: "Fixed".to_string(),
+            user_type: "fixed".to_string(),
             expires_at: Some(9999999999),
             max_allocations: Some(5),
             bandwidth_limit: Some(1000000),
@@ -273,7 +273,7 @@ priority = 0
             max_allocation_duration_secs: Some(600),
         };
         assert_eq!(user.username, "testuser");
-        assert_eq!(user.user_type, "Fixed");
+        assert_eq!(user.user_type, "fixed");
         assert!(user.expires_at.is_some());
     }
 
@@ -308,7 +308,7 @@ address = "0.0.0.0:8080"
 [[auth.users]]
 username = "fulluser"
 password = "secret"
-user_type = "Fixed"
+user_type = "fixed"
 max_allocations = 5
 bandwidth_limit = 1048576
 max_allocation_duration_secs = 600
@@ -341,7 +341,7 @@ priority = 0
         let user = UserConfig {
             username: "minimal".to_string(),
             password: "pass".to_string(),
-            user_type: "Temporary".to_string(),
+            user_type: "temporary".to_string(),
             expires_at: None,
             max_allocations: None,
             bandwidth_limit: None,
@@ -359,7 +359,7 @@ priority = 0
         let user = UserConfig {
             username: "test".to_string(),
             password: "pass".to_string(),
-            user_type: "Fixed".to_string(),
+            user_type: "fixed".to_string(),
             expires_at: Some(1234567890),
             max_allocations: Some(10),
             bandwidth_limit: Some(2097152),
@@ -377,7 +377,7 @@ priority = 0
         let toml_content = r#"
 username = "nowhitelist"
 password = "pass"
-user_type = "Fixed"
+user_type = "fixed"
 ip_whitelist = []
 "#;
         let user: UserConfig = toml::from_str(toml_content).unwrap();

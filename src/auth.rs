@@ -18,6 +18,7 @@ pub struct User {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum UserType {
     Temporary,
     Fixed,
@@ -181,6 +182,23 @@ impl AuthManager {
 
     pub fn realm(&self) -> &str {
         &self.realm
+    }
+
+    /// Get the password for a user by username (for TURN HMAC key derivation).
+    /// Returns None if the user doesn't exist or has expired.
+    pub fn get_user_password(&self, username: &str) -> Option<String> {
+        let users = self.users.read();
+        let user = users.get(username)?;
+        if let Some(expires) = user.expires_at {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            if now > expires {
+                return None;
+            }
+        }
+        Some(user.password.clone())
     }
 }
 

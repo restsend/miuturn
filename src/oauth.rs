@@ -9,8 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 type HmacSha256 = Hmac<Sha256>;
 
 /// OAuth 2.0 configuration
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct OAuthConfig {
     /// JWT secret key for validation
     pub jwt_secret: String,
@@ -21,7 +20,6 @@ pub struct OAuthConfig {
     /// JWT validation enabled
     pub enabled: bool,
 }
-
 
 impl OAuthConfig {
     pub fn new(jwt_secret: String) -> Self {
@@ -95,16 +93,14 @@ impl OAuthValidator {
         }
 
         // Validate issuer if configured
-        if !self.config.issuer.is_empty()
-            && iss.as_ref() != Some(&self.config.issuer) {
-                return None;
-            }
+        if !self.config.issuer.is_empty() && iss.as_ref() != Some(&self.config.issuer) {
+            return None;
+        }
 
         // Validate audience if configured
-        if !self.config.audience.is_empty()
-            && aud.as_ref() != Some(&self.config.audience) {
-                return None;
-            }
+        if !self.config.audience.is_empty() && aud.as_ref() != Some(&self.config.audience) {
+            return None;
+        }
 
         // Verify signature
         let signature_input = format!("{}.{}", parts[0], parts[1]);
