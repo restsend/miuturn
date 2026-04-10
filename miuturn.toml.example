@@ -1,0 +1,27 @@
+[server]
+realm = "miuda.ai"
+external_ip = "0.0.0.0"
+start_port = 49152
+end_port = 65535
+
+[[server.listening]]
+protocol = "udp"
+address = "0.0.0.0:3478"
+
+#[[server.listening]]
+#protocol = "tcp"
+#address = "0.0.0.0:3478"
+
+[http]
+address = "0.0.0.0:8080"
+
+[[auth.users]]
+username = "miuturn.admin"
+password = "miuturn.pwd.changeme"
+user_type = "Fixed"
+max_allocations = 10
+
+[[auth.acl_rules]]
+ip_range = "0.0.0.0/0"
+action = "Allow"
+priority = 0
