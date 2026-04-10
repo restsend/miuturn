@@ -10,8 +10,16 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config_path = std::env::var("CONFIG").unwrap_or_else(|_| "miuturn.toml".to_string());
-    let config = Config::load(PathBuf::from(&config_path)).unwrap_or_else(|_| Config::default());
-    println!("Loaded configuration from {}", config_path);
+    let config = match Config::load(PathBuf::from(&config_path)) {
+        Ok(cfg) => {
+            println!("Loaded configuration from {}", config_path);
+            cfg
+        }
+        Err(e) => {
+            eprintln!("Failed to load config from {}: {}", config_path, e);
+            Config::default()
+        }
+    };
     println!("Log level: {}", config.log.log_level);
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log.log_level));
