@@ -11,12 +11,13 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config_path = std::env::var("CONFIG").unwrap_or_else(|_| "miuturn.toml".to_string());
     let config = Config::load(PathBuf::from(&config_path)).unwrap_or_else(|_| Config::default());
-
-    // Configure logging
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&config.log.log_level));
+    println!("Loaded configuration from {}", config_path);
+    println!("Log level: {}", config.log.log_level);
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log.log_level));
 
     if let Some(ref log_file) = config.log.log_file {
+        println!("Logging to file: {}", log_file);
         let file_appender = tracing_appender::rolling::never(".", log_file);
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
@@ -24,15 +25,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .with_ansi(false)
             .init();
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .init();
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
-
-    info!("Starting miuturn TURN server");
-    info!("Realm: {}", config.server.realm);
-    info!("External IP: {}", config.server.external_ip);
-    info!(
+    println!("Starting miuturn TURN server");
+    println!("Realm: {}", config.server.realm);
+    println!("External IP: {}", config.server.external_ip);
+    println!(
         "Port range: {}-{}",
         config.server.start_port, config.server.end_port
     );
