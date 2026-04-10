@@ -85,6 +85,41 @@ impl TurnServer {
         server
     }
 
+    pub fn with_port_range_limits_and_password(
+        relay_addr: Ipv4Addr,
+        realm: String,
+        min_port: u16,
+        max_port: u16,
+        max_concurrent_allocations: Option<usize>,
+        max_allocation_duration_secs: Option<u32>,
+        max_bandwidth_bytes_per_sec: Option<usize>,
+        password: String,
+        auth_disabled: bool,
+    ) -> Self {
+        let server = TurnServer {
+            allocation_table: Arc::new(AllocationTable::with_port_range(
+                relay_addr,
+                realm.clone(),
+                min_port,
+                max_port,
+                max_concurrent_allocations,
+                max_allocation_duration_secs,
+                max_bandwidth_bytes_per_sec,
+            )),
+            channel_table: Arc::new(TokioRwLock::new(ChannelTable::new())),
+            relay_addr,
+            realm,
+            nonce_map: Arc::new(RwLock::new(HashMap::new())),
+            password,
+            auth_disabled,
+            auth_manager: None,
+        };
+        server.start_nonce_cleanup_task();
+        server.start_channel_cleanup_task();
+        server.start_allocation_cleanup_task();
+        server
+    }
+
     pub fn with_port_range_auth_disabled(
         relay_addr: Ipv4Addr,
         realm: String,
@@ -403,7 +438,7 @@ async fn handle_tcp_message(
 }
 
 async fn handle_udp_message(
-    socket: &Arc<UdpSocket>,
+    _socket: &Arc<UdpSocket>,
     data: Bytes,
     peer_addr: SocketAddr,
     server: &TurnServer,
@@ -601,13 +636,24 @@ fn verify_message_integrity(msg: &Message, key: &[u8]) -> bool {
 
 /// Verify TURN long-term credential auth (nonce + username + MESSAGE-INTEGRITY).
 /// Returns Ok(username) on success, or a 401 response bytes on failure.
-fn verify_turn_auth(msg: &Message, server: &TurnServer) -> Result<String, Bytes> {
+fn verify_turn_auth(
+    msg: &Message,
+    server: &TurnServer,
+    client_addr: SocketAddr,
+) -> Result<String, Bytes> {
     if server.auth_disabled {
         // Return username from attribute if present, or empty string
         if let Some(username_attr) = msg.get_attribute(Attribute::USERNAME) {
             return Ok(String::from_utf8_lossy(&username_attr.value).to_string());
         }
         return Ok(String::new());
+    }
+
+    if let Some(ref am) = server.auth_manager {
+        let client_ip = client_addr.ip().to_string();
+        if !am.check_acl(&client_ip) {
+            return Err(create_error_response_bytes(msg, ErrorCode::Forbidden));
+        }
     }
 
     let nonce_attr = msg.get_attribute(Attribute::NONCE);
@@ -678,7 +724,7 @@ async fn handle_allocate(
     client_addr: SocketAddr,
 ) -> Option<Bytes> {
     // Verify auth
-    if let Err(resp) = verify_turn_auth(&msg, server) {
+    if let Err(resp) = verify_turn_auth(&msg, server, client_addr) {
         return Some(resp);
     }
 
@@ -733,7 +779,7 @@ async fn handle_refresh(
     client_addr: SocketAddr,
 ) -> Option<Bytes> {
     // Verify auth
-    if let Err(resp) = verify_turn_auth(&msg, server) {
+    if let Err(resp) = verify_turn_auth(&msg, server, client_addr) {
         return Some(resp);
     }
 
@@ -774,7 +820,7 @@ async fn handle_create_permission(
     client_addr: SocketAddr,
 ) -> Option<Bytes> {
     // Verify auth
-    if let Err(resp) = verify_turn_auth(&msg, server) {
+    if let Err(resp) = verify_turn_auth(&msg, server, client_addr) {
         return Some(resp);
     }
 
@@ -808,7 +854,9 @@ async fn handle_create_permission(
         return Some(create_error_response_bytes(&msg, ErrorCode::BadRequest));
     }
 
-    server.allocation_table.add_permissions(&client_addr, &peers);
+    server
+        .allocation_table
+        .add_permissions(&client_addr, &peers);
 
     // Return CreatePermission Success
     let response = crate::message::create_success_response(&msg.header);
@@ -821,7 +869,7 @@ async fn handle_channel_bind(
     client_addr: SocketAddr,
 ) -> Option<Bytes> {
     // Verify auth
-    if let Err(resp) = verify_turn_auth(&msg, server) {
+    if let Err(resp) = verify_turn_auth(&msg, server, client_addr) {
         return Some(resp);
     }
 
@@ -859,11 +907,7 @@ async fn handle_channel_bind(
 
 /// Handle Send Indication (RFC 5766 Section 11).
 /// Relays data from the client to a peer via the XOR-PEER-ADDRESS.
-async fn handle_send(
-    msg: Message,
-    server: &TurnServer,
-    client_addr: SocketAddr,
-) -> Option<Bytes> {
+async fn handle_send(msg: Message, server: &TurnServer, client_addr: SocketAddr) -> Option<Bytes> {
     // Send indications don't require MESSAGE-INTEGRITY (they're indications, not requests)
     // But the client must have an allocation
     let _relayed_addr = server

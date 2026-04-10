@@ -113,7 +113,7 @@ async fn test_turn_allocate_with_auth_via_crate() {
         result.err()
     );
 
-    let relay_conn = result.unwrap();
+    let _relay_conn = result.unwrap();
     println!("Allocate successful!");
 
     let _ = client.close().await;

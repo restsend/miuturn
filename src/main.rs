@@ -48,15 +48,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .external_ip
         .parse()
         .unwrap_or(std::net::Ipv4Addr::new(0, 0, 0, 0));
-    let mut server = TurnServer::with_limits(
+    let mut server = TurnServer::with_port_range_limits_and_password(
         relay_addr,
         config.server.realm.clone(),
+        config.server.start_port,
+        config.server.end_port,
         config.server.max_concurrent_allocations,
         config.server.max_allocation_duration_secs,
         config
             .server
             .max_bandwidth_bytes_per_sec
             .map(|b| b as usize),
+        "password".to_string(),
+        false,
     );
 
     let auth_manager: SharedAuthManager = Arc::new(AuthManager::new(config.server.realm.clone()));
@@ -106,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for acl_config in &config.auth.acl_rules {
         let rule = AclRule {
             ip_range: acl_config.ip_range.clone(),
-            action: if acl_config.action == "Allow" {
+            action: if acl_config.action.eq_ignore_ascii_case("allow") {
                 AclAction::Allow
             } else {
                 AclAction::Deny

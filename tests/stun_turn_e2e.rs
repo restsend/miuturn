@@ -616,7 +616,7 @@ async fn turn_full_data_relay_raw() {
     sleep(Duration::from_millis(100)).await;
 
     let mut buf2 = vec![0u8; 1500];
-    let (len2, _) = tokio::select! {
+    let (_len2, _) = tokio::select! {
         r = conn.recv_from(&mut buf2) => r.unwrap(),
         _ = sleep(Duration::from_secs(2)) => panic!("timeout on CreatePermission"),
     };
@@ -657,7 +657,7 @@ async fn turn_full_data_relay_raw() {
     sleep(Duration::from_millis(100)).await;
 
     let mut buf3 = vec![0u8; 1500];
-    let (len3, _) = tokio::select! {
+    let (_len3, _) = tokio::select! {
         r = conn.recv_from(&mut buf3) => r.unwrap(),
         _ = sleep(Duration::from_secs(2)) => panic!("timeout on ChannelBind"),
     };
@@ -692,7 +692,82 @@ async fn turn_full_data_relay_raw() {
     eprintln!("[TEST] Full TURN data relay verified!");
 }
 
-// ── 12. Auth with per-user password ────────────────────────────────────────
+// ── 12. Peer -> client relay must be TURN Data Indication ─────────────────
+
+#[tokio::test]
+async fn turn_peer_to_client_is_data_indication() {
+    let (server_addr, _) = start_server_no_auth("127.0.0.1", "test").await;
+    let (conn, _client_addr) = bind_udp().await;
+
+    // Allocate Request
+    let mut alloc_req = Vec::new();
+    alloc_req.extend_from_slice(&[0x00, 0x03]);
+    alloc_req.extend_from_slice(&[0x00, 0x00]);
+    alloc_req.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+    alloc_req.extend_from_slice(&[0x11; 12]);
+
+    conn.send_to(&alloc_req, server_addr).await.unwrap();
+    sleep(Duration::from_millis(100)).await;
+
+    let mut buf = vec![0u8; 1500];
+    let (len, _) = tokio::select! {
+        r = conn.recv_from(&mut buf) => r.unwrap(),
+        _ = sleep(Duration::from_secs(2)) => panic!("timeout on Allocate"),
+    };
+
+    let mut relay_addr: Option<SocketAddr> = None;
+    let mut offset = 20usize;
+    let attr_end = 20 + u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    while offset + 4 <= attr_end {
+        let a_type = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+        let a_len = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
+        if a_type == 0x0016 && offset + 4 + a_len <= len {
+            let port = u16::from_be_bytes([buf[offset + 6], buf[offset + 7]]) ^ 0x2112;
+            let ip0 = buf[offset + 8] ^ 0x21;
+            let ip1 = buf[offset + 9] ^ 0x12;
+            let ip2 = buf[offset + 10] ^ 0xA4;
+            let ip3 = buf[offset + 11] ^ 0x42;
+            relay_addr = Some(format!("{}.{}.{}.{}:{}", ip0, ip1, ip2, ip3, port).parse().unwrap());
+            break;
+        }
+        offset += 4 + a_len;
+        offset += (4 - (a_len % 4)) % 4;
+    }
+    let relay_addr = relay_addr.expect("no XOR-RELAYED-ADDRESS");
+
+    let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer_socket.local_addr().unwrap();
+    let payload = b"peer-to-client-via-turn";
+    peer_socket.send_to(payload, relay_addr).await.unwrap();
+
+    let mut recv = vec![0u8; 2048];
+    let (recv_len, _from) = tokio::select! {
+        r = conn.recv_from(&mut recv) => r.unwrap(),
+        _ = sleep(Duration::from_secs(2)) => panic!("timeout waiting for Data Indication"),
+    };
+
+    let msg = miuturn::message::Message::parse(&recv[..recv_len]).expect("expected STUN Data Indication");
+    assert_eq!(msg.header.method, miuturn::message::Method::Data);
+    assert_eq!(msg.header.event_type, miuturn::message::EventType::Indication);
+
+    let peer_attr = msg
+        .get_attribute(miuturn::message::Attribute::PEER_ADDRESS)
+        .expect("missing XOR-PEER-ADDRESS");
+    let decoded_peer = miuturn::message::decode_xor_address(
+        &peer_attr.value,
+        0x2112A442,
+        &msg.header.transaction_id,
+    )
+    .expect("decode XOR-PEER-ADDRESS");
+    assert_eq!(decoded_peer, peer_addr);
+
+    let data_attr = msg
+        .get_attribute(miuturn::message::Attribute::DATA)
+        .expect("missing DATA attr");
+    assert_eq!(&data_attr.value[..], payload);
+}
+
+// ── 13. Auth with per-user password ────────────────────────────────────────
 
 #[tokio::test]
 async fn turn_allocate_with_auth_manager_per_user_password() {

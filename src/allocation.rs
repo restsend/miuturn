@@ -703,6 +703,33 @@ fn getrandom(buf: &mut [u8]) {
     }
 }
 
+fn build_data_indication(peer_addr: SocketAddr, payload: &[u8]) -> Bytes {
+    let mut transaction_id = [0u8; 12];
+    getrandom(&mut transaction_id);
+
+    let mut msg = crate::message::Message {
+        header: crate::message::MessageHeader {
+            method: crate::message::Method::Data,
+            event_type: crate::message::EventType::Indication,
+            message_length: 0,
+            magic_cookie: 0x2112A442,
+            transaction_id,
+        },
+        attributes: Vec::new(),
+    };
+
+    msg.attributes.push(crate::message::Attribute {
+        attr_type: crate::message::Attribute::PEER_ADDRESS,
+        value: crate::message::encode_xor_address(peer_addr, 0x2112A442, &transaction_id),
+    });
+    msg.attributes.push(crate::message::Attribute {
+        attr_type: crate::message::Attribute::DATA,
+        value: Bytes::copy_from_slice(payload),
+    });
+
+    msg.encode()
+}
+
 /// Spawn a dedicated task for an allocation to handle relay traffic
 /// This eliminates lock contention by giving each allocation its own processing loop
 async fn spawn_allocation_task(
@@ -723,14 +750,14 @@ async fn spawn_allocation_task(
                 // Handle incoming peer data on the relay socket
                 result = socket_clone.recv_from(&mut buf) => {
                     match result {
-                        Ok((len, _peer_addr)) => {
+                        Ok((len, peer_addr)) => {
                             // Update stats using atomics - no lock contention
                             stats.total_bytes_relayed.fetch_add(len as u64, Ordering::Relaxed);
                             stats.total_messages.fetch_add(1, Ordering::Relaxed);
 
-                            // Forward to client as Data Indication
-                            // For now, just forward raw data
-                            if let Err(_e) = socket_clone.send_to(&buf[..len], &client_addr).await {
+                            // Forward to client as TURN Data Indication (RFC 5766 Section 10.4)
+                            let indication = build_data_indication(peer_addr, &buf[..len]);
+                            if let Err(_e) = socket_clone.send_to(&indication, &client_addr).await {
                                 // Silently drop send errors (client may be unreachable)
                             }
                         }
