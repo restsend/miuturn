@@ -52,6 +52,35 @@ impl TurnServer {
         Self::with_limits_and_password(relay_addr, realm, None, None, None, String::new(), true)
     }
 
+    pub fn with_port_range_and_password(
+        relay_addr: Ipv4Addr,
+        realm: String,
+        min_port: u16,
+        max_port: u16,
+        password: String,
+    ) -> Self {
+        let server = TurnServer {
+            allocation_table: Arc::new(AllocationTable::with_port_range(
+                relay_addr,
+                realm.clone(),
+                min_port,
+                max_port,
+                None,
+                None,
+                None,
+            )),
+            channel_table: Arc::new(TokioRwLock::new(ChannelTable::new())),
+            relay_addr,
+            realm,
+            nonce_map: Arc::new(RwLock::new(HashMap::new())),
+            password,
+            auth_disabled: false,
+        };
+        server.start_nonce_cleanup_task();
+        server.start_channel_cleanup_task();
+        server
+    }
+
     pub fn with_port_range_auth_disabled(
         relay_addr: Ipv4Addr,
         realm: String,

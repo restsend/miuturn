@@ -48,6 +48,7 @@ num_cpus = "0.2"
 axum-extra = { version = "0.9", features = ["cookie"] }
 
 [dev-dependencies]
+stun = "0.17.1"
 turn = "0.17.1"
 tokio-test = "0.4"
 tower = "0.5"

@@ -230,7 +230,7 @@ pub fn create_binding_response_fast(transaction_id: [u8; 12], client_addr: Socke
     // Header: Binding Success Response
     // method=0x001, class=Success(2) -> RFC 5389 encoded: 0x0101
     buf.put_u16(0x0101);
-    buf.put_u16(8); // message length: XOR-MAPPED-ADDRESS is 8 bytes
+    buf.put_u16(12); // message length: attr header(4) + attr value(8) = 12
     buf.put_u32(0x2112A442); // magic cookie
     buf.put_slice(&transaction_id);
 

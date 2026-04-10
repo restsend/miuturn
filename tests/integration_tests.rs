@@ -66,12 +66,18 @@ async fn test_e2e_turn_allocation() {
 /// instead of 401) and the nonce generation bug (all bytes identical "151515...").
 #[tokio::test]
 async fn test_turn_allocate_with_auth_via_crate() {
-    let relay_addr: std::net::Ipv4Addr = "0.0.0.0".parse().unwrap();
+    let relay_addr: std::net::Ipv4Addr = "127.0.0.1".parse().unwrap();
     let realm = "test".to_string();
     let username = "admin".to_string();
     let password = "password".to_string();
 
-    let server = TurnServer::with_password(relay_addr, realm.clone(), password.clone());
+    let server = TurnServer::with_port_range_and_password(
+        relay_addr,
+        realm.clone(),
+        45000,
+        45999,
+        password.clone(),
+    );
 
     let server_addr: SocketAddr = "127.0.0.1:3507".parse().unwrap();
     let srv = server.clone();
