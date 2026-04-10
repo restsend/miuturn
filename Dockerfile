@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
 
 # Copy source
 COPY Cargo.toml ./
+COPY miuturn.toml.example ./miuturn.toml
 COPY src ./src
 COPY static ./static
 
@@ -32,7 +33,7 @@ COPY --from=builder /app/target/release/miuturn /usr/local/bin/miuturn
 
 # Copy static files
 COPY --from=builder /app/static ./static
-COPY --from=builder /app/miuturn.toml.example ./miuturn.toml
+COPY --from=builder /app/miuturn.toml ./miuturn.toml
 
 ENV CONFIG=/app/miuturn.toml
 
