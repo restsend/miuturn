@@ -40,8 +40,8 @@ impl TlsConfig {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let cert = generate_simple_self_signed([domain.to_string()])?;
 
-        let cert_der = cert.serialize_der()?;
-        let key_der = cert.serialize_private_key_der();
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
 
         Ok(Self { cert_der, key_der })
     }

@@ -3,7 +3,7 @@
 //! Implements TURN REST API for generating short-term credentials.
 //! Format: username = timestamp:user_id, password = HMAC(timestamp:user_id, key)
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -5,13 +5,29 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing_subscriber::fmt::init();
-
     let config_path = std::env::var("CONFIG").unwrap_or_else(|_| "miuturn.toml".to_string());
     let config = Config::load(PathBuf::from(&config_path)).unwrap_or_else(|_| Config::default());
+
+    // Configure logging
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(&config.log.log_level));
+
+    if let Some(ref log_file) = config.log.log_file {
+        let file_appender = tracing_appender::rolling::never(".", log_file);
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(file_appender)
+            .with_ansi(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .init();
+    }
 
     info!("Starting miuturn TURN server");
     info!("Realm: {}", config.server.realm);
@@ -119,48 +135,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Arc::new(move || allocation_table.stats().snapshot())
     };
 
-    // Admin console credentials from [http] section
-    let admin_username = config.http.admin_username.clone();
-    let admin_password = config.http.admin_password.clone();
-    let http_addr: SocketAddr = config
-        .http
-        .address
-        .parse()
-        .unwrap_or_else(|_| "0.0.0.0:8080".parse().unwrap());
+    // Admin console — only started if [http] is configured
+    if let Some(http) = &config.http {
+        let admin_username = http.admin_username.clone();
+        let admin_password = http.admin_password.clone();
+        let http_addr: SocketAddr = http
+            .address
+            .parse()
+            .unwrap_or_else(|_| "0.0.0.0:8080".parse().unwrap());
 
-    // TURN REST API settings
-    let turn_rest_enabled = config.http.turn_rest_enabled.unwrap_or(false);
-    let turn_rest_secret = config.http.turn_rest_secret.clone();
-    let turn_rest_default_lifetime = config.http.turn_rest_default_lifetime.unwrap_or(3600);
+        let turn_rest_enabled = http.turn_rest_enabled.unwrap_or(false);
+        let turn_rest_secret = http.turn_rest_secret.clone();
+        let turn_rest_default_lifetime = http.turn_rest_default_lifetime.unwrap_or(3600);
 
-    // Create a new Metrics instance for the admin routes
-    let metrics = Metrics::new();
+        let metrics = Metrics::new();
 
-    // Config path for persistence
-    let config_path = std::env::var("CONFIG")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("miuturn.toml"));
+        let config_path = std::env::var("CONFIG")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("miuturn.toml"));
 
-    tokio::spawn(async move {
-        if let Err(e) = miuturn::create_admin_routes(
-            http_addr.to_string(),
-            stats_fn,
-            admin_username,
-            admin_password,
-            auth_manager.clone(),
-            turn_rest_enabled,
-            turn_rest_secret,
-            turn_rest_default_lifetime,
-            Some(metrics),
-            Some(config_path),
-        )
-        .await
-        {
-            tracing::error!("Admin server error: {}", e);
-        }
-    });
+        tokio::spawn(async move {
+            if let Err(e) = miuturn::create_admin_routes(
+                http_addr.to_string(),
+                stats_fn,
+                admin_username,
+                admin_password,
+                auth_manager.clone(),
+                turn_rest_enabled,
+                turn_rest_secret,
+                turn_rest_default_lifetime,
+                Some(metrics),
+                Some(config_path),
+            )
+            .await
+            {
+                tracing::error!("Admin server error: {}", e);
+            }
+        });
 
-    info!("HTTP server available at http://{}", config.http.address);
+        info!("HTTP server available at http://{}", http.address);
+    }
 
     tokio::signal::ctrl_c().await?;
     info!("Shutting down...");

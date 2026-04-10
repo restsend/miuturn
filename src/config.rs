@@ -6,8 +6,11 @@ use std::path::PathBuf;
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     pub server: ServerConfig,
-    pub http: HttpConfig,
+    #[serde(default)]
+    pub http: Option<HttpConfig>,
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub log: LogConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -52,6 +55,28 @@ impl Default for HttpConfig {
             turn_rest_default_lifetime: Some(3600),
             admin_username: None,
             admin_password: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct LogConfig {
+    pub log_file: Option<String>,
+    #[serde(default = "LogConfig::default_level")]
+    pub log_level: String,
+}
+
+impl LogConfig {
+    fn default_level() -> String {
+        "info".to_string()
+    }
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            log_file: None,
+            log_level: Self::default_level(),
         }
     }
 }
@@ -118,7 +143,8 @@ impl Default for Config {
                 max_bandwidth_bytes_per_sec: None,
                 max_allocation_duration_secs: None,
             },
-            http: HttpConfig::default(),
+            http: None,
+            log: LogConfig::default(),
             auth: AuthConfig {
                 users: vec![],
                 api_keys: HashMap::new(),
@@ -209,12 +235,15 @@ priority = 0
         let config: Config = toml::from_str(toml_content).unwrap();
         assert_eq!(config.server.realm, "test-realm");
         assert_eq!(config.server.external_ip, "192.168.1.1");
-        assert_eq!(config.http.turn_rest_enabled, Some(true));
+        assert_eq!(config.http.as_ref().unwrap().turn_rest_enabled, Some(true));
         assert_eq!(
-            config.http.turn_rest_secret,
+            config.http.as_ref().unwrap().turn_rest_secret,
             Some("my-secret-key".to_string())
         );
-        assert_eq!(config.http.turn_rest_default_lifetime, Some(7200));
+        assert_eq!(
+            config.http.as_ref().unwrap().turn_rest_default_lifetime,
+            Some(7200)
+        );
         assert_eq!(config.auth.api_keys.get("key1"), Some(&"user1".to_string()));
     }
 

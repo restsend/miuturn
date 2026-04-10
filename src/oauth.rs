@@ -2,7 +2,7 @@
 //!
 //! Provides OAuth 2.0 bearer token authentication and JWT validation.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 

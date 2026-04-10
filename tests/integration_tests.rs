@@ -600,7 +600,7 @@ fn test_component_performance_analysis() {
 
     let start = Instant::now();
     for _ in 0..HMAC_OPS {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         type HmacSha1 = Hmac<sha1::Sha1>;
         let mut mac = HmacSha1::new_from_slice(&key).unwrap();
         mac.update(&data);
@@ -750,7 +750,7 @@ fn test_component_performance_analysis() {
     let start = Instant::now();
     for _ in 0..MI_OPS {
         // Simulate full message integrity verification
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         type HmacSha1 = Hmac<sha1::Sha1>;
         let mut mac = HmacSha1::new_from_slice(&key).unwrap();
         mac.update(&encoded);

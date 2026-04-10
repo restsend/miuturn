@@ -1,7 +1,10 @@
 [package]
 name = "miuturn"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
+description = "A high-performance TURN server implemented in Rust, designed for WebRTC applications."
+authors = ["jinti<shenjindi@fourz.cn>"]
+license = "MIT"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -12,16 +15,17 @@ hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 parking_lot = "0.12"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1.1.2"
 tower-http = { version = "0.6", features = ["cors"] }
-hmac = "0.12"
-sha1 = "0.10"
-sha2 = "0.10"
-md5 = "0.7"
+hmac = "0.13.0"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+md5 = "0.8.0"
 hex = "0.4"
 base64 = "0.22"
 
@@ -29,10 +33,10 @@ base64 = "0.22"
 tokio-rustls = "0.26"
 rustls = "0.23"
 pem = "3"
-rcgen = "0.11"
+rcgen = "0.14.7"
 
 # Prometheus metrics (custom implementation)
-prometheus = "0.13"
+prometheus = "0.14.0"
 
 # Time utilities
 time = "0.3"
@@ -44,11 +48,11 @@ num_cpus = "0.2"
 axum-extra = { version = "0.9", features = ["cookie"] }
 
 [dev-dependencies]
-turn = "0.11"
+turn = "0.17.1"
 tokio-test = "0.4"
 tower = "0.5"
 anyhow = "1"
-webrtc-util = "0.12"
+webrtc-util = "0.17.1"
 futures = "0.3"
 
 [[test]]

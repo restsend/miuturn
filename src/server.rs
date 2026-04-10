@@ -3,7 +3,7 @@ use crate::message::{
     Attribute, ErrorCode, EventType, Message, MessageHeader, Method, encode_xor_address,
 };
 use bytes::{Buf, Bytes, BytesMut};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};

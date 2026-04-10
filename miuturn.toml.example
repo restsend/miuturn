@@ -12,8 +12,8 @@ address = "0.0.0.0:3478"
 #protocol = "tcp"
 #address = "0.0.0.0:3478"
 
-[http]
-address = "0.0.0.0:8080"
+#[http]
+#address = "0.0.0.0:8080"
 
 [[auth.users]]
 username = "miuturn.admin"
@@ -23,5 +23,5 @@ max_allocations = 10
 
 [[auth.acl_rules]]
 ip_range = "0.0.0.0/0"
-action = "Allow"
+action = "allow"
 priority = 0

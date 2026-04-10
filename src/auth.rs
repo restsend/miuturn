@@ -32,6 +32,7 @@ pub struct AclRule {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum AclAction {
     Allow,
     Deny,
@@ -77,18 +78,19 @@ impl AuthManager {
     pub fn authenticate(&self, username: &str, password: &str) -> Option<User> {
         let users = self.users.read();
         if let Some(user) = users.get(username)
-            && user.password == password {
-                if let Some(expires) = user.expires_at {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    if now > expires {
-                        return None;
-                    }
+            && user.password == password
+        {
+            if let Some(expires) = user.expires_at {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                if now > expires {
+                    return None;
                 }
-                return Some(user.clone());
             }
+            return Some(user.clone());
+        }
         None
     }
 
