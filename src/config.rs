@@ -83,8 +83,11 @@ impl Default for LogConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AuthConfig {
+    #[serde(default)]
     pub users: Vec<UserConfig>,
+    #[serde(default)]
     pub api_keys: HashMap<String, String>,
+    #[serde(default)]
     pub acl_rules: Vec<AclRuleConfig>,
 }
 
