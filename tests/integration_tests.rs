@@ -61,6 +61,58 @@ async fn test_e2e_turn_allocation() {
     let _ = client.close().await;
 }
 
+/// Verify full TURN Allocate flow with authentication using the `turn` crate.
+/// This test would have caught both the ERROR_CODE encoding bug (caused error-code: 0
+/// instead of 401) and the nonce generation bug (all bytes identical "151515...").
+#[tokio::test]
+async fn test_turn_allocate_with_auth_via_crate() {
+    let relay_addr: std::net::Ipv4Addr = "0.0.0.0".parse().unwrap();
+    let realm = "test".to_string();
+    let username = "admin".to_string();
+    let password = "password".to_string();
+
+    let server = TurnServer::with_password(relay_addr, realm.clone(), password.clone());
+
+    let server_addr: SocketAddr = "127.0.0.1:3507".parse().unwrap();
+    let srv = server.clone();
+    tokio::spawn(async move {
+        let _ = srv.run_udp(server_addr).await;
+    });
+
+    sleep(Duration::from_millis(100)).await;
+
+    let local_socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    let conn = Arc::new(local_socket);
+    let conn_clone = conn.clone();
+
+    let config = ClientConfig {
+        stun_serv_addr: "127.0.0.1:3507".to_string(),
+        turn_serv_addr: "127.0.0.1:3507".to_string(),
+        username: username.clone(),
+        password: password.clone(),
+        realm: realm.clone(),
+        software: "miuturn-auth-test".to_string(),
+        rto_in_ms: 200,
+        conn: conn_clone,
+        vnet: None,
+    };
+
+    let client = Client::new(config).await.expect("Failed to create client");
+    client.listen().await.expect("Failed to listen");
+
+    let result = client.allocate().await;
+    assert!(
+        result.is_ok(),
+        "TURN Allocate with auth must succeed, got error: {:?}",
+        result.err()
+    );
+
+    let relay_conn = result.unwrap();
+    println!("Allocate successful!");
+
+    let _ = client.close().await;
+}
+
 #[tokio::test]
 async fn test_e2e_stun_binding() {
     let relay_addr: std::net::Ipv4Addr = "0.0.0.0".parse().unwrap();

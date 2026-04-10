@@ -63,13 +63,12 @@ async fn test_e2e_stun_binding_auth_disabled() {
         };
     println!("Received {} bytes from server", len);
 
-    // The server encodes Success responses with class=1 (0x0011), which is internally consistent
-    // Note: There may be a slight discrepancy with RFC 5766 encoding, but the server works correctly
+    // RFC 5389: Binding Success = method 0x001, class Success(2) → 0x0101
     let resp_type = (buf[0] as u16) << 8 | (buf[1] as u16);
     println!("Response type: 0x{:04x}", resp_type);
     assert_eq!(
-        resp_type, 0x0011,
-        "Expected Binding Success (0x0011), got 0x{:04x}",
+        resp_type, 0x0101,
+        "Expected Binding Success (0x0101), got 0x{:04x}",
         resp_type
     );
     assert!(len > 24, "Response too short for XOR-MAPPED-ADDRESS");
@@ -115,14 +114,12 @@ async fn test_e2e_turn_allocation_auth_disabled() {
     println!("Received {} bytes from server", len);
     println!("First 20 bytes: {:02x?}", &buf[..20]);
 
-    // The server encodes responses with class=1 for this method (internally consistent)
+    // RFC 5389: Allocate Success = method 0x003, class Success(2) → 0x0103
     let resp_type = (buf[0] as u16) << 8 | (buf[1] as u16);
     println!("Response type for allocation: 0x{:04x}", resp_type);
-    // 0x0013 = Allocate Indication (class=1), 0x0113 would be Allocate Success
-    // For now, we accept either as long as allocation succeeded
-    assert!(
-        resp_type == 0x0113 || resp_type == 0x0013,
-        "Expected Allocate response (0x0113 or 0x0013), got 0x{:04x}",
+    assert_eq!(
+        resp_type, 0x0103,
+        "Expected Allocate Success (0x0103), got 0x{:04x}",
         resp_type
     );
     assert!(len > 40, "Response too short");
@@ -188,8 +185,12 @@ async fn test_e2e_turn_allocate_and_channel_bind_auth_disabled() {
     let resp_type = (buf[0] as u16) << 8 | (buf[1] as u16);
     println!("Allocation response type: 0x{:04x}", resp_type);
     // Just verify we got a response with Allocate method
-    let method = resp_type & 0x0F;
-    assert_eq!(method, 0x03, "Expected Allocate method in response");
+    // RFC 5389 type decoding: method from encoded type
+    let a = resp_type & 0x000F;
+    let b = (resp_type >> 1) & 0x0070;
+    let d = (resp_type >> 2) & 0x0F80;
+    let method = a | b | d;
+    assert_eq!(method, 0x0003, "Expected Allocate method in response");
 
     println!("Allocation successful!");
 
@@ -201,7 +202,7 @@ async fn test_e2e_turn_allocate_and_channel_bind_auth_disabled() {
         let attr_type = (buf[offset] as u16) << 8 | (buf[offset + 1] as u16);
         let attr_len = (buf[offset + 2] as u16) << 8 | (buf[offset + 3] as u16);
 
-        if attr_type == 0x001C {
+        if attr_type == 0x0016 {
             // XOR-RELAYED-ADDRESS
             // XOR-RELAYED-ADDRESS
             let xor_port = (buf[offset + 6] as u16) << 8 | (buf[offset + 7] as u16);

@@ -62,12 +62,15 @@ impl MessageHeader {
 
         // Check for magic cookie at byte 4-7 (RFC 5389)
         if data[4] == 0x21 && data[5] == 0x12 && data[6] == 0xA4 && data[7] == 0x42 {
-            // Fast path: read directly from bytes without allocating
-            let msg_type = u16::from_be_bytes([data[0], data[1]]);
-            let first_byte = (msg_type >> 8) as u8;
-            let second_byte = (msg_type & 0xFF) as u8;
-            let class = (first_byte & 0x01) | ((second_byte & 0x10) >> 3);
-            let method_val = (((first_byte & 0x3E) as u16) << 7) | ((second_byte & 0x0F) as u16);
+            // RFC 5389 type field decoding (matches stun crate)
+            let value = u16::from_be_bytes([data[0], data[1]]);
+            let a = (value & 0x000F) as u16;
+            let b = ((value >> 1) & 0x0070) as u16;
+            let d = ((value >> 2) & 0x0F80) as u16;
+            let method_val = a | b | d;
+            let c0 = ((value >> 4) & 1) as u16;
+            let c1 = ((value >> 7) & 2) as u16;
+            let class = c0 | c1;
             let method = match method_val {
                 0x0001 => Method::Binding,
                 0x0003 => Method::Allocate,
@@ -145,9 +148,14 @@ impl MessageHeader {
             EventType::Success => 2u16,
             EventType::Error => 3u16,
         };
-        let first_byte = (((method_val >> 7) & 0x3E) as u8) | ((class_val & 0x01) as u8);
-        let second_byte = ((method_val & 0x0F) as u8) | (((class_val & 0x02) << 3) as u8);
-        let msg_type = ((first_byte as u16) << 8) | (second_byte as u16);
+        // RFC 5389 type field encoding (matches stun crate)
+        let a = method_val & 0x000F;
+        let b = method_val & 0x0070;
+        let d = method_val & 0x0F80;
+        let method_enc = a + (b << 1) + (d << 2);
+        let c0 = (class_val & 1) << 4;
+        let c1 = (class_val & 2) << 7;
+        let msg_type = method_enc + c0 + c1;
         buf.put_u16(msg_type);
         buf.put_u16(self.message_length);
         buf.put_u32(self.magic_cookie);
@@ -164,20 +172,18 @@ pub struct Attribute {
 impl Attribute {
     pub const MAPPED_ADDRESS: u16 = 0x0001;
     pub const XOR_MAPPED_ADDRESS: u16 = 0x0020;
-    pub const XOR_RELAYED_ADDRESS: u16 = 0x001C;
+    pub const XOR_RELAYED_ADDRESS: u16 = 0x0016;
     pub const REALM: u16 = 0x0014;
     pub const NONCE: u16 = 0x0015;
-    pub const USERNAME: u16 = 0x0016;
+    pub const USERNAME: u16 = 0x0006;
     pub const MESSAGE_INTEGRITY: u16 = 0x0008;
     pub const LIFETIME: u16 = 0x000D;
-    pub const BANDWIDTH: u16 = 0x0011;
+    pub const BANDWIDTH: u16 = 0x0010;
     pub const DATA: u16 = 0x0013;
     pub const CHANNEL_NUMBER: u16 = 0x000C;
     pub const PEER_ADDRESS: u16 = 0x0012;
-    pub const TRANSPORT: u16 = 0x0019;
-    pub const REQUESTED_TRANSPORT: u16 = 0x0009;
+    pub const REQUESTED_TRANSPORT: u16 = 0x0019;
     pub const ERROR_CODE: u16 = 0x0009;
-    pub const ERROR_CODE_ALT: u16 = 0x000B;
     pub const SOFTWARE: u16 = 0x8022;
     pub const FINGERPRINT: u16 = 0x8028;
     pub const ICE_CONTROLLING: u16 = 0x8029;
@@ -222,8 +228,8 @@ pub fn create_binding_response_fast(transaction_id: [u8; 12], client_addr: Socke
     let mut buf = BytesMut::with_capacity(32 + 8);
 
     // Header: Binding Success Response
-    // msg_type = 0x0001 | class=2 -> encoded as 0x0011
-    buf.put_u16(0x0011);
+    // method=0x001, class=Success(2) -> RFC 5389 encoded: 0x0101
+    buf.put_u16(0x0101);
     buf.put_u16(8); // message length: XOR-MAPPED-ADDRESS is 8 bytes
     buf.put_u32(0x2112A442); // magic cookie
     buf.put_slice(&transaction_id);
@@ -388,14 +394,11 @@ pub fn create_error_response(header: &MessageHeader, code: ErrorCode) -> Message
         attributes: Vec::new(),
     };
     let mut err_buf = BytesMut::new();
-    err_buf.put_u32(0);
-    err_buf.put_u16(0);
-    let class = (code.code() / 100) as u8;
-    let number = (code.code() % 100) as u8;
-    err_buf.put_u8(class);
-    err_buf.put_u8(number);
+    let class = (code.code() / 100) as u32;
+    let number = (code.code() % 100) as u32;
+    // RFC 5389: 4 bytes = 21 reserved bits | 3 class bits | 8 number bits
+    err_buf.put_u32((class << 8) | number);
     let reason = format!("{:?}", code);
-    err_buf.put_u8(reason.len() as u8);
     err_buf.put_slice(reason.as_bytes());
     msg.add_attribute(Attribute {
         attr_type: Attribute::ERROR_CODE,
@@ -497,5 +500,47 @@ mod tests {
         let msg = parsed.unwrap();
         assert_eq!(msg.header.method, Method::Binding);
         assert_eq!(msg.header.event_type, EventType::Success);
+    }
+
+    #[test]
+    fn test_error_code_encoding_rfc5389() {
+        // RFC 5389 Section 15.6: ERROR-CODE attribute format
+        // 4 bytes: 21 reserved bits (0) | 3 class bits | 8 number bits
+        let header = MessageHeader {
+            method: Method::Allocate,
+            event_type: EventType::Request,
+            message_length: 0,
+            magic_cookie: 0x2112A442,
+            transaction_id: [0; 12],
+        };
+        let msg = create_error_response(&header, ErrorCode::Unauthorized);
+        let err_attr = msg
+            .attributes
+            .iter()
+            .find(|a| a.attr_type == Attribute::ERROR_CODE)
+            .expect("should have ERROR_CODE attr");
+        let val = &err_attr.value;
+
+        // 401: class=4, number=1 → u32 = (4 << 8) | 1 = 0x00000401
+        assert_eq!(val.len(), 4 + "Unauthorized".len());
+        assert_eq!(u32::from_be_bytes([val[0], val[1], val[2], val[3]]), 0x00000401);
+        assert_eq!(&val[4..], b"Unauthorized");
+
+        // Verify 300 (TryAlternate): class=3, number=0 → 0x00000300
+        let msg300 = create_error_response(&header, ErrorCode::TryAlternate);
+        let attr300 = msg300
+            .attributes
+            .iter()
+            .find(|a| a.attr_type == Attribute::ERROR_CODE)
+            .unwrap();
+        assert_eq!(
+            u32::from_be_bytes([
+                attr300.value[0],
+                attr300.value[1],
+                attr300.value[2],
+                attr300.value[3]
+            ]),
+            0x00000300
+        );
     }
 }

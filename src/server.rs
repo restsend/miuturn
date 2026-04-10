@@ -435,12 +435,12 @@ fn generate_nonce() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    // Simple hash: mix seed with position-dependent rotation to avoid identical bytes
     let mut hash: [u8; 16] = [0; 16];
     for (i, byte) in hash.iter_mut().enumerate() {
-        let s = seed
-            .wrapping_mul(1103515245u128)
-            .wrapping_add(12345 ^ (i as u128));
-        *byte = (s >> 16) as u8;
+        let rotated = seed.rotate_left((i as u32) * 7);
+        let mixed = rotated.wrapping_mul(1103515245u128).wrapping_add(12345u128);
+        *byte = (mixed >> 16) as u8;
     }
     hex::encode(hash)
 }
@@ -456,6 +456,10 @@ fn verify_message_integrity(msg: &Message, key: &[u8]) -> bool {
         None => return false,
     };
 
+    // Per RFC 5389 and stun crate implementation:
+    // HMAC is computed over: STUN header (with message_length including MI)
+    // + all attributes BEFORE MESSAGE-INTEGRITY.
+    // The MI attribute bytes themselves are NOT included.
     let mut partial_msg = Message {
         header: msg.header.clone(),
         attributes: Vec::new(),
@@ -468,9 +472,20 @@ fn verify_message_integrity(msg: &Message, key: &[u8]) -> bool {
         partial_msg.attributes.push(attr.clone());
     }
 
-    let encoded = partial_msg.encode();
+    // Manually encode with adjusted message_length = attrs_before_MI + 24 (MI size)
+    let mut attr_buf = BytesMut::new();
+    for attr in &partial_msg.attributes {
+        attr.encode(&mut attr_buf);
+    }
+    let mut header = partial_msg.header.clone();
+    header.message_length = (attr_buf.len() + 24) as u16; // include MI: 4 header + 20 value
+    header.magic_cookie = 0x2112A442;
+    let mut buf = BytesMut::new();
+    header.encode(&mut buf);
+    buf.extend_from_slice(&attr_buf.freeze());
+
     let mut mac = HmacSha1::new_from_slice(key).ok().unwrap();
-    mac.update(&encoded);
+    mac.update(&buf);
     let computed = mac.finalize().into_bytes();
     computed[..20] == integrity_attr.value[..20]
 }
@@ -723,6 +738,17 @@ mod tests {
         let nonce2 = generate_nonce();
         assert_ne!(nonce1, nonce2);
         assert_eq!(nonce1.len(), 32);
+        // Verify nonce bytes are not all identical (bug: old LCG produced "151515...")
+        let unique_bytes = nonce1
+            .as_bytes()
+            .chunks(2)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert!(
+            unique_bytes > 4,
+            "nonce has too few unique bytes: {}",
+            nonce1
+        );
     }
 
     #[test]
