@@ -911,6 +911,10 @@ async fn handle_create_permission(
         .find_allocation_by_client(&client_addr)
         .is_none()
     {
+        debug!(
+            %client_addr,
+            "CreatePermission rejected because client has no active allocation"
+        );
         return Some(create_error_response_bytes(
             &msg,
             ErrorCode::AllocationMismatch,
@@ -932,12 +936,22 @@ async fn handle_create_permission(
     }
 
     if peers.is_empty() {
+        debug!(
+            %client_addr,
+            "CreatePermission rejected because no valid XOR-PEER-ADDRESS was provided"
+        );
         return Some(create_error_response_bytes(&msg, ErrorCode::BadRequest));
     }
 
     server
         .allocation_table
         .add_permissions(&client_addr, &peers);
+
+    debug!(
+        %client_addr,
+        peer_count = peers.len(),
+        "CreatePermission succeeded"
+    );
 
     // Return CreatePermission Success
     let response = crate::message::create_success_response(&msg.header);
@@ -977,12 +991,30 @@ async fn handle_channel_bind(
                     .bind(channel_num, peer_addr, relayed_addr)
                     .is_ok()
                 {
+                    debug!(
+                        %client_addr,
+                        %peer_addr,
+                        %relayed_addr,
+                        channel_num,
+                        "ChannelBind succeeded"
+                    );
                     let response = crate::message::create_success_response(&msg.header);
                     return Some(response.encode());
                 }
+                debug!(
+                    %client_addr,
+                    %peer_addr,
+                    %relayed_addr,
+                    channel_num,
+                    "ChannelBind failed while creating binding"
+                );
             }
         }
     }
+    debug!(
+        %client_addr,
+        "ChannelBind ignored because required attributes or allocation were missing"
+    );
     None
 }
 
@@ -991,25 +1023,68 @@ async fn handle_channel_bind(
 async fn handle_send(msg: Message, server: &TurnServer, client_addr: SocketAddr) -> Option<Bytes> {
     // Send indications don't require MESSAGE-INTEGRITY (they're indications, not requests)
     // But the client must have an allocation
-    let _relayed_addr = server
-        .allocation_table
-        .find_allocation_by_client(&client_addr)?;
+    let _relayed_addr = match server.allocation_table.find_allocation_by_client(&client_addr) {
+        Some(addr) => addr,
+        None => {
+            debug!(
+                %client_addr,
+                "Send indication dropped because client has no active allocation"
+            );
+            return None;
+        }
+    };
 
-    let peer_attr = msg.get_attribute(Attribute::PEER_ADDRESS)?;
+    let peer_attr = match msg.get_attribute(Attribute::PEER_ADDRESS) {
+        Some(attr) => attr,
+        None => {
+            debug!(
+                %client_addr,
+                "Send indication dropped because PEER-ADDRESS is missing"
+            );
+            return None;
+        }
+    };
     let peer_addr = crate::message::decode_xor_address(
         &peer_attr.value,
         0x2112A442,
         &msg.header.transaction_id,
     )?;
 
-    let data_attr = msg.get_attribute(Attribute::DATA)?;
+    let data_attr = match msg.get_attribute(Attribute::DATA) {
+        Some(attr) => attr,
+        None => {
+            debug!(
+                %client_addr,
+                %peer_addr,
+                "Send indication dropped because DATA is missing"
+            );
+            return None;
+        }
+    };
     let data = &data_attr.value;
 
     // Relay data through the allocation's relay socket (enforces permission check)
-    server
+    if server
         .allocation_table
         .send_to_peer(&client_addr, peer_addr, data)
-        .await?;
+        .await
+        .is_none()
+    {
+        debug!(
+            %client_addr,
+            %peer_addr,
+            payload_len = data.len(),
+            "Send indication dropped because permission check failed or relay socket was unavailable"
+        );
+        return None;
+    }
+
+    debug!(
+        %client_addr,
+        %peer_addr,
+        payload_len = data.len(),
+        "Send indication relayed to peer"
+    );
 
     // Send indication doesn't generate a response
     None

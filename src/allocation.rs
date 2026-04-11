@@ -507,12 +507,6 @@ impl AllocationTable {
             // Create and bind a dedicated UDP socket for this allocation
             match UdpSocket::bind(relay_bind_addr).await {
                 Ok(socket) => {
-                    debug!(
-                        %client_addr,
-                        %relay_bind_addr,
-                        %relayed_addr,
-                        "bound relay socket for allocation"
-                    );
                     break (port, socket, relayed_addr, relay_bind_addr);
                 }
                 Err(err) => {
@@ -690,6 +684,12 @@ impl AllocationTable {
                 if a.client_addr == *client_addr {
                     // Check permission
                     if !a.permissions.contains(&peer.ip()) {
+                        debug!(
+                            %client_addr,
+                            %peer,
+                            payload_len = data.len(),
+                            "dropping relay packet because peer is not in permission list"
+                        );
                         return None;
                     }
                     // Clone the socket Arc so we can send after releasing the lock
@@ -702,13 +702,34 @@ impl AllocationTable {
             found
         };
         if let Some(socket) = socket {
-            let _ = socket.send_to(data, &peer).await;
+            if let Err(err) = socket.send_to(data, &peer).await {
+                debug!(
+                    %client_addr,
+                    %peer,
+                    payload_len = data.len(),
+                    error = %err,
+                    "failed to send relay packet to peer"
+                );
+                return None;
+            }
             self.stats
                 .total_bytes_relayed
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
             self.stats.total_messages.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                %client_addr,
+                %peer,
+                payload_len = data.len(),
+                "sent relay packet to peer"
+            );
             return Some(());
         }
+        debug!(
+            %client_addr,
+            %peer,
+            payload_len = data.len(),
+            "dropping relay packet because no active relay socket was found"
+        );
         None
     }
 
@@ -860,12 +881,30 @@ async fn spawn_allocation_task(
 
                             // Forward to client as TURN Data Indication (RFC 5766 Section 10.4)
                             let indication = build_data_indication(peer_addr, &buf[..len]);
-                            if let Err(_e) = socket_clone.send_to(&indication, &client_addr).await {
-                                // Silently drop send errors (client may be unreachable)
+                            if let Err(e) = socket_clone.send_to(&indication, &client_addr).await {
+                                debug!(
+                                    %client_addr,
+                                    %peer_addr,
+                                    payload_len = len,
+                                    error = %e,
+                                    "failed to forward peer packet to client as Data Indication"
+                                );
+                            } else {
+                                debug!(
+                                    %client_addr,
+                                    %peer_addr,
+                                    payload_len = len,
+                                    "forwarded peer packet to client as Data Indication"
+                                );
                             }
                         }
-                        Err(_e) => {
+                        Err(e) => {
                             // Socket error, likely allocation closed
+                            debug!(
+                                %client_addr,
+                                error = %e,
+                                "relay socket recv loop exiting"
+                            );
                             break;
                         }
                     }
@@ -876,14 +915,38 @@ async fn spawn_allocation_task(
                     match msg {
                         AllocationMessage::ClientData { data, peer_addr } => {
                             // Forward client data to peer
-                            if let Err(_e) = socket_clone.send_to(&data, &peer_addr).await {
-                                // Silently drop send errors
+                            if let Err(e) = socket_clone.send_to(&data, &peer_addr).await {
+                                debug!(
+                                    %client_addr,
+                                    %peer_addr,
+                                    payload_len = data.len(),
+                                    error = %e,
+                                    "allocation task failed to forward client data to peer"
+                                );
+                            } else {
+                                debug!(
+                                    %client_addr,
+                                    %peer_addr,
+                                    payload_len = data.len(),
+                                    "allocation task forwarded client data to peer"
+                                );
                             }
                         }
                         AllocationMessage::ChannelData { data, channel_num: _ } => {
                             // Forward channel data - data already has channel header
-                            if let Err(_e) = socket_clone.send_to(&data, &client_addr).await {
-                                // Silently drop send errors
+                            if let Err(e) = socket_clone.send_to(&data, &client_addr).await {
+                                debug!(
+                                    %client_addr,
+                                    payload_len = data.len(),
+                                    error = %e,
+                                    "allocation task failed to forward channel data to client"
+                                );
+                            } else {
+                                debug!(
+                                    %client_addr,
+                                    payload_len = data.len(),
+                                    "allocation task forwarded channel data to client"
+                                );
                             }
                         }
                         AllocationMessage::Shutdown => {
