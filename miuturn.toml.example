@@ -5,6 +5,7 @@ log_level="info"
 [server]
 realm = "miuda.ai"
 external_ip = "0.0.0.0"
+relay_bind_ip = "0.0.0.0"
 start_port = 49152
 end_port = 65535
 

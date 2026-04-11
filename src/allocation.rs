@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tracing::{debug, warn};
 
 /// Message types for allocation task communication
 #[derive(Debug)]
@@ -133,8 +134,6 @@ pub struct PortAllocator {
 impl PortAllocator {
     pub fn new(min_port: u16, max_port: u16) -> Self {
         let port_count = max_port - min_port + 1;
-        assert!(port_count <= 16384, "Port range too large");
-        // Calculate number of u64s needed: ceil(port_count / 64)
         let num_u64s = (port_count as usize).div_ceil(64);
         let allocated: Vec<AtomicU64> = (0..num_u64s).map(|_| AtomicU64::new(0)).collect();
         Self {
@@ -146,13 +145,10 @@ impl PortAllocator {
         }
     }
 
-    /// Allocate a port, returns None if no ports available
     #[inline]
     pub fn allocate(&self) -> Option<u16> {
         let num_u64s = self.allocated.len();
 
-        // Fast path: try to find a free port using atomic operations
-        // Start from a random-ish position to reduce contention
         let start_idx = self.allocated_count.load(Ordering::Relaxed) % num_u64s;
 
         for bitmap_idx in 0..num_u64s {
@@ -279,7 +275,8 @@ impl PortAllocator {
 pub struct AllocationTable {
     allocations: RwLock<HashMap<SocketAddr, Arc<RwLock<Allocation>>>>,
     port_allocator: PortAllocator,
-    addr: Ipv4Addr,
+    bind_addr: Ipv4Addr,
+    external_addr: Ipv4Addr,
     realm: String,
     stats: Arc<ServerStats>,
     max_concurrent_allocations: Option<usize>,
@@ -344,8 +341,30 @@ impl AllocationTable {
         Self::with_limits(addr, realm, None, None, None)
     }
 
+    pub fn with_bind_addr(external_addr: Ipv4Addr, bind_addr: Ipv4Addr, realm: String) -> Self {
+        Self::with_limits_and_bind_addr(external_addr, bind_addr, realm, None, None, None)
+    }
+
     pub fn with_limits(
         addr: Ipv4Addr,
+        realm: String,
+        max_concurrent_allocations: Option<usize>,
+        max_allocation_duration_secs: Option<u32>,
+        max_bandwidth_bytes_per_sec: Option<usize>,
+    ) -> Self {
+        Self::with_limits_and_bind_addr(
+            addr,
+            addr,
+            realm,
+            max_concurrent_allocations,
+            max_allocation_duration_secs,
+            max_bandwidth_bytes_per_sec,
+        )
+    }
+
+    pub fn with_limits_and_bind_addr(
+        external_addr: Ipv4Addr,
+        bind_addr: Ipv4Addr,
         realm: String,
         max_concurrent_allocations: Option<usize>,
         max_allocation_duration_secs: Option<u32>,
@@ -355,7 +374,8 @@ impl AllocationTable {
         AllocationTable {
             allocations: RwLock::new(HashMap::new()),
             port_allocator: PortAllocator::new(49152, 65535),
-            addr,
+            bind_addr,
+            external_addr,
             realm,
             stats: Arc::new(ServerStats::default()),
             max_concurrent_allocations,
@@ -376,10 +396,33 @@ impl AllocationTable {
         max_allocation_duration_secs: Option<u32>,
         max_bandwidth_bytes_per_sec: Option<usize>,
     ) -> Self {
+        Self::with_port_range_and_bind_addr(
+            addr,
+            addr,
+            realm,
+            min_port,
+            max_port,
+            max_concurrent_allocations,
+            max_allocation_duration_secs,
+            max_bandwidth_bytes_per_sec,
+        )
+    }
+
+    pub fn with_port_range_and_bind_addr(
+        external_addr: Ipv4Addr,
+        bind_addr: Ipv4Addr,
+        realm: String,
+        min_port: u16,
+        max_port: u16,
+        max_concurrent_allocations: Option<usize>,
+        max_allocation_duration_secs: Option<u32>,
+        max_bandwidth_bytes_per_sec: Option<usize>,
+    ) -> Self {
         AllocationTable {
             allocations: RwLock::new(HashMap::new()),
             port_allocator: PortAllocator::new(min_port, max_port),
-            addr,
+            bind_addr,
+            external_addr,
             realm,
             stats: Arc::new(ServerStats::default()),
             max_concurrent_allocations,
@@ -402,7 +445,13 @@ impl AllocationTable {
         if let Some(max) = self.max_concurrent_allocations {
             let current = self.stats.active_allocations.load(Ordering::Relaxed) as usize;
             if current >= max {
-                return Err(Error::AllocationFailed);
+                debug!(
+                    %client_addr,
+                    current_allocations = current,
+                    max_allocations = max,
+                    "rejecting allocation because server allocation quota is reached"
+                );
+                return Err(Error::AllocationQuotaReached);
             }
         }
 
@@ -418,27 +467,67 @@ impl AllocationTable {
         // If binding fails, we'll retry with another port
         let mut attempts = 0;
         const MAX_ATTEMPTS: usize = 100;
+        let mut last_bind_failure: Option<(SocketAddr, String)> = None;
 
-        let (_port, relay_socket, relayed_addr) = loop {
+        let (_port, relay_socket, relayed_addr, relay_bind_addr) = loop {
             if attempts >= MAX_ATTEMPTS {
-                return Err(Error::AllocationFailed);
+                if let Some((addr, source)) = last_bind_failure {
+                    warn!(
+                        %client_addr,
+                        %addr,
+                        error = %source,
+                        attempts = MAX_ATTEMPTS,
+                        "failed to create allocation after repeated relay bind failures"
+                    );
+                    return Err(Error::RelayBindFailed { addr, source });
+                }
+
+                debug!(
+                    %client_addr,
+                    attempts = MAX_ATTEMPTS,
+                    "failed to create allocation because relay ports are exhausted"
+                );
+                return Err(Error::RelayPortExhausted);
             }
 
-            let port = self
-                .port_allocator
-                .allocate()
-                .ok_or(Error::AllocationFailed)?;
+            let port = self.port_allocator.allocate().ok_or_else(|| {
+                debug!(
+                    %client_addr,
+                    attempts,
+                    min_port = self.port_allocator.min_port,
+                    max_port = self.port_allocator.max_port,
+                    "failed to create allocation because no relay ports are available"
+                );
+                Error::RelayPortExhausted
+            })?;
 
-            let relayed_addr = SocketAddr::V4(SocketAddrV4::new(self.addr, port));
+            let relay_bind_addr = SocketAddr::V4(SocketAddrV4::new(self.bind_addr, port));
+            let relayed_addr = SocketAddr::V4(SocketAddrV4::new(self.external_addr, port));
 
             // Create and bind a dedicated UDP socket for this allocation
-            match UdpSocket::bind(relayed_addr).await {
+            match UdpSocket::bind(relay_bind_addr).await {
                 Ok(socket) => {
-                    break (port, socket, relayed_addr);
+                    debug!(
+                        %client_addr,
+                        %relay_bind_addr,
+                        %relayed_addr,
+                        "bound relay socket for allocation"
+                    );
+                    break (port, socket, relayed_addr, relay_bind_addr);
                 }
-                Err(_) => {
+                Err(err) => {
                     // Port binding failed - release and try again
                     self.port_allocator.release(port);
+                    let err_string = err.to_string();
+                    debug!(
+                        %client_addr,
+                        %relay_bind_addr,
+                        %relayed_addr,
+                        attempt = attempts + 1,
+                        error = %err_string,
+                        "relay socket bind failed while creating allocation"
+                    );
+                    last_bind_failure = Some((relay_bind_addr, err_string));
                     attempts += 1;
                     continue;
                 }
@@ -479,6 +568,15 @@ impl AllocationTable {
         // Register with bandwidth manager for tracking
         self.bandwidth_manager
             .register_allocation(&relayed_addr.to_string(), None);
+
+        debug!(
+            %client_addr,
+            %relay_bind_addr,
+            %relayed_addr,
+            requested_lifetime = requested_lifetime.unwrap_or(600),
+            effective_lifetime = lifetime_secs,
+            "created relay allocation"
+        );
 
         Ok(allocation)
     }
@@ -535,7 +633,10 @@ impl AllocationTable {
     }
 
     /// Get the allocation for a client, returning the Arc for direct access
-    pub fn get_allocation_by_client(&self, client_addr: &SocketAddr) -> Option<Arc<RwLock<Allocation>>> {
+    pub fn get_allocation_by_client(
+        &self,
+        client_addr: &SocketAddr,
+    ) -> Option<Arc<RwLock<Allocation>>> {
         let allocations = self.allocations.read();
         for alloc in allocations.values() {
             let a = alloc.read();
@@ -602,7 +703,9 @@ impl AllocationTable {
         };
         if let Some(socket) = socket {
             let _ = socket.send_to(data, &peer).await;
-            self.stats.total_bytes_relayed.fetch_add(data.len() as u64, Ordering::Relaxed);
+            self.stats
+                .total_bytes_relayed
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
             self.stats.total_messages.fetch_add(1, Ordering::Relaxed);
             return Some(());
         }
@@ -1046,7 +1149,30 @@ mod tests {
 
         let result = table.create_allocation(client3, Some(600)).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::AllocationFailed));
+        assert!(matches!(result.unwrap_err(), Error::AllocationQuotaReached));
+    }
+
+    #[tokio::test]
+    async fn test_allocation_advertises_external_ip_when_bind_ip_differs() {
+        let table = AllocationTable::with_port_range_and_bind_addr(
+            Ipv4Addr::new(203, 0, 113, 10),
+            Ipv4Addr::new(127, 0, 0, 1),
+            "test".to_string(),
+            52001,
+            53000,
+            None,
+            None,
+            None,
+        );
+        let client: SocketAddr = "192.168.1.10:12345".parse().unwrap();
+
+        let allocation = table.create_allocation(client, Some(600)).await.unwrap();
+        let relayed_addr = allocation.read().relayed_addr;
+
+        assert_eq!(
+            relayed_addr.ip(),
+            std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))
+        );
     }
 
     #[tokio::test]

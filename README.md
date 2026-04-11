@@ -40,6 +40,7 @@ Create `miuturn.toml`:
 [server]
 realm = "miuturn"
 external_ip = "YOUR PUBLIC IP HERE"
+relay_bind_ip = "0.0.0.0"
 start_port = 49152
 end_port = 65535
 max_concurrent_allocations = 1000
@@ -91,6 +92,9 @@ ip_range = "0.0.0.0/0"
 action = "Deny"
 priority = 1
 ```
+
+`external_ip` is the relay address advertised back to clients.
+`relay_bind_ip` is the local interface used to bind relay sockets. If omitted, it defaults to `0.0.0.0`. In NAT deployments, set `external_ip` to the public IP and keep `relay_bind_ip` as `0.0.0.0` (or a specific local interface IP if needed).
 
 ## Admin Console
 

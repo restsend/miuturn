@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use std::fmt;
 
 #[derive(Debug)]
@@ -9,6 +11,9 @@ pub enum Error {
     InvalidChannel,
     NoAllocation,
     AllocationFailed,
+    AllocationQuotaReached,
+    RelayPortExhausted,
+    RelayBindFailed { addr: SocketAddr, source: String },
     BandwidthLimitExceeded,
     Encode(&'static str),
     Decode(&'static str),
@@ -23,7 +28,12 @@ impl fmt::Display for Error {
             Error::AlreadyExists => write!(f, "Already exists"),
             Error::InvalidChannel => write!(f, "Invalid channel"),
             Error::NoAllocation => write!(f, "No allocation"),
-            Error::AllocationFailed => write!(f, "Allocation failed - limit reached"),
+            Error::AllocationFailed => write!(f, "Allocation failed"),
+            Error::AllocationQuotaReached => write!(f, "Allocation quota reached"),
+            Error::RelayPortExhausted => write!(f, "No relay ports available"),
+            Error::RelayBindFailed { addr, source } => {
+                write!(f, "Failed to bind relay socket on {}: {}", addr, source)
+            }
             Error::BandwidthLimitExceeded => write!(f, "Bandwidth limit exceeded"),
             Error::Encode(s) => write!(f, "Encode error: {}", s),
             Error::Decode(s) => write!(f, "Decode error: {}", s),

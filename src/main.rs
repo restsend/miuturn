@@ -38,6 +38,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Starting miuturn TURN server");
     println!("Realm: {}", config.server.realm);
     println!("External IP: {}", config.server.external_ip);
+    if let Some(ref relay_bind_ip) = config.server.relay_bind_ip {
+        println!("Relay bind IP: {}", relay_bind_ip);
+    }
     println!(
         "Port range: {}-{}",
         config.server.start_port, config.server.end_port
@@ -48,8 +51,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .external_ip
         .parse()
         .unwrap_or(std::net::Ipv4Addr::new(0, 0, 0, 0));
-    let mut server = TurnServer::with_port_range_limits_and_password(
+    let relay_bind_addr: std::net::Ipv4Addr = config
+        .server
+        .relay_bind_ip
+        .as_deref()
+        .unwrap_or("0.0.0.0")
+        .parse()
+        .unwrap_or(std::net::Ipv4Addr::new(0, 0, 0, 0));
+    let mut server = TurnServer::with_port_range_limits_bind_address_and_password(
         relay_addr,
+        relay_bind_addr,
         config.server.realm.clone(),
         config.server.start_port,
         config.server.end_port,
@@ -61,6 +72,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .map(|b| b as usize),
         "password".to_string(),
         false,
+    );
+
+    info!(
+        external_ip = %relay_addr,
+        relay_bind_ip = %relay_bind_addr,
+        "configured relay addressing"
     );
 
     let auth_manager: SharedAuthManager = Arc::new(AuthManager::new(config.server.realm.clone()));

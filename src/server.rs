@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::RwLock as TokioRwLock;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 type HmacSha1 = Hmac<sha1::Sha1>;
 
@@ -21,6 +21,7 @@ pub struct TurnServer {
     pub allocation_table: Arc<AllocationTable>,
     pub channel_table: Arc<TokioRwLock<ChannelTable>>,
     pub relay_addr: Ipv4Addr,
+    pub relay_bind_addr: Ipv4Addr,
     pub realm: String,
     nonce_map: Arc<RwLock<HashMap<String, NonceEntry>>>,
     password: String,
@@ -61,9 +62,23 @@ impl TurnServer {
         max_port: u16,
         password: String,
     ) -> Self {
+        Self::with_port_range_and_bind_address_and_password(
+            relay_addr, relay_addr, realm, min_port, max_port, password,
+        )
+    }
+
+    pub fn with_port_range_and_bind_address_and_password(
+        relay_addr: Ipv4Addr,
+        relay_bind_addr: Ipv4Addr,
+        realm: String,
+        min_port: u16,
+        max_port: u16,
+        password: String,
+    ) -> Self {
         let server = TurnServer {
-            allocation_table: Arc::new(AllocationTable::with_port_range(
+            allocation_table: Arc::new(AllocationTable::with_port_range_and_bind_addr(
                 relay_addr,
+                relay_bind_addr,
                 realm.clone(),
                 min_port,
                 max_port,
@@ -73,6 +88,7 @@ impl TurnServer {
             )),
             channel_table: Arc::new(TokioRwLock::new(ChannelTable::new())),
             relay_addr,
+            relay_bind_addr,
             realm,
             nonce_map: Arc::new(RwLock::new(HashMap::new())),
             password,
@@ -96,9 +112,36 @@ impl TurnServer {
         password: String,
         auth_disabled: bool,
     ) -> Self {
+        Self::with_port_range_limits_bind_address_and_password(
+            relay_addr,
+            relay_addr,
+            realm,
+            min_port,
+            max_port,
+            max_concurrent_allocations,
+            max_allocation_duration_secs,
+            max_bandwidth_bytes_per_sec,
+            password,
+            auth_disabled,
+        )
+    }
+
+    pub fn with_port_range_limits_bind_address_and_password(
+        relay_addr: Ipv4Addr,
+        relay_bind_addr: Ipv4Addr,
+        realm: String,
+        min_port: u16,
+        max_port: u16,
+        max_concurrent_allocations: Option<usize>,
+        max_allocation_duration_secs: Option<u32>,
+        max_bandwidth_bytes_per_sec: Option<usize>,
+        password: String,
+        auth_disabled: bool,
+    ) -> Self {
         let server = TurnServer {
-            allocation_table: Arc::new(AllocationTable::with_port_range(
+            allocation_table: Arc::new(AllocationTable::with_port_range_and_bind_addr(
                 relay_addr,
+                relay_bind_addr,
                 realm.clone(),
                 min_port,
                 max_port,
@@ -108,6 +151,7 @@ impl TurnServer {
             )),
             channel_table: Arc::new(TokioRwLock::new(ChannelTable::new())),
             relay_addr,
+            relay_bind_addr,
             realm,
             nonce_map: Arc::new(RwLock::new(HashMap::new())),
             password,
@@ -138,6 +182,7 @@ impl TurnServer {
             )),
             channel_table: Arc::new(TokioRwLock::new(ChannelTable::new())),
             relay_addr,
+            relay_bind_addr: relay_addr,
             realm,
             nonce_map: Arc::new(RwLock::new(HashMap::new())),
             password: String::new(),
@@ -187,6 +232,7 @@ impl TurnServer {
             )),
             channel_table: Arc::new(TokioRwLock::new(ChannelTable::new())),
             relay_addr,
+            relay_bind_addr: relay_addr,
             realm,
             nonce_map: Arc::new(RwLock::new(HashMap::new())),
             password,
@@ -724,22 +770,49 @@ async fn handle_allocate(
     client_addr: SocketAddr,
 ) -> Option<Bytes> {
     // Verify auth
-    if let Err(resp) = verify_turn_auth(&msg, server, client_addr) {
-        return Some(resp);
-    }
+    let username = match verify_turn_auth(&msg, server, client_addr) {
+        Ok(username) => username,
+        Err(resp) => return Some(resp),
+    };
 
     let lifetime = get_lifetime(&msg);
+    debug!(
+        %client_addr,
+        %username,
+        lifetime,
+        "received TURN Allocate request"
+    );
+
     let allocation = match server
         .allocation_table
         .create_allocation(client_addr, Some(lifetime))
         .await
     {
         Ok(a) => a,
-        Err(_) => {
-            return Some(create_error_response_bytes(
-                &msg,
-                ErrorCode::AllocationMismatch,
-            ));
+        Err(err) => {
+            let (code, reason) = match &err {
+                crate::errors::Error::AllocationQuotaReached => (
+                    ErrorCode::AllocationQuotaReached,
+                    "server allocation quota reached".to_string(),
+                ),
+                crate::errors::Error::RelayPortExhausted
+                | crate::errors::Error::RelayBindFailed { .. } => {
+                    (ErrorCode::InsufficientCapacity, err.to_string())
+                }
+                _ => (ErrorCode::ServerError, err.to_string()),
+            };
+
+            warn!(
+                %client_addr,
+                %username,
+                lifetime,
+                error = %err,
+                reason = %reason,
+                ?code,
+                "TURN Allocate request failed"
+            );
+
+            return Some(create_error_response_bytes_with_reason(&msg, code, &reason));
         }
     };
 
@@ -769,6 +842,14 @@ async fn handle_allocate(
         attr_type: Attribute::REALM,
         value: Bytes::from(server.realm.as_bytes().to_vec()),
     });
+
+    debug!(
+        %client_addr,
+        %username,
+        relayed_addr = %relayed_addr,
+        lifetime,
+        "TURN Allocate request succeeded"
+    );
 
     Some(response.encode())
 }
@@ -953,11 +1034,29 @@ fn create_401_response(msg: &Message, server: &TurnServer, _reason: Option<Strin
         attr_type: Attribute::NONCE,
         value: Bytes::from(nonce.into_bytes()),
     });
+    response.attributes.push(Attribute {
+        attr_type: Attribute::SOFTWARE,
+        value: Bytes::from_static(b"miuturn"),
+    });
     response.encode()
 }
 
 fn create_error_response_bytes(msg: &Message, code: ErrorCode) -> Bytes {
-    let response = crate::message::create_error_response(&msg.header, code);
+    let mut response = crate::message::create_error_response(&msg.header, code);
+    response.attributes.push(Attribute {
+        attr_type: Attribute::SOFTWARE,
+        value: Bytes::from_static(b"miuturn"),
+    });
+    response.encode()
+}
+
+fn create_error_response_bytes_with_reason(msg: &Message, code: ErrorCode, reason: &str) -> Bytes {
+    let mut response =
+        crate::message::create_error_response_with_reason(&msg.header, code, Some(reason));
+    response.attributes.push(Attribute {
+        attr_type: Attribute::SOFTWARE,
+        value: Bytes::from_static(b"miuturn"),
+    });
     response.encode()
 }
 
@@ -996,6 +1095,7 @@ mod tests {
     fn test_create_server() {
         let server = TurnServer::new(Ipv4Addr::new(0, 0, 0, 0), "test".to_string());
         assert_eq!(server.relay_addr, Ipv4Addr::new(0, 0, 0, 0));
+        assert_eq!(server.relay_bind_addr, Ipv4Addr::new(0, 0, 0, 0));
     }
 
     #[tokio::test]
@@ -1015,6 +1115,7 @@ mod tests {
             Some(1024),
         );
         assert_eq!(server.relay_addr, Ipv4Addr::new(127, 0, 0, 1));
+        assert_eq!(server.relay_bind_addr, Ipv4Addr::new(127, 0, 0, 1));
     }
 
     #[test]

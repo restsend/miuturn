@@ -17,6 +17,8 @@ pub struct Config {
 pub struct ServerConfig {
     pub realm: String,
     pub external_ip: String,
+    #[serde(default)]
+    pub relay_bind_ip: Option<String>,
     pub start_port: u16,
     pub end_port: u16,
     pub listening: Vec<ListenConfig>,
@@ -130,6 +132,7 @@ impl Default for Config {
             server: ServerConfig {
                 realm: "miuturn".to_string(),
                 external_ip: "0.0.0.0".to_string(),
+                relay_bind_ip: None,
                 start_port: 49152,
                 end_port: 65535,
                 listening: vec![
@@ -176,6 +179,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.server.realm, "miuturn");
         assert_eq!(config.server.external_ip, "0.0.0.0");
+        assert_eq!(config.server.relay_bind_ip, None);
         assert_eq!(config.server.start_port, 49152);
         assert_eq!(config.server.end_port, 65535);
         assert!(config.server.max_concurrent_allocations.is_none());
@@ -205,6 +209,7 @@ mod tests {
 [server]
 realm = "test-realm"
 external_ip = "192.168.1.1"
+relay_bind_ip = "0.0.0.0"
 start_port = 49152
 end_port = 65535
 max_concurrent_allocations = 100
@@ -238,6 +243,7 @@ priority = 0
         let config: Config = toml::from_str(toml_content).unwrap();
         assert_eq!(config.server.realm, "test-realm");
         assert_eq!(config.server.external_ip, "192.168.1.1");
+        assert_eq!(config.server.relay_bind_ip.as_deref(), Some("0.0.0.0"));
         assert_eq!(config.http.as_ref().unwrap().turn_rest_enabled, Some(true));
         assert_eq!(
             config.http.as_ref().unwrap().turn_rest_secret,

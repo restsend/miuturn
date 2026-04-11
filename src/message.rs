@@ -36,6 +36,7 @@ pub enum ErrorCode {
     AllocationQuotaReached = 486,
     RoleConflict = 487,
     ServerError = 500,
+    InsufficientCapacity = 508,
 }
 
 impl ErrorCode {
@@ -381,7 +382,11 @@ impl Message {
     }
 }
 
-pub fn create_error_response(header: &MessageHeader, code: ErrorCode) -> Message {
+pub fn create_error_response_with_reason(
+    header: &MessageHeader,
+    code: ErrorCode,
+    reason: Option<&str>,
+) -> Message {
     let mut msg = Message {
         header: MessageHeader {
             method: header.method,
@@ -397,13 +402,19 @@ pub fn create_error_response(header: &MessageHeader, code: ErrorCode) -> Message
     let number = (code.code() % 100) as u32;
     // RFC 5389: 4 bytes = 21 reserved bits | 3 class bits | 8 number bits
     err_buf.put_u32((class << 8) | number);
-    let reason = format!("{:?}", code);
+    let reason = reason
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{:?}", code));
     err_buf.put_slice(reason.as_bytes());
     msg.add_attribute(Attribute {
         attr_type: Attribute::ERROR_CODE,
         value: err_buf.freeze(),
     });
     msg
+}
+
+pub fn create_error_response(header: &MessageHeader, code: ErrorCode) -> Message {
+    create_error_response_with_reason(header, code, None)
 }
 
 pub fn create_success_response(header: &MessageHeader) -> Message {
@@ -527,6 +538,19 @@ mod tests {
             0x00000401
         );
         assert_eq!(&val[4..], b"Unauthorized");
+
+        // Verify custom reason text can be supplied.
+        let msg_custom = create_error_response_with_reason(
+            &header,
+            ErrorCode::InsufficientCapacity,
+            Some("relay bind failed"),
+        );
+        let attr_custom = msg_custom
+            .attributes
+            .iter()
+            .find(|a| a.attr_type == Attribute::ERROR_CODE)
+            .unwrap();
+        assert_eq!(&attr_custom.value[4..], b"relay bind failed");
 
         // Verify 300 (TryAlternate): class=3, number=0 → 0x00000300
         let msg300 = create_error_response(&header, ErrorCode::TryAlternate);
