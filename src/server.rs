@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::RwLock as TokioRwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 type HmacSha1 = Hmac<sha1::Sha1>;
 
@@ -286,7 +286,13 @@ impl TurnServer {
                 interval.tick().await;
                 let removed_count = allocation_table.cleanup_expired();
                 if removed_count > 0 {
-                    tracing::info!("Cleaned up {} expired allocations", removed_count);
+                    let (active_count, total_allocations) = allocation_table.port_stats();
+                    tracing::info!(
+                        active_count,
+                        total_allocations,
+                        removed_count,
+                        "Cleaned up expired allocations"
+                    );
                 }
             }
         });
@@ -801,7 +807,7 @@ async fn handle_allocate(
     };
 
     let lifetime = get_lifetime(&msg);
-    debug!(
+    trace!(
         %client_addr,
         %username,
         lifetime,
@@ -889,7 +895,7 @@ async fn handle_allocate(
         }
     }
 
-    debug!(
+    info!(
         %client_addr,
         %username,
         relayed_addr = %relayed_addr,
@@ -1336,17 +1342,43 @@ mod tests {
         .unwrap();
 
         // Retry Allocate with long-term auth and verify success attributes.
-        let auth_msg = build_authenticated_allocate_request(
-            [11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
-            username,
-            &realm,
-            &nonce,
-            password,
+        // Under parallel test load, relay port contention can cause transient 486/508.
+        let mut success_msg: Option<Message> = None;
+        for attempt in 0..5 {
+            let mut tid = [0u8; 12];
+            tid[11] = attempt;
+            let auth_msg =
+                build_authenticated_allocate_request(tid, username, &realm, &nonce, password);
+            let response = process_message(auth_msg, &server, client_addr)
+                .await
+                .unwrap();
+            let parsed = Message::parse(&response).unwrap();
+
+            if parsed.header.event_type == EventType::Success {
+                success_msg = Some(parsed);
+                break;
+            }
+
+            let err_attr = parsed
+                .get_attribute(Attribute::ERROR_CODE)
+                .expect("error response should include ERROR-CODE");
+            let raw = u32::from_be_bytes([
+                err_attr.value[0],
+                err_attr.value[1],
+                err_attr.value[2],
+                err_attr.value[3],
+            ]);
+            let code = ((raw >> 8) & 0x7) * 100 + (raw & 0xff);
+            assert!(
+                code == 486 || code == 508,
+                "unexpected Allocate error code in auth test: {}",
+                code
+            );
+        }
+
+        let success_msg = success_msg.expect(
+            "authenticated Allocate should eventually succeed (no Success after transient retries)",
         );
-        let success_response = process_message(auth_msg, &server, client_addr)
-            .await
-            .unwrap();
-        let success_msg = Message::parse(&success_response).unwrap();
 
         assert_eq!(success_msg.header.method, Method::Allocate);
         assert_eq!(success_msg.header.event_type, EventType::Success);

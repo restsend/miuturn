@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 /// Message types for allocation task communication
 #[derive(Debug)]
@@ -563,7 +563,7 @@ impl AllocationTable {
         self.bandwidth_manager
             .register_allocation(&relayed_addr.to_string(), None);
 
-        debug!(
+        trace!(
             %client_addr,
             %relay_bind_addr,
             %relayed_addr,
