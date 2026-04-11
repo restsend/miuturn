@@ -2,13 +2,89 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::{Bytes, BytesMut};
+use hmac::{Hmac, KeyInit, Mac};
+use sha1::Sha1;
 use tokio::net::UdpSocket;
 use tokio::time::sleep;
 
 use turn::client::Client;
 use turn::client::ClientConfig;
 
-use miuturn::TurnServer;
+use miuturn::{Attribute, EventType, Message, MessageHeader, Method, TurnServer};
+
+type HmacSha1 = Hmac<Sha1>;
+
+fn compute_message_integrity_key(username: &str, realm: &str, password: &str) -> Vec<u8> {
+    let key_input = format!("{}:{}:{}", username, realm, password);
+    md5::compute(key_input.as_bytes()).to_vec()
+}
+
+fn add_request_message_integrity(msg: &mut Message, key: &[u8]) {
+    let mut attr_buf = BytesMut::new();
+    for attr in &msg.attributes {
+        attr.encode(&mut attr_buf);
+    }
+
+    let mut header = msg.header.clone();
+    header.message_length = (attr_buf.len() + 24) as u16;
+    header.magic_cookie = 0x2112A442;
+
+    let mut buf = BytesMut::new();
+    header.encode(&mut buf);
+    buf.extend_from_slice(&attr_buf.freeze());
+
+    let mut mac = HmacSha1::new_from_slice(key).ok().unwrap();
+    mac.update(&buf);
+    let computed = mac.finalize().into_bytes();
+
+    msg.attributes.push(Attribute {
+        attr_type: Attribute::MESSAGE_INTEGRITY,
+        value: Bytes::copy_from_slice(&computed[..20]),
+    });
+}
+
+fn build_allocate_request(transaction_id: [u8; 12]) -> Message {
+    Message {
+        header: MessageHeader {
+            method: Method::Allocate,
+            event_type: EventType::Request,
+            message_length: 0,
+            magic_cookie: 0x2112A442,
+            transaction_id,
+        },
+        attributes: vec![Attribute {
+            attr_type: Attribute::REQUESTED_TRANSPORT,
+            value: Bytes::from_static(&[0x11, 0x00, 0x00, 0x00]),
+        }],
+    }
+}
+
+fn build_authenticated_allocate_request(
+    transaction_id: [u8; 12],
+    username: &str,
+    realm: &str,
+    nonce: &str,
+    password: &str,
+) -> Message {
+    let mut msg = build_allocate_request(transaction_id);
+    msg.attributes.push(Attribute {
+        attr_type: Attribute::USERNAME,
+        value: Bytes::copy_from_slice(username.as_bytes()),
+    });
+    msg.attributes.push(Attribute {
+        attr_type: Attribute::REALM,
+        value: Bytes::copy_from_slice(realm.as_bytes()),
+    });
+    msg.attributes.push(Attribute {
+        attr_type: Attribute::NONCE,
+        value: Bytes::copy_from_slice(nonce.as_bytes()),
+    });
+
+    let key = compute_message_integrity_key(username, realm, password);
+    add_request_message_integrity(&mut msg, &key);
+    msg
+}
 
 #[tokio::test]
 async fn test_e2e_turn_allocation() {
@@ -117,6 +193,91 @@ async fn test_turn_allocate_with_auth_via_crate() {
     println!("Allocate successful!");
 
     let _ = client.close().await;
+}
+
+#[tokio::test]
+async fn test_e2e_allocate_protocol_asserts_required_success_attributes() {
+    let relay_addr: std::net::Ipv4Addr = "127.0.0.1".parse().unwrap();
+    let realm = "test".to_string();
+    let username = "admin";
+    let password = "password";
+    let server = TurnServer::with_port_range_and_password(
+        relay_addr,
+        realm.clone(),
+        46000,
+        46099,
+        password.to_string(),
+    );
+
+    let server_addr: SocketAddr = "127.0.0.1:3511".parse().unwrap();
+    let srv = server.clone();
+    tokio::spawn(async move {
+        let _ = srv.run_udp(server_addr).await;
+    });
+
+    sleep(Duration::from_millis(100)).await;
+
+    let client_socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+
+    // First Allocate without auth to get NONCE.
+    let unauth_req = build_allocate_request([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    client_socket
+        .send_to(&unauth_req.encode(), server_addr)
+        .await
+        .unwrap();
+    let mut buf = [0u8; 2048];
+    let (len_401, _) = client_socket.recv_from(&mut buf).await.unwrap();
+    let resp_401 = Message::parse(&buf[..len_401]).unwrap();
+    assert_eq!(resp_401.header.event_type, EventType::Error);
+    let nonce = String::from_utf8(
+        resp_401
+            .get_attribute(Attribute::NONCE)
+            .unwrap()
+            .value
+            .to_vec(),
+    )
+    .unwrap();
+
+    // Authenticated Allocate and protocol-attribute assertions.
+    let auth_req = build_authenticated_allocate_request(
+        [12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1],
+        username,
+        &realm,
+        &nonce,
+        password,
+    );
+    client_socket
+        .send_to(&auth_req.encode(), server_addr)
+        .await
+        .unwrap();
+
+    let (len_success, _) = client_socket.recv_from(&mut buf).await.unwrap();
+    let resp_success = Message::parse(&buf[..len_success]).unwrap();
+
+    assert_eq!(resp_success.header.method, Method::Allocate);
+    assert_eq!(resp_success.header.event_type, EventType::Success);
+
+    let mi = resp_success
+        .get_attribute(Attribute::MESSAGE_INTEGRITY)
+        .expect("Allocate success should include MESSAGE-INTEGRITY");
+    assert_eq!(mi.value.len(), 20);
+
+    assert!(
+        resp_success
+            .get_attribute(Attribute::XOR_RELAYED_ADDRESS)
+            .is_some(),
+        "Allocate success should include XOR-RELAYED-ADDRESS"
+    );
+    assert!(
+        resp_success
+            .get_attribute(Attribute::XOR_MAPPED_ADDRESS)
+            .is_some(),
+        "Allocate success should include XOR-MAPPED-ADDRESS"
+    );
+    assert!(
+        resp_success.get_attribute(Attribute::LIFETIME).is_some(),
+        "Allocate success should include LIFETIME"
+    );
 }
 
 #[tokio::test]

@@ -680,6 +680,31 @@ fn verify_message_integrity(msg: &Message, key: &[u8]) -> bool {
     computed[..20] == integrity_attr.value[..20]
 }
 
+fn add_response_message_integrity(response: &mut Message, key: &[u8]) {
+    let mut attr_buf = BytesMut::new();
+    for attr in &response.attributes {
+        attr.encode(&mut attr_buf);
+    }
+
+    // MESSAGE-INTEGRITY is 24 bytes total on wire (type+len+20-byte HMAC value).
+    let mut header = response.header.clone();
+    header.message_length = (attr_buf.len() + 24) as u16;
+    header.magic_cookie = 0x2112A442;
+
+    let mut buf = BytesMut::new();
+    header.encode(&mut buf);
+    buf.extend_from_slice(&attr_buf.freeze());
+
+    let mut mac = HmacSha1::new_from_slice(key).ok().unwrap();
+    mac.update(&buf);
+    let computed = mac.finalize().into_bytes();
+
+    response.attributes.push(Attribute {
+        attr_type: Attribute::MESSAGE_INTEGRITY,
+        value: Bytes::copy_from_slice(&computed[..20]),
+    });
+}
+
 /// Verify TURN long-term credential auth (nonce + username + MESSAGE-INTEGRITY).
 /// Returns Ok(username) on success, or a 401 response bytes on failure.
 fn verify_turn_auth(
@@ -835,6 +860,10 @@ async fn handle_allocate(
         value: encode_xor_address(relayed_addr, magic, &msg.header.transaction_id),
     });
     response.attributes.push(Attribute {
+        attr_type: Attribute::XOR_MAPPED_ADDRESS,
+        value: encode_xor_address(client_addr, magic, &msg.header.transaction_id),
+    });
+    response.attributes.push(Attribute {
         attr_type: Attribute::LIFETIME,
         value: Bytes::from(lifetime.to_be_bytes().to_vec()),
     });
@@ -842,6 +871,23 @@ async fn handle_allocate(
         attr_type: Attribute::REALM,
         value: Bytes::from(server.realm.as_bytes().to_vec()),
     });
+    response.attributes.push(Attribute {
+        attr_type: Attribute::SOFTWARE,
+        value: Bytes::from_static(b"miuturn"),
+    });
+
+    if !server.auth_disabled {
+        if let Some(password) = server.get_password_for_user(&username) {
+            let key = compute_message_integrity_key(&username, &server.realm, &password);
+            add_response_message_integrity(&mut response, &key);
+        } else {
+            warn!(
+                %client_addr,
+                %username,
+                "could not add MESSAGE-INTEGRITY to Allocate success response because user password was unavailable"
+            );
+        }
+    }
 
     debug!(
         %client_addr,
@@ -1023,16 +1069,17 @@ async fn handle_channel_bind(
 async fn handle_send(msg: Message, server: &TurnServer, client_addr: SocketAddr) -> Option<Bytes> {
     // Send indications don't require MESSAGE-INTEGRITY (they're indications, not requests)
     // But the client must have an allocation
-    let _relayed_addr = match server.allocation_table.find_allocation_by_client(&client_addr) {
-        Some(addr) => addr,
-        None => {
-            debug!(
-                %client_addr,
-                "Send indication dropped because client has no active allocation"
-            );
-            return None;
-        }
-    };
+    if server
+        .allocation_table
+        .find_allocation_by_client(&client_addr)
+        .is_none()
+    {
+        debug!(
+            %client_addr,
+            "Send indication dropped because client has no active allocation"
+        );
+        return None;
+    }
 
     let peer_attr = match msg.get_attribute(Attribute::PEER_ADDRESS) {
         Some(attr) => attr,
@@ -1166,6 +1213,48 @@ impl TurnServerHandle {
 mod tests {
     use super::*;
 
+    fn build_allocate_request(transaction_id: [u8; 12]) -> Message {
+        Message {
+            header: MessageHeader {
+                method: Method::Allocate,
+                event_type: EventType::Request,
+                message_length: 0,
+                magic_cookie: 0x2112A442,
+                transaction_id,
+            },
+            attributes: vec![Attribute {
+                attr_type: Attribute::REQUESTED_TRANSPORT,
+                value: Bytes::from_static(&[0x11, 0x00, 0x00, 0x00]),
+            }],
+        }
+    }
+
+    fn build_authenticated_allocate_request(
+        transaction_id: [u8; 12],
+        username: &str,
+        realm: &str,
+        nonce: &str,
+        password: &str,
+    ) -> Message {
+        let mut msg = build_allocate_request(transaction_id);
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::USERNAME,
+            value: Bytes::copy_from_slice(username.as_bytes()),
+        });
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::REALM,
+            value: Bytes::copy_from_slice(realm.as_bytes()),
+        });
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::NONCE,
+            value: Bytes::copy_from_slice(nonce.as_bytes()),
+        });
+
+        let key = compute_message_integrity_key(username, realm, password);
+        add_response_message_integrity(&mut msg, &key);
+        msg
+    }
+
     #[test]
     fn test_create_server() {
         let server = TurnServer::new(Ipv4Addr::new(0, 0, 0, 0), "test".to_string());
@@ -1216,5 +1305,66 @@ mod tests {
     fn test_message_integrity_key() {
         let key = compute_message_integrity_key("user", "realm", "pass");
         assert_eq!(key.len(), 16);
+    }
+
+    #[tokio::test]
+    async fn test_authenticated_allocate_success_contains_required_attributes() {
+        let realm = "test-realm".to_string();
+        let username = "admin";
+        let password = "password";
+        let server = TurnServer::with_password(
+            Ipv4Addr::new(127, 0, 0, 1),
+            realm.clone(),
+            password.to_string(),
+        );
+        let client_addr: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+
+        // First Allocate without auth to obtain nonce.
+        let unauth_msg = build_allocate_request([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        let nonce_response = process_message(unauth_msg, &server, client_addr)
+            .await
+            .unwrap();
+        let nonce_msg = Message::parse(&nonce_response).unwrap();
+        assert_eq!(nonce_msg.header.event_type, EventType::Error);
+        let nonce = String::from_utf8(
+            nonce_msg
+                .get_attribute(Attribute::NONCE)
+                .unwrap()
+                .value
+                .to_vec(),
+        )
+        .unwrap();
+
+        // Retry Allocate with long-term auth and verify success attributes.
+        let auth_msg = build_authenticated_allocate_request(
+            [11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+            username,
+            &realm,
+            &nonce,
+            password,
+        );
+        let success_response = process_message(auth_msg, &server, client_addr)
+            .await
+            .unwrap();
+        let success_msg = Message::parse(&success_response).unwrap();
+
+        assert_eq!(success_msg.header.method, Method::Allocate);
+        assert_eq!(success_msg.header.event_type, EventType::Success);
+        assert!(
+            success_msg
+                .get_attribute(Attribute::MESSAGE_INTEGRITY)
+                .is_some()
+        );
+        assert!(
+            success_msg
+                .get_attribute(Attribute::XOR_RELAYED_ADDRESS)
+                .is_some()
+        );
+        assert!(
+            success_msg
+                .get_attribute(Attribute::XOR_MAPPED_ADDRESS)
+                .is_some()
+        );
+        assert!(success_msg.get_attribute(Attribute::LIFETIME).is_some());
     }
 }
