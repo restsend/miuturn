@@ -27,6 +27,14 @@ cargo build --release
 
 ### Docker
 
+#### Using Pre-built Image (Recommended)
+
+```bash
+docker run -p 3478:3478 -p 3478:3478/udp -p 8080:8080 docker.cnb.cool/miuda.ai/miuturn:latest
+```
+
+#### Build from Source
+
 ```bash
 docker build -t miuturn .
 docker run -p 3478:3478 -p 3478:3478/udp -p 8080:8080 miuturn
