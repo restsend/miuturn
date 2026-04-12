@@ -1234,14 +1234,6 @@ async fn handle_send(msg: Message, server: &TurnServer, client_addr: SocketAddr)
         );
         return None;
     }
-
-    debug!(
-        %client_addr,
-        %peer_addr,
-        payload_len = data.len(),
-        "Send indication relayed to peer"
-    );
-
     // Send indication doesn't generate a response
     None
 }

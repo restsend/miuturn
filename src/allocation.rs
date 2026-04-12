@@ -728,12 +728,6 @@ impl AllocationTable {
                 .total_bytes_relayed
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
             self.stats.total_messages.fetch_add(1, Ordering::Relaxed);
-            debug!(
-                %client_addr,
-                %peer,
-                payload_len = data.len(),
-                "sent relay packet to peer"
-            );
             return Some(());
         }
         debug!(
