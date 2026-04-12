@@ -902,13 +902,6 @@ async fn spawn_allocation_task(
                                     error = %e,
                                     "failed to forward peer packet to client as Data Indication"
                                 );
-                            } else {
-                                debug!(
-                                    %client_addr,
-                                    %peer_addr,
-                                    payload_len = len,
-                                    "forwarded peer packet to client as Data Indication"
-                                );
                             }
                         }
                         Err(e) => {
