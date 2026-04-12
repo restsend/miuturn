@@ -16,6 +16,50 @@ use tracing::{debug, error, info, trace, warn};
 
 type HmacSha1 = Hmac<sha1::Sha1>;
 
+/// Format bytes into human-readable string
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    const TB: u64 = GB * 1024;
+    
+    if bytes >= TB {
+        format!("{:.2} TB", bytes as f64 / TB as f64)
+    } else if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Format bytes and rate for stats output
+fn format_bytes_and_rate(total: u64, delta: u64, interval_secs: u64) -> (String, String) {
+    let total_str = format_bytes(total);
+    let rate = if interval_secs > 0 {
+        delta / interval_secs
+    } else {
+        0
+    };
+    let rate_str = format!("{}/s", format_bytes(rate));
+    (total_str, rate_str)
+}
+
+/// Format messages and rate for stats output
+fn format_messages_and_rate(total: u64, delta: u64, interval_secs: u64) -> (String, String) {
+    let total_str = format!("{}", total);
+    let rate = if interval_secs > 0 {
+        delta / interval_secs
+    } else {
+        0
+    };
+    let rate_str = format!("{}", rate);
+    (total_str, rate_str)
+}
+
 #[derive(Clone)]
 pub struct TurnServer {
     pub allocation_table: Arc<AllocationTable>,
@@ -270,6 +314,45 @@ impl TurnServer {
         self.allocation_table.stats().snapshot()
     }
 
+    /// Start a background task to periodically dump statistics
+    pub fn start_stats_dump_task(&self, interval_secs: u64) {
+        let stats = self.allocation_table.stats();
+        
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+            let mut prev_bytes = 0u64;
+            let mut prev_messages = 0u64;
+            
+            loop {
+                interval.tick().await;
+                
+                let current_bytes = stats.total_bytes_relayed.load(std::sync::atomic::Ordering::Relaxed);
+                let current_messages = stats.total_messages.load(std::sync::atomic::Ordering::Relaxed);
+                let active = stats.active_allocations.load(std::sync::atomic::Ordering::Relaxed);
+                let total = stats.total_allocations.load(std::sync::atomic::Ordering::Relaxed);
+                
+                let bytes_delta = current_bytes.saturating_sub(prev_bytes);
+                let messages_delta = current_messages.saturating_sub(prev_messages);
+                
+                // Format bytes
+                let (bytes_str, bytes_rate_str) = format_bytes_and_rate(current_bytes, bytes_delta, interval_secs);
+                let (msg_str, msg_rate_str) = format_messages_and_rate(current_messages, messages_delta, interval_secs);
+                
+                tracing::info!(
+                    "[STATS] Active: {} | Total: {} | Bytes: {} (+{}/s) | Messages: {} (+{}/s)",
+                    active, total, bytes_str, bytes_rate_str, msg_str, msg_rate_str
+                );
+                
+                prev_bytes = current_bytes;
+                prev_messages = current_messages;
+            }
+        });
+    }
+
     /// Start a background task to clean up expired allocations
     pub fn start_allocation_cleanup_task(&self) {
         let allocation_table = self.allocation_table.clone();
@@ -413,9 +496,15 @@ impl TurnServer {
         self.start_nonce_cleanup_task();
         self.start_channel_cleanup_task();
         self.start_allocation_cleanup_task();
+        
+        // Start stats dump task (every 5 seconds)
+        self.start_stats_dump_task(5);
 
         let socket = Arc::new(UdpSocket::bind(addr).await?);
         info!("TURN UDP server listening on {}", addr);
+
+        // Set main socket for Data Indication NAT traversal
+        self.allocation_table.set_main_socket(socket.clone());
 
         // Optimized worker pool with round-robin message distribution
         let num_workers = num_cpus::get().max(4);

@@ -283,8 +283,8 @@ pub struct AllocationTable {
     max_allocation_duration_secs: Option<u32>,
     _current_bandwidth_bytes_per_sec: AtomicUsize,
     _max_bandwidth_bytes_per_sec: Option<usize>,
-    /// Bandwidth manager for tracking per-allocation bandwidth
     bandwidth_manager: Arc<crate::bandwidth::BandwidthManager>,
+    main_socket: RwLock<Option<std::sync::Arc<tokio::net::UdpSocket>>>,
 }
 
 #[derive(Debug)]
@@ -383,6 +383,7 @@ impl AllocationTable {
             _current_bandwidth_bytes_per_sec: AtomicUsize::new(0),
             _max_bandwidth_bytes_per_sec: max_bandwidth_bytes_per_sec,
             bandwidth_manager: Arc::new(crate::bandwidth::BandwidthManager::new(None)),
+            main_socket: RwLock::new(None),
         }
     }
 
@@ -430,7 +431,12 @@ impl AllocationTable {
             _current_bandwidth_bytes_per_sec: AtomicUsize::new(0),
             _max_bandwidth_bytes_per_sec: max_bandwidth_bytes_per_sec,
             bandwidth_manager: Arc::new(crate::bandwidth::BandwidthManager::new(None)),
+            main_socket: RwLock::new(None),
         }
+    }
+
+    pub fn set_main_socket(&self, socket: Arc<tokio::net::UdpSocket>) {
+        *self.main_socket.write() = Some(socket);
     }
 
     pub fn stats(&self) -> Arc<ServerStats> {
@@ -534,8 +540,14 @@ impl AllocationTable {
         getrandom(&mut id);
 
         // Spawn the per-allocation task
+        let main_socket = self
+            .main_socket
+            .read()
+            .clone()
+            .unwrap_or_else(|| relay_socket.clone());
         let relay = spawn_allocation_task(
             relay_socket.clone(),
+            main_socket, // Use main socket for sending Data Indication
             client_addr,
             relayed_addr,
             self.stats.clone(),
@@ -858,6 +870,7 @@ fn build_data_indication(peer_addr: SocketAddr, payload: &[u8]) -> Bytes {
 /// This eliminates lock contention by giving each allocation its own processing loop
 async fn spawn_allocation_task(
     socket: Arc<UdpSocket>,
+    main_socket: Arc<UdpSocket>, // Main socket for sending Data Indication
     client_addr: SocketAddr,
     _relayed_addr: SocketAddr,
     stats: Arc<ServerStats>,
@@ -865,6 +878,7 @@ async fn spawn_allocation_task(
     let (tx, mut rx) = mpsc::channel::<AllocationMessage>(1024);
 
     let socket_clone = socket.clone();
+    let main_socket_clone = main_socket.clone();
 
     let task_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
@@ -879,9 +893,8 @@ async fn spawn_allocation_task(
                             stats.total_bytes_relayed.fetch_add(len as u64, Ordering::Relaxed);
                             stats.total_messages.fetch_add(1, Ordering::Relaxed);
 
-                            // Forward to client as TURN Data Indication (RFC 5766 Section 10.4)
                             let indication = build_data_indication(peer_addr, &buf[..len]);
-                            if let Err(e) = socket_clone.send_to(&indication, &client_addr).await {
+                            if let Err(e) = main_socket_clone.send_to(&indication, &client_addr).await {
                                 debug!(
                                     %client_addr,
                                     %peer_addr,
