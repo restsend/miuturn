@@ -970,7 +970,7 @@ async fn spawn_allocation_task(
 }
 
 pub struct ChannelTable {
-    channels: RwLock<HashMap<u16, ChannelBinding>>,
+    channels: RwLock<HashMap<(SocketAddr, u16), ChannelBinding>>,
     next_channel: u16,
 }
 
@@ -1012,11 +1012,12 @@ impl ChannelTable {
         relayed_addr: SocketAddr,
     ) -> Result<(), Error> {
         let mut channels = self.channels.write();
-        if channels.contains_key(&channel_id) {
+        let key = (relayed_addr, channel_id);
+        if channels.contains_key(&key) {
             return Err(Error::AlreadyExists);
         }
         channels.insert(
-            channel_id,
+            key,
             ChannelBinding {
                 channel_id,
                 peer_addr,
@@ -1028,16 +1029,20 @@ impl ChannelTable {
         Ok(())
     }
 
-    pub fn get_by_channel(&self, channel_id: u16) -> Option<ChannelBinding> {
+    pub fn get_by_channel(
+        &self,
+        relayed_addr: SocketAddr,
+        channel_id: u16,
+    ) -> Option<ChannelBinding> {
         let channels = self.channels.read();
-        channels.get(&channel_id).cloned()
+        channels.get(&(relayed_addr, channel_id)).cloned()
     }
 
     pub fn get_by_peer(&self, peer_addr: &SocketAddr) -> Option<u16> {
         let channels = self.channels.read();
-        for (id, ch) in channels.iter() {
+        for ((_, channel_id), ch) in channels.iter() {
             if ch.peer_addr == *peer_addr {
-                return Some(*id);
+                return Some(*channel_id);
             }
         }
         None
@@ -1053,9 +1058,9 @@ impl ChannelTable {
         None
     }
 
-    pub fn unbind(&self, channel_id: u16) -> Option<ChannelBinding> {
+    pub fn unbind(&self, relayed_addr: SocketAddr, channel_id: u16) -> Option<ChannelBinding> {
         let mut channels = self.channels.write();
-        channels.remove(&channel_id)
+        channels.remove(&(relayed_addr, channel_id))
     }
 
     pub fn next_id(&mut self) -> u16 {
@@ -1096,6 +1101,26 @@ impl Default for ChannelTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    static ALLOC_TEST_RANGE_IDX: AtomicU16 = AtomicU16::new(0);
+
+    /// Returns a unique (min_port, max_port) range per call, sharded by PID,
+    /// in the 40000–48999 window to avoid collisions with other test files.
+    fn alloc_test_port_range() -> (u16, u16) {
+        const RANGE_SIZE: u16 = 64;
+        const BASE_PORT: u16 = 40000;
+        const WINDOW: u16 = 9000; // 40000..48999
+        const SLOT_COUNT: u16 = WINDOW / RANGE_SIZE;
+        let idx = ALLOC_TEST_RANGE_IDX.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id() as u16;
+        let slot = pid
+            .wrapping_mul(131)
+            .wrapping_add(idx)
+            .wrapping_rem(SLOT_COUNT);
+        let min = BASE_PORT + slot * RANGE_SIZE;
+        (min, min + RANGE_SIZE - 1)
+    }
 
     #[test]
     fn test_port_allocator() {
@@ -1148,12 +1173,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_allocation_table_create() {
-        // Use unique port range to avoid conflicts with concurrent tests
+        let (min_port, max_port) = alloc_test_port_range();
         let table = AllocationTable::with_port_range(
             Ipv4Addr::new(127, 0, 0, 1),
             "test".to_string(),
-            50000,
-            51000,
+            min_port,
+            max_port,
             None,
             None,
             None,
@@ -1165,12 +1190,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_allocation_expired() {
-        // Use unique port range to avoid conflicts with concurrent tests
+        let (min_port, max_port) = alloc_test_port_range();
         let table = AllocationTable::with_port_range(
             Ipv4Addr::new(127, 0, 0, 1),
             "test".to_string(),
-            53001,
-            54000,
+            min_port,
+            max_port,
             None,
             None,
             None,
@@ -1187,18 +1212,39 @@ mod tests {
         let client: SocketAddr = "192.168.1.1:12345".parse().unwrap();
         let relayed: SocketAddr = "10.0.0.1:49152".parse().unwrap();
         table.bind(0x4000, client, relayed).unwrap();
-        let ch = table.get_by_channel(0x4000).unwrap();
+        let ch = table.get_by_channel(relayed, 0x4000).unwrap();
         assert_eq!(ch.peer_addr, client);
+    }
+
+    #[test]
+    fn test_channel_binding_same_channel_allowed_across_allocations() {
+        let table = ChannelTable::new();
+        let peer1: SocketAddr = "192.168.1.1:12345".parse().unwrap();
+        let peer2: SocketAddr = "192.168.1.2:23456".parse().unwrap();
+        let relayed1: SocketAddr = "10.0.0.1:49152".parse().unwrap();
+        let relayed2: SocketAddr = "10.0.0.1:49153".parse().unwrap();
+
+        table.bind(0x4002, peer1, relayed1).unwrap();
+        table.bind(0x4002, peer2, relayed2).unwrap();
+
+        assert_eq!(
+            table.get_by_channel(relayed1, 0x4002).unwrap().peer_addr,
+            peer1
+        );
+        assert_eq!(
+            table.get_by_channel(relayed2, 0x4002).unwrap().peer_addr,
+            peer2
+        );
     }
 
     #[tokio::test]
     async fn test_max_concurrent_allocations_limit() {
-        // Use unique port range to avoid conflicts with concurrent tests
+        let (min_port, max_port) = alloc_test_port_range();
         let table = AllocationTable::with_port_range(
             Ipv4Addr::new(127, 0, 0, 1),
             "test".to_string(),
-            51001,
-            52000,
+            min_port,
+            max_port,
             Some(2),
             None,
             None,
@@ -1217,12 +1263,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_allocation_advertises_external_ip_when_bind_ip_differs() {
+        let (min_port, max_port) = alloc_test_port_range();
         let table = AllocationTable::with_port_range_and_bind_addr(
             Ipv4Addr::new(203, 0, 113, 10),
             Ipv4Addr::new(127, 0, 0, 1),
             "test".to_string(),
-            52001,
-            53000,
+            min_port,
+            max_port,
             None,
             None,
             None,
@@ -1240,12 +1287,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_port_reuse_after_removal() {
-        // Use unique port range to avoid conflicts with concurrent tests
+        let (min_port, max_port) = alloc_test_port_range();
         let table = AllocationTable::with_port_range(
             Ipv4Addr::new(127, 0, 0, 1),
             "test".to_string(),
-            52001,
-            53000,
+            min_port,
+            max_port,
             None,
             None,
             None,

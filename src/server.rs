@@ -607,25 +607,25 @@ async fn handle_udp_message(
         let payload_end = 4 + data_len.min(data.len().saturating_sub(4));
         let payload = data.slice(4..payload_end);
 
-        let has_allocation = server
-            .allocation_table
-            .find_allocation_by_client(&peer_addr)
-            .is_some();
-        let channel_binding = server
-            .channel_table
-            .read()
-            .await
-            .get_by_channel(channel_num);
+        let allocation = server.allocation_table.get_allocation_by_client(&peer_addr);
+        let has_allocation = allocation.is_some();
+        let relayed_addr = allocation.as_ref().map(|alloc| alloc.read().relayed_addr);
+        let channel_binding = if let Some(relayed_addr) = relayed_addr {
+            server
+                .channel_table
+                .read()
+                .await
+                .get_by_channel(relayed_addr, channel_num)
+        } else {
+            None
+        };
 
-        if has_allocation && let Some(channel) = channel_binding {
+        if let Some(channel) = channel_binding {
             // Get the relay socket from the allocation (must release lock before await)
-            let relay_socket = server
-                .allocation_table
-                .get_allocation_by_client(&peer_addr)
-                .and_then(|alloc| {
-                    let a = alloc.read();
-                    a.relay.as_ref().map(|r| r.socket.clone())
-                });
+            let relay_socket = allocation.and_then(|alloc| {
+                let a = alloc.read();
+                a.relay.as_ref().map(|r| r.socket.clone())
+            });
 
             if let Some(relay_sock) = relay_socket {
                 let _ = relay_sock.send_to(&payload, &channel.peer_addr).await;
@@ -1163,6 +1163,11 @@ async fn handle_channel_bind(
                     channel_num,
                     "ChannelBind failed while creating binding"
                 );
+                return Some(create_error_response_bytes_with_reason(
+                    &msg,
+                    ErrorCode::BadRequest,
+                    "Channel number already bound for this allocation",
+                ));
             }
         }
     }

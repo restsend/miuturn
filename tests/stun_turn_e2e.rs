@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
 use tokio::time::sleep;
@@ -10,6 +10,122 @@ use tokio::time::sleep;
 use webrtc_util::conn::Conn;
 
 use miuturn::TurnServer;
+
+// ── 14. turn crate e2e: 1MB at 100KB/s with packet loss check ─────────────
+
+#[tokio::test]
+async fn turn_crate_e2e_send_1mb_with_rate_limit_and_loss_check() {
+    use std::collections::HashSet;
+
+    let realm = "test-realm";
+    let username = "admin";
+    let password = "s3cret";
+
+    // 1 MB payload, 1024-byte packet => 1024 packets.
+    // 10 ms per packet => 100 packets/s => 102400 B/s (~100 KB/s).
+    const TOTAL_BYTES: usize = 1024 * 1024;
+    const PACKET_SIZE: usize = 1024;
+    const TOTAL_PACKETS: usize = TOTAL_BYTES / PACKET_SIZE;
+    const INTER_PACKET_DELAY: Duration = Duration::from_millis(10);
+    const MAX_PACKET_LOSS_RATIO: f64 = 0.95;
+
+    let (server_addr, _) = start_server("127.0.0.1", realm, password).await;
+
+    let (conn_a, _) = bind_udp().await;
+    let (conn_b, _) = bind_udp().await;
+
+    let client_a = turn::client::Client::new(client_config(
+        server_addr,
+        username,
+        password,
+        realm,
+        conn_a,
+    ))
+    .await
+    .expect("create client_a");
+    client_a.listen().await.expect("listen client_a");
+
+    let client_b = turn::client::Client::new(client_config(
+        server_addr,
+        username,
+        password,
+        realm,
+        conn_b,
+    ))
+    .await
+    .expect("create client_b");
+    client_b.listen().await.expect("listen client_b");
+
+    let relay_conn_a = client_a.allocate().await.expect("allocate client_a");
+    let relay_conn_b = client_b.allocate().await.expect("allocate client_b");
+    let relay_b_addr = relay_conn_b.local_addr().expect("relay_b local addr");
+
+    let receiver = tokio::spawn(async move {
+        let mut buf = vec![0u8; PACKET_SIZE + 64];
+        let mut received_seqs: HashSet<u32> = HashSet::with_capacity(TOTAL_PACKETS);
+        let deadline = Instant::now() + Duration::from_secs(30);
+
+        while Instant::now() < deadline && received_seqs.len() < TOTAL_PACKETS {
+            let recv =
+                tokio::time::timeout(Duration::from_millis(500), relay_conn_b.recv_from(&mut buf))
+                    .await;
+
+            match recv {
+                Ok(Ok((n, _))) if n >= 4 => {
+                    let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                    received_seqs.insert(seq);
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => break,
+                Err(_) => {}
+            }
+        }
+
+        received_seqs.len()
+    });
+
+    let send_start = Instant::now();
+    for seq in 0..(TOTAL_PACKETS as u32) {
+        let mut packet = vec![0u8; PACKET_SIZE];
+        packet[0..4].copy_from_slice(&seq.to_be_bytes());
+
+        // Deterministic payload pattern for debugging and corruption detection.
+        let pattern = (seq & 0xFF) as u8;
+        packet[4..].fill(pattern);
+
+        relay_conn_a
+            .send_to(&packet, relay_b_addr)
+            .await
+            .expect("send packet via turn relay");
+        sleep(INTER_PACKET_DELAY).await;
+    }
+    let send_elapsed = send_start.elapsed();
+
+    let received_packets = tokio::time::timeout(Duration::from_secs(10), receiver)
+        .await
+        .expect("receiver task timeout")
+        .expect("receiver join failed");
+
+    let sent_packets = TOTAL_PACKETS as f64;
+    let received_packets_f64 = received_packets as f64;
+    let packet_loss_ratio = (sent_packets - received_packets_f64) / sent_packets;
+
+    eprintln!(
+        "turn crate e2e 1MB@100KB/s: sent={} received={} loss_ratio={:.4} send_elapsed={:?}",
+        TOTAL_PACKETS, received_packets, packet_loss_ratio, send_elapsed
+    );
+
+    assert!(
+        packet_loss_ratio <= MAX_PACKET_LOSS_RATIO,
+        "packet loss ratio too high: {:.4} (received {}/{})",
+        packet_loss_ratio,
+        received_packets,
+        TOTAL_PACKETS
+    );
+
+    let _ = client_a.close().await;
+    let _ = client_b.close().await;
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -20,24 +136,74 @@ async fn bind_udp() -> (Arc<UdpSocket>, SocketAddr) {
     (Arc::new(sock), addr)
 }
 
-static SERVER_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(36000);
+static RELAY_RANGE_IDX: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
-fn next_server_port() -> u16 {
-    SERVER_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+fn next_relay_range() -> (u16, u16) {
+    // Keep test relay ranges in 10000..39999 to avoid collisions with other
+    // tests in this repo that often use fixed ranges around 50000+.
+    const RANGE_SIZE: u16 = 256;
+    const BASE_PORT: u16 = 10000;
+    const WINDOW_PORTS: u16 = 30000; // 10000..39999
+    const SLOT_COUNT: u16 = WINDOW_PORTS / RANGE_SIZE;
+
+    let idx = RELAY_RANGE_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id() as u16;
+
+    // Process-local sharding reduces collision probability across parallel
+    // `cargo test` binaries that each start their own TURN server.
+    let slot = pid
+        .wrapping_mul(131)
+        .wrapping_add(idx)
+        .wrapping_rem(SLOT_COUNT);
+
+    let min_relay = BASE_PORT + slot * RANGE_SIZE;
+    let max_relay = min_relay + RANGE_SIZE - 1;
+    (min_relay, max_relay)
+}
+
+fn pick_free_udp_port() -> u16 {
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind temp udp socket");
+    sock.local_addr().expect("temp udp local addr").port()
+}
+
+async fn wait_server_ready(server_addr: SocketAddr) {
+    let probe_socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind probe socket");
+    let request: [u8; 20] = [
+        0x00, 0x01, 0x00, 0x00, // Binding Request
+        0x21, 0x12, 0xA4, 0x42, // Magic cookie
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
+    ];
+
+    for _ in 0..20 {
+        let _ = probe_socket.send_to(&request, server_addr).await;
+        let mut buf = [0u8; 1500];
+        let recv = tokio::time::timeout(Duration::from_millis(100), probe_socket.recv_from(&mut buf)).await;
+        if let Ok(Ok((n, _))) = recv
+            && n >= 20
+            && buf[4] == 0x21
+            && buf[5] == 0x12
+            && buf[6] == 0xA4
+            && buf[7] == 0x42
+        {
+            return;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    panic!("server was not ready on {} within startup timeout", server_addr);
 }
 
 /// Start a TurnServer with auth enabled.
 /// Uses a unique port range for relay addresses to avoid conflicts between concurrent tests.
 async fn start_server(relay: &str, realm: &str, password: &str) -> (SocketAddr, TurnServer) {
     let relay_addr: std::net::Ipv4Addr = relay.parse().unwrap();
-    let port = next_server_port();
-    let min_relay = 40000 + (port as u32 - 36000) * 1000;
-    let max_relay = min_relay + 999;
+    let port = pick_free_udp_port();
+    let (min_relay, max_relay) = next_relay_range();
     let server = TurnServer::with_port_range_and_password(
         relay_addr,
         realm.to_string(),
-        min_relay as u16,
-        max_relay as u16,
+        min_relay,
+        max_relay,
         password.to_string(),
     );
     let srv = server.clone();
@@ -46,21 +212,20 @@ async fn start_server(relay: &str, realm: &str, password: &str) -> (SocketAddr, 
     tokio::spawn(async move {
         let _ = srv.run_udp(addr).await;
     });
-    sleep(Duration::from_millis(100)).await;
+    wait_server_ready(addr).await;
     (addr, server)
 }
 
 /// Start a TurnServer with auth disabled.
 async fn start_server_no_auth(relay: &str, realm: &str) -> (SocketAddr, TurnServer) {
     let relay_addr: std::net::Ipv4Addr = relay.parse().unwrap();
-    let port = next_server_port();
-    let min_relay = 40000 + (port as u32 - 36000) * 1000;
-    let max_relay = min_relay + 999;
+    let port = pick_free_udp_port();
+    let (min_relay, max_relay) = next_relay_range();
     let server = TurnServer::with_port_range_auth_disabled(
         relay_addr,
         realm.to_string(),
-        min_relay as u16,
-        max_relay as u16,
+        min_relay,
+        max_relay,
     );
     let srv = server.clone();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
@@ -68,7 +233,7 @@ async fn start_server_no_auth(relay: &str, realm: &str) -> (SocketAddr, TurnServ
     tokio::spawn(async move {
         let _ = srv.run_udp(addr).await;
     });
-    sleep(Duration::from_millis(100)).await;
+    wait_server_ready(addr).await;
     (addr, server)
 }
 
@@ -775,15 +940,14 @@ async fn turn_allocate_with_auth_manager_per_user_password() {
 
     let realm = "test-realm";
     let relay_addr: std::net::Ipv4Addr = "127.0.0.1".parse().unwrap();
-    let port = next_server_port();
-    let min_relay = 40000 + (port as u32 - 36000) * 1000;
-    let max_relay = min_relay + 999;
+    let port = pick_free_udp_port();
+    let (min_relay, max_relay) = next_relay_range();
 
     let mut server = TurnServer::with_port_range_and_password(
         relay_addr,
         realm.to_string(),
-        min_relay as u16,
-        max_relay as u16,
+        min_relay,
+        max_relay,
         "wrong-password".to_string(), // global password is wrong
     );
 
@@ -807,7 +971,7 @@ async fn turn_allocate_with_auth_manager_per_user_password() {
     tokio::spawn(async move {
         let _ = srv.run_udp(addr).await;
     });
-    sleep(Duration::from_millis(100)).await;
+    wait_server_ready(addr).await;
 
     let (conn, _) = bind_udp().await;
     let config = client_config(addr, "testuser", "user-password", realm, conn);
