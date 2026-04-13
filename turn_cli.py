@@ -316,8 +316,8 @@ class StunTurnClient:
 # ----------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Pure Python STUN / TURN test script by miuda.ai")
-    parser.add_argument("-stun", help="STUN server address, e.g. 124.223.96.208:3478")
-    parser.add_argument("-turn", help="TURN server address, e.g. 124.223.96.208:3478")
+    parser.add_argument("-stun", help="STUN server address, e.g. restsend.com:3478")
+    parser.add_argument("-turn", help="TURN server address, e.g. restsend.com:3478")
     parser.add_argument("-u", "--username", help="TURN username")
     parser.add_argument("-p", "--password", help="TURN password")
     args = parser.parse_args()
@@ -374,7 +374,7 @@ def main():
             log(f"[OK] Client2 created permission for {relay1[0]}:{relay1[1]}")
 
             # Client1 -> Client2
-            msg1 = b"Hello from TURN client1"
+            msg1 = b"Hello from TURN client1 - by miuda.ai"
             client1.turn_send(relay2[0], relay2[1], msg1)
             log(f"[->] Client1 sent: {msg1!r}")
 
@@ -385,7 +385,7 @@ def main():
                 log("[FAIL] Client2 receive timeout")
 
             # Client2 -> Client1
-            msg2 = b"Hello from TURN client2"
+            msg2 = b"Hello from TURN client2 - by miuda.ai"
             client2.turn_send(relay1[0], relay1[1], msg2)
             log(f"[->] Client2 sent: {msg2!r}")
 
