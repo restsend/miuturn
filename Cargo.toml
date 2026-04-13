@@ -55,6 +55,7 @@ tower = "0.5"
 anyhow = "1"
 webrtc-util = "0.17.1"
 futures = "0.3"
+rustrtc = "0.3"
 
 [[test]]
 name = "integration_tests"
