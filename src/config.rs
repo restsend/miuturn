@@ -25,6 +25,26 @@ pub struct ServerConfig {
     pub max_concurrent_allocations: Option<usize>,
     pub max_bandwidth_bytes_per_sec: Option<u64>,
     pub max_allocation_duration_secs: Option<u32>,
+    #[serde(default = "ServerConfig::default_stats_dump_interval_secs")]
+    pub stats_dump_interval_secs: u64,
+    #[serde(default = "ServerConfig::default_stats_dump_skip_if_no_change")]
+    pub stats_dump_skip_if_no_change: bool,
+    #[serde(default = "ServerConfig::default_server_name")]
+    pub server_name: String,
+}
+
+impl ServerConfig {
+    fn default_stats_dump_interval_secs() -> u64 {
+        30
+    }
+
+    fn default_stats_dump_skip_if_no_change() -> bool {
+        true
+    }
+
+    fn default_server_name() -> String {
+        format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -148,6 +168,9 @@ impl Default for Config {
                 max_concurrent_allocations: None,
                 max_bandwidth_bytes_per_sec: None,
                 max_allocation_duration_secs: None,
+                stats_dump_interval_secs: 30,
+                stats_dump_skip_if_no_change: true,
+                server_name: ServerConfig::default_server_name(),
             },
             http: None,
             log: LogConfig::default(),

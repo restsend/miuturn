@@ -71,6 +71,9 @@ pub struct TurnServer {
     password: String,
     auth_disabled: bool,
     auth_manager: Option<Arc<AuthManager>>,
+    stats_dump_interval_secs: u64,
+    stats_dump_skip_if_no_change: bool,
+    server_name: String,
 }
 
 struct NonceEntry {
@@ -89,6 +92,18 @@ impl TurnServer {
             "password".to_string(),
             false,
         )
+    }
+
+    pub fn set_stats_dump_interval(&mut self, interval_secs: u64) {
+        self.stats_dump_interval_secs = interval_secs;
+    }
+
+    pub fn set_stats_dump_skip_if_no_change(&mut self, skip: bool) {
+        self.stats_dump_skip_if_no_change = skip;
+    }
+
+    pub fn set_server_name(&mut self, server_name: String) {
+        self.server_name = server_name;
     }
 
     pub fn with_password(relay_addr: Ipv4Addr, realm: String, password: String) -> Self {
@@ -138,6 +153,9 @@ impl TurnServer {
             password,
             auth_disabled: false,
             auth_manager: None,
+            stats_dump_interval_secs: 30,
+            stats_dump_skip_if_no_change: true,
+            server_name: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
         };
         server.start_nonce_cleanup_task();
         server.start_channel_cleanup_task();
@@ -201,6 +219,9 @@ impl TurnServer {
             password,
             auth_disabled,
             auth_manager: None,
+            stats_dump_interval_secs: 30,
+            stats_dump_skip_if_no_change: true,
+            server_name: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
         };
         server.start_nonce_cleanup_task();
         server.start_channel_cleanup_task();
@@ -232,6 +253,9 @@ impl TurnServer {
             password: String::new(),
             auth_disabled: true,
             auth_manager: None,
+            stats_dump_interval_secs: 30,
+            stats_dump_skip_if_no_change: true,
+            server_name: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
         };
         server.start_nonce_cleanup_task();
         server.start_channel_cleanup_task();
@@ -282,6 +306,9 @@ impl TurnServer {
             password,
             auth_disabled,
             auth_manager: None,
+            stats_dump_interval_secs: 30,
+            stats_dump_skip_if_no_change: true,
+            server_name: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
         };
         server.start_nonce_cleanup_task();
         server.start_channel_cleanup_task();
@@ -315,7 +342,11 @@ impl TurnServer {
     }
 
     /// Start a background task to periodically dump statistics
-    pub fn start_stats_dump_task(&self, interval_secs: u64) {
+    pub fn start_stats_dump_task(&self, interval_secs: u64, skip_if_no_change: bool) {
+        if interval_secs == 0 {
+            return;
+        }
+
         let stats = self.allocation_table.stats();
 
         if tokio::runtime::Handle::try_current().is_err() {
@@ -327,6 +358,8 @@ impl TurnServer {
                 tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
             let mut prev_bytes = 0u64;
             let mut prev_messages = 0u64;
+            let mut prev_active = 0u64;
+            let mut prev_total = 0u64;
 
             loop {
                 interval.tick().await;
@@ -339,32 +372,45 @@ impl TurnServer {
                     .load(std::sync::atomic::Ordering::Relaxed);
                 let active = stats
                     .active_allocations
-                    .load(std::sync::atomic::Ordering::Relaxed);
+                    .load(std::sync::atomic::Ordering::Relaxed) as u64;
                 let total = stats
                     .total_allocations
-                    .load(std::sync::atomic::Ordering::Relaxed);
+                    .load(std::sync::atomic::Ordering::Relaxed) as u64;
 
-                let bytes_delta = current_bytes.saturating_sub(prev_bytes);
-                let messages_delta = current_messages.saturating_sub(prev_messages);
+                let has_change = if skip_if_no_change {
+                    current_bytes != prev_bytes
+                        || current_messages != prev_messages
+                        || active != prev_active
+                        || total != prev_total
+                } else {
+                    true
+                };
 
-                // Format bytes
-                let (bytes_str, bytes_rate_str) =
-                    format_bytes_and_rate(current_bytes, bytes_delta, interval_secs);
-                let (msg_str, msg_rate_str) =
-                    format_messages_and_rate(current_messages, messages_delta, interval_secs);
+                if has_change {
+                    let bytes_delta = current_bytes.saturating_sub(prev_bytes);
+                    let messages_delta = current_messages.saturating_sub(prev_messages);
 
-                tracing::info!(
-                    "[STATS] Active: {} | Total: {} | Bytes: {} (+{}/s) | Messages: {} (+{}/s)",
-                    active,
-                    total,
-                    bytes_str,
-                    bytes_rate_str,
-                    msg_str,
-                    msg_rate_str
-                );
+                    // Format bytes
+                    let (bytes_str, bytes_rate_str) =
+                        format_bytes_and_rate(current_bytes, bytes_delta, interval_secs);
+                    let (msg_str, msg_rate_str) =
+                        format_messages_and_rate(current_messages, messages_delta, interval_secs);
+
+                    tracing::info!(
+                        "[STATS] Active: {} | Total: {} | Bytes: {} (+{}/s) | Messages: {} (+{}/s)",
+                        active,
+                        total,
+                        bytes_str,
+                        bytes_rate_str,
+                        msg_str,
+                        msg_rate_str
+                    );
+                }
 
                 prev_bytes = current_bytes;
                 prev_messages = current_messages;
+                prev_active = active;
+                prev_total = total;
             }
         });
     }
@@ -512,7 +558,10 @@ impl TurnServer {
         self.start_nonce_cleanup_task();
         self.start_channel_cleanup_task();
         self.start_allocation_cleanup_task();
-        self.start_stats_dump_task(30);
+        self.start_stats_dump_task(
+            self.stats_dump_interval_secs,
+            self.stats_dump_skip_if_no_change,
+        );
 
         let socket = Arc::new(UdpSocket::bind(addr).await?);
         info!("TURN UDP server listening on {}", addr);
@@ -832,7 +881,7 @@ fn verify_turn_auth(
     if let Some(ref am) = server.auth_manager {
         let client_ip = client_addr.ip().to_string();
         if !am.check_acl(&client_ip) {
-            return Err(create_error_response_bytes(msg, ErrorCode::Forbidden));
+            return Err(create_error_response_bytes(msg, ErrorCode::Forbidden, server));
         }
     }
 
@@ -946,7 +995,7 @@ async fn handle_allocate(
                 "TURN Allocate request failed"
             );
 
-            return Some(create_error_response_bytes_with_reason(&msg, code, &reason));
+            return Some(create_error_response_bytes_with_reason(&msg, code, &reason, server));
         }
     };
 
@@ -982,7 +1031,7 @@ async fn handle_allocate(
     });
     response.attributes.push(Attribute {
         attr_type: Attribute::SOFTWARE,
-        value: Bytes::from_static(b"miuturn"),
+        value: Bytes::from(server.server_name.as_bytes().to_vec()),
     });
 
     if !server.auth_disabled {
@@ -1032,6 +1081,7 @@ async fn handle_refresh(
             return Some(create_error_response_bytes(
                 &msg,
                 ErrorCode::AllocationMismatch,
+                server,
             ));
         }
         // Return Refresh Success with LIFETIME
@@ -1045,6 +1095,7 @@ async fn handle_refresh(
     Some(create_error_response_bytes(
         &msg,
         ErrorCode::AllocationMismatch,
+        server,
     ))
 }
 
@@ -1073,6 +1124,7 @@ async fn handle_create_permission(
         return Some(create_error_response_bytes(
             &msg,
             ErrorCode::AllocationMismatch,
+            server,
         ));
     }
 
@@ -1095,7 +1147,7 @@ async fn handle_create_permission(
             %client_addr,
             "CreatePermission rejected because no valid XOR-PEER-ADDRESS was provided"
         );
-        return Some(create_error_response_bytes(&msg, ErrorCode::BadRequest));
+        return Some(create_error_response_bytes(&msg, ErrorCode::BadRequest, server));
     }
 
     server
@@ -1167,6 +1219,7 @@ async fn handle_channel_bind(
                     &msg,
                     ErrorCode::BadRequest,
                     "Channel number already bound for this allocation",
+                    server,
                 ));
             }
         }
@@ -1264,26 +1317,31 @@ fn create_401_response(msg: &Message, server: &TurnServer, _reason: Option<Strin
     });
     response.attributes.push(Attribute {
         attr_type: Attribute::SOFTWARE,
-        value: Bytes::from_static(b"miuturn"),
+        value: Bytes::from(server.server_name.as_bytes().to_vec()),
     });
     response.encode()
 }
 
-fn create_error_response_bytes(msg: &Message, code: ErrorCode) -> Bytes {
+fn create_error_response_bytes(msg: &Message, code: ErrorCode, server: &TurnServer) -> Bytes {
     let mut response = crate::message::create_error_response(&msg.header, code);
     response.attributes.push(Attribute {
         attr_type: Attribute::SOFTWARE,
-        value: Bytes::from_static(b"miuturn"),
+        value: Bytes::from(server.server_name.as_bytes().to_vec()),
     });
     response.encode()
 }
 
-fn create_error_response_bytes_with_reason(msg: &Message, code: ErrorCode, reason: &str) -> Bytes {
+fn create_error_response_bytes_with_reason(
+    msg: &Message,
+    code: ErrorCode,
+    reason: &str,
+    server: &TurnServer,
+) -> Bytes {
     let mut response =
         crate::message::create_error_response_with_reason(&msg.header, code, Some(reason));
     response.attributes.push(Attribute {
         attr_type: Attribute::SOFTWARE,
-        value: Bytes::from_static(b"miuturn"),
+        value: Bytes::from(server.server_name.as_bytes().to_vec()),
     });
     response.encode()
 }

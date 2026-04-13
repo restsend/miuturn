@@ -8,6 +8,12 @@ external_ip = "0.0.0.0"
 relay_bind_ip = "0.0.0.0"
 start_port = 49152
 end_port = 65535
+# Stats dump interval in seconds, set to 0 to disable (default: 30)
+stats_dump_interval_secs = 30
+# Skip stats dump if no data change since last dump (default: true)
+stats_dump_skip_if_no_change = true
+# Server name for SOFTWARE attribute in TURN responses (default: miuturn/0.1.2)
+server_name = "miuturn/0.1.2"
 
 [[server.listening]]
 protocol = "udp"

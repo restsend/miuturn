@@ -74,9 +74,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         false,
     );
 
+    server.set_stats_dump_interval(config.server.stats_dump_interval_secs);
+    server.set_stats_dump_skip_if_no_change(config.server.stats_dump_skip_if_no_change);
+    server.set_server_name(config.server.server_name.clone());
+
     info!(
         external_ip = %relay_addr,
         relay_bind_ip = %relay_bind_addr,
+        stats_dump_interval = config.server.stats_dump_interval_secs,
+        stats_dump_skip_if_no_change = config.server.stats_dump_skip_if_no_change,
+        server_name = %config.server.server_name,
         "configured relay addressing"
     );
 
