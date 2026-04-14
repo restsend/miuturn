@@ -446,7 +446,7 @@ impl TurnServer {
     /// Start a background task to clean up expired nonces
     pub fn start_nonce_cleanup_task(&self) {
         let nonce_map = self.nonce_map.clone();
-        const NONCE_EXPIRY_SECONDS: u64 = 60;
+        const NONCE_EXPIRY_SECONDS: u64 = 600;
         const CLEANUP_INTERVAL_SECONDS: u64 = 30;
 
         // Check if we're running in a Tokio runtime context
@@ -778,18 +778,9 @@ async fn handle_binding(msg: Message, client_addr: SocketAddr) -> Option<Bytes> 
 }
 
 fn generate_nonce() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    // Simple hash: mix seed with position-dependent rotation to avoid identical bytes
+    use rand::Rng;
     let mut hash: [u8; 16] = [0; 16];
-    for (i, byte) in hash.iter_mut().enumerate() {
-        let rotated = seed.rotate_left((i as u32) * 7);
-        let mixed = rotated.wrapping_mul(1103515245u128).wrapping_add(12345u128);
-        *byte = (mixed >> 16) as u8;
-    }
+    rand::rng().fill_bytes(&mut hash);
     hex::encode(hash)
 }
 
@@ -889,7 +880,12 @@ fn verify_turn_auth(
     let username_attr = msg.get_attribute(Attribute::USERNAME);
 
     if nonce_attr.is_none() || username_attr.is_none() {
-        return Err(create_401_response(msg, server, None));
+        debug!(
+            %client_addr,
+            method = ?msg.header.method,
+            "Returning 401: missing nonce or username attribute"
+        );
+        return Err(create_401_response(msg, server, client_addr, None));
     }
 
     let nonce = String::from_utf8_lossy(&nonce_attr.unwrap().value).to_string();
@@ -899,9 +895,17 @@ fn verify_turn_auth(
     let nonce_map = server.nonce_map.read();
     if !nonce_map.contains_key(&nonce) {
         drop(nonce_map);
+        debug!(
+            %client_addr,
+            method = ?msg.header.method,
+            %username,
+            %nonce,
+            "Returning 401: invalid nonce"
+        );
         return Err(create_401_response(
             msg,
             server,
+            client_addr,
             Some("Invalid nonce".to_string()),
         ));
     }
@@ -909,11 +913,20 @@ fn verify_turn_auth(
     let nonce_age = nonce_entry.created_at.elapsed();
     drop(nonce_map);
 
-    // Nonce expires after 60 seconds
-    if nonce_age.as_secs() > 60 {
+    // Nonce expires after 600 seconds
+    if nonce_age.as_secs() > 600 {
+        debug!(
+            %client_addr,
+            method = ?msg.header.method,
+            %username,
+            %nonce,
+            nonce_age_secs = nonce_age.as_secs(),
+            "Returning 401: nonce expired"
+        );
         return Err(create_401_response(
             msg,
             server,
+            client_addr,
             Some("Nonce expired".to_string()),
         ));
     }
@@ -922,9 +935,16 @@ fn verify_turn_auth(
     let password = match server.get_password_for_user(&username) {
         Some(pw) => pw,
         None => {
+            debug!(
+                %client_addr,
+                method = ?msg.header.method,
+                %username,
+                "Returning 401: unknown user or credentials expired"
+            );
             return Err(create_401_response(
                 msg,
                 server,
+                client_addr,
                 Some("Unknown user".to_string()),
             ));
         }
@@ -933,16 +953,23 @@ fn verify_turn_auth(
     let key = compute_message_integrity_key(&username, &server.realm, &password);
 
     if !verify_message_integrity(msg, &key) {
+        debug!(
+            %client_addr,
+            method = ?msg.header.method,
+            %username,
+            "Returning 401: message integrity verification failed"
+        );
         return Err(create_401_response(
             msg,
             server,
+            client_addr,
             Some("Bad integrity".to_string()),
         ));
     }
 
     // Do NOT remove the nonce after successful auth.
     // The turn crate client reuses the same nonce for CreatePermission, ChannelBind, etc.
-    // Nonce will expire naturally after 60 seconds via the cleanup task.
+    // Nonce will expire naturally after 600 seconds via the cleanup task.
 
     Ok(username)
 }
@@ -1296,8 +1323,21 @@ async fn handle_send(msg: Message, server: &TurnServer, client_addr: SocketAddr)
     None
 }
 
-fn create_401_response(msg: &Message, server: &TurnServer, _reason: Option<String>) -> Bytes {
+fn create_401_response(
+    msg: &Message,
+    server: &TurnServer,
+    client_addr: SocketAddr,
+    reason: Option<String>,
+) -> Bytes {
     let nonce = generate_nonce();
+    debug!(
+        %client_addr,
+        method = ?msg.header.method,
+        transaction_id = ?msg.header.transaction_id,
+        nonce = %nonce,
+        reason = ?reason,
+        "Creating 401 Unauthorized response"
+    );
     server.nonce_map.write().insert(
         nonce.clone(),
         NonceEntry {
@@ -1306,7 +1346,11 @@ fn create_401_response(msg: &Message, server: &TurnServer, _reason: Option<Strin
         },
     );
 
-    let mut response = crate::message::create_error_response(&msg.header, ErrorCode::Unauthorized);
+    let mut response = crate::message::create_error_response_with_reason(
+        &msg.header,
+        ErrorCode::Unauthorized,
+        reason.as_deref(),
+    );
     response.attributes.push(Attribute {
         attr_type: Attribute::REALM,
         value: Bytes::from(server.realm.as_bytes().to_vec()),
