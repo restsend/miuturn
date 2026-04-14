@@ -1013,7 +1013,11 @@ impl ChannelTable {
     ) -> Result<(), Error> {
         let mut channels = self.channels.write();
         let key = (relayed_addr, channel_id);
-        if channels.contains_key(&key) {
+        if let Some(existing) = channels.get_mut(&key) {
+            if existing.peer_addr == peer_addr {
+                existing.created_at = Instant::now();
+                return Ok(());
+            }
             return Err(Error::AlreadyExists);
         }
         channels.insert(
@@ -1235,6 +1239,35 @@ mod tests {
             table.get_by_channel(relayed2, 0x4002).unwrap().peer_addr,
             peer2
         );
+    }
+
+    #[test]
+    fn test_channel_binding_refresh_same_peer_succeeds() {
+        let table = ChannelTable::new();
+        let peer: SocketAddr = "192.168.1.1:12345".parse().unwrap();
+        let relayed: SocketAddr = "10.0.0.1:49152".parse().unwrap();
+
+        table.bind(0x4000, peer, relayed).unwrap();
+        let ch1 = table.get_by_channel(relayed, 0x4000).unwrap();
+
+        std::thread::sleep(Duration::from_millis(10));
+
+        table.bind(0x4000, peer, relayed).unwrap();
+        let ch2 = table.get_by_channel(relayed, 0x4000).unwrap();
+
+        assert_eq!(ch2.peer_addr, peer);
+        assert!(ch2.created_at > ch1.created_at);
+    }
+
+    #[test]
+    fn test_channel_binding_different_peer_fails() {
+        let table = ChannelTable::new();
+        let peer1: SocketAddr = "192.168.1.1:12345".parse().unwrap();
+        let peer2: SocketAddr = "192.168.1.2:23456".parse().unwrap();
+        let relayed: SocketAddr = "10.0.0.1:49152".parse().unwrap();
+
+        table.bind(0x4000, peer1, relayed).unwrap();
+        assert!(table.bind(0x4000, peer2, relayed).is_err());
     }
 
     #[tokio::test]
