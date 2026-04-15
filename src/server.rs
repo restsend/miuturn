@@ -1116,7 +1116,17 @@ async fn handle_refresh(
         .allocation_table
         .find_allocation_by_client(&client_addr)
     {
-        if server
+        if lifetime == 0 {
+            // Refresh with lifetime=0 means explicit deletion (RFC 5766 §7).
+            // Remove immediately instead of waiting for the cleanup task.
+            let ch_table = server.channel_table.read().await.clone();
+            server.allocation_table.remove_allocation(&relayed, Some(&ch_table));
+            tracing::info!(
+                %client_addr,
+                relayed = %relayed,
+                "TURN Refresh lifetime=0: allocation removed"
+            );
+        } else if server
             .allocation_table
             .refresh_allocation(&relayed, lifetime)
             .is_err()
@@ -1126,13 +1136,14 @@ async fn handle_refresh(
                 ErrorCode::AllocationMismatch,
                 server,
             ));
+        } else {
+            tracing::info!(
+                %client_addr,
+                relayed = %relayed,
+                lifetime,
+                "TURN Refresh succeeded"
+            );
         }
-        tracing::info!(
-            %client_addr,
-            relayed = %relayed,
-            lifetime,
-            "TURN Refresh succeeded"
-        );
         // Return Refresh Success with LIFETIME
         let mut response = crate::message::create_success_response(&msg.header);
         response.attributes.push(Attribute {
@@ -1973,6 +1984,99 @@ mod tests {
         assert!(
             refresh_parsed.get_attribute(Attribute::LIFETIME).is_some(),
             "Refresh success should include LIFETIME"
+        );
+    }
+
+    /// Verify that Refresh with lifetime=0 immediately removes the allocation
+    /// and its channel bindings, without waiting for the cleanup task.
+    #[tokio::test]
+    async fn test_refresh_lifetime_zero_immediately_removes_allocation() {
+        let realm = "test-realm".to_string();
+        let username = "admin";
+        let password = "password";
+        let server = TurnServer::with_password(
+            Ipv4Addr::new(127, 0, 0, 1),
+            realm.clone(),
+            password.to_string(),
+        );
+        let client_addr: SocketAddr = "127.0.0.1:50010".parse().unwrap();
+
+        // Get nonce
+        let unauth_msg = build_allocate_request([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        let nonce_response = process_message(unauth_msg, &server, client_addr)
+            .await
+            .unwrap();
+        let nonce_msg = Message::parse(&nonce_response).unwrap();
+        let nonce = String::from_utf8(
+            nonce_msg
+                .get_attribute(Attribute::NONCE)
+                .unwrap()
+                .value
+                .to_vec(),
+        )
+        .unwrap();
+
+        // Create allocation
+        for attempt in 0..5 {
+            let mut tid = [0u8; 12];
+            tid[11] = attempt;
+            let auth_msg =
+                build_authenticated_allocate_request(tid, username, &realm, &nonce, password);
+            let response = process_message(auth_msg, &server, client_addr)
+                .await
+                .unwrap();
+            let parsed = Message::parse(&response).unwrap();
+            if parsed.header.event_type == EventType::Success {
+                break;
+            }
+            if attempt == 4 {
+                panic!("allocation should succeed");
+            }
+        }
+
+        // Verify allocation exists
+        assert!(
+            server.allocation_table.find_allocation_by_client(&client_addr).is_some(),
+            "allocation should exist before refresh"
+        );
+
+        // Bind a channel to verify it gets cleaned up
+        let relayed = server.allocation_table.find_allocation_by_client(&client_addr).unwrap();
+        let peer: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        server.channel_table.write().await.bind(0x4000, peer, relayed).unwrap();
+        assert_eq!(server.channel_table.read().await.len(), 1);
+
+        // Refresh with lifetime=0
+        let refresh_msg = build_authenticated_refresh_request(
+            [11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+            0,
+            username,
+            &realm,
+            &nonce,
+            password,
+        );
+        let refresh_response = process_message(refresh_msg, &server, client_addr)
+            .await
+            .unwrap();
+        let refresh_parsed = Message::parse(&refresh_response).unwrap();
+        assert_eq!(refresh_parsed.header.event_type, EventType::Success);
+
+        // Allocation should be immediately gone
+        assert!(
+            server.allocation_table.find_allocation_by_client(&client_addr).is_none(),
+            "allocation should be removed immediately after Refresh lifetime=0"
+        );
+        // Active count should be 0
+        assert_eq!(
+            server.allocation_table.stats().active_allocations.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "active_allocations should be 0 after Refresh lifetime=0"
+        );
+        // Channel bindings should be cleaned up
+        assert_eq!(
+            server.channel_table.read().await.len(),
+            0,
+            "channel bindings should be cleaned up after Refresh lifetime=0"
         );
     }
 }
