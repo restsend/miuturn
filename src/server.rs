@@ -993,9 +993,10 @@ async fn handle_allocate(
         "received TURN Allocate request"
     );
 
+    let ch_table = server.channel_table.read().await.clone();
     let allocation = match server
         .allocation_table
-        .create_allocation(client_addr, Some(lifetime))
+        .create_allocation(client_addr, Some(lifetime), &ch_table)
         .await
     {
         Ok(a) => a,

@@ -644,13 +644,14 @@ async fn test_alloc_performance_direct() {
 
     let relay_addr: Ipv4Addr = "0.0.0.0".parse().unwrap();
     let server = TurnServer::with_auth_disabled(relay_addr, "test".to_string());
+    let channel_table = miuturn::ChannelTable::new();
 
     const NUM_ALLOCS: usize = 10000;
     let start = Instant::now();
 
     for i in 0..NUM_ALLOCS {
         let client: SocketAddr = format!("192.168.1.{}:12345", i % 255).parse().unwrap();
-        let _ = server.allocation_table.create_allocation(client, Some(600));
+        let _ = server.allocation_table.create_allocation(client, Some(600), &channel_table);
     }
 
     let elapsed = start.elapsed().as_secs_f64();
@@ -679,6 +680,7 @@ async fn test_alloc_performance_concurrent_direct() {
 
     let relay_addr: Ipv4Addr = "0.0.0.0".parse().unwrap();
     let server = TurnServer::with_auth_disabled(relay_addr, "test".to_string());
+    let channel_table = miuturn::ChannelTable::new();
 
     const NUM_TASKS: usize = 10;
     const ALLOCS_PER_TASK: usize = 1000;
@@ -688,11 +690,12 @@ async fn test_alloc_performance_concurrent_direct() {
     let mut handles = Vec::new();
     for t in 0..NUM_TASKS {
         let server = server.clone();
+        let channel_table = channel_table.clone();
         let handle = tokio::spawn(async move {
             for i in 0..ALLOCS_PER_TASK {
                 let client: SocketAddr =
                     format!("192.168.{}.{}:12345", t, i % 255).parse().unwrap();
-                let _ = server.allocation_table.create_allocation(client, Some(600));
+                let _ = server.allocation_table.create_allocation(client, Some(600), &channel_table);
             }
         });
         handles.push(handle);
@@ -854,6 +857,7 @@ fn test_component_performance_analysis() {
     const ALLOC_OPS: usize = 5_000;
     let relay_addr: Ipv4Addr = "0.0.0.0".parse().unwrap();
     let server = miuturn::TurnServer::with_auth_disabled(relay_addr, "test".to_string());
+    let channel_table = miuturn::ChannelTable::new();
 
     // Create runtime for async operations
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -861,10 +865,11 @@ fn test_component_performance_analysis() {
     let start = Instant::now();
     for i in 0..ALLOC_OPS {
         let client: SocketAddr = format!("192.168.1.{}:12345", i % 255).parse().unwrap();
+        let ct = channel_table.clone();
         rt.block_on(async {
             let _ = server
                 .allocation_table
-                .create_allocation(client, Some(600))
+                .create_allocation(client, Some(600), &ct)
                 .await;
         });
     }
@@ -908,12 +913,12 @@ fn test_component_performance_analysis() {
     rt.block_on(async {
         server
             .allocation_table
-            .create_allocation(client1, Some(600))
+            .create_allocation(client1, Some(600), &channel_table)
             .await
             .ok();
         server
             .allocation_table
-            .create_allocation(client2, Some(600))
+            .create_allocation(client2, Some(600), &channel_table)
             .await
             .ok();
     });

@@ -447,6 +447,7 @@ impl AllocationTable {
         &self,
         client_addr: SocketAddr,
         requested_lifetime: Option<u32>,
+        channel_table: &ChannelTable,
     ) -> Result<Arc<RwLock<Allocation>>, Error> {
         if let Some(max) = self.max_concurrent_allocations {
             let current = self.stats.active_allocations.load(Ordering::Relaxed) as usize;
@@ -551,6 +552,7 @@ impl AllocationTable {
             client_addr,
             relayed_addr,
             self.stats.clone(),
+            channel_table.clone(),
         )
         .await;
 
@@ -864,10 +866,11 @@ fn build_data_indication(peer_addr: SocketAddr, payload: &[u8]) -> Bytes {
 /// This eliminates lock contention by giving each allocation its own processing loop
 async fn spawn_allocation_task(
     socket: Arc<UdpSocket>,
-    main_socket: Arc<UdpSocket>, // Main socket for sending Data Indication
+    main_socket: Arc<UdpSocket>, // Main socket for sending Data Indication / ChannelData to client
     client_addr: SocketAddr,
-    _relayed_addr: SocketAddr,
+    relayed_addr: SocketAddr,
     stats: Arc<ServerStats>,
+    channel_table: ChannelTable,
 ) -> AllocationRelay {
     let (tx, mut rx) = mpsc::channel::<AllocationMessage>(1024);
 
@@ -887,15 +890,55 @@ async fn spawn_allocation_task(
                             stats.total_bytes_relayed.fetch_add(len as u64, Ordering::Relaxed);
                             stats.total_messages.fetch_add(1, Ordering::Relaxed);
 
-                            let indication = build_data_indication(peer_addr, &buf[..len]);
-                            if let Err(e) = main_socket_clone.send_to(&indication, &client_addr).await {
-                                debug!(
-                                    %client_addr,
-                                    %peer_addr,
-                                    payload_len = len,
-                                    error = %e,
-                                    "failed to forward peer packet to client as Data Indication"
-                                );
+                            // Fix peer address: when data comes from another relay socket on the
+                            // same server, the source address is the bind address (e.g. 127.0.0.1:port),
+                            // but the browser knows the peer by its external relay address.
+                            // Map bind_addr:port → external_addr:port so the PEER-ADDRESS is correct.
+                            let effective_peer = if peer_addr.ip() != relayed_addr.ip() {
+                                SocketAddr::new(relayed_addr.ip(), peer_addr.port())
+                            } else {
+                                peer_addr
+                            };
+                            // Construct the external relay address for the sender by swapping in
+                            // the same external IP we use for our own relayed address.
+                            let sender_relayed = SocketAddr::new(relayed_addr.ip(), peer_addr.port());
+
+                            // RFC 5766 §10.4: if a channel binding exists for this peer on this
+                            // allocation, send ChannelData; otherwise send Data Indication.
+                            let channel_num = channel_table.get_by_peer_for_relayed(&sender_relayed, &effective_peer);
+
+                            if let Some(ch_num) = channel_num {
+                                // Send as ChannelData
+                                let data_len = len as u16;
+                                let mut channel_data = vec![0u8; 4 + len];
+                                channel_data[0] = (ch_num >> 8) as u8;
+                                channel_data[1] = (ch_num & 0xFF) as u8;
+                                channel_data[2] = (data_len >> 8) as u8;
+                                channel_data[3] = (data_len & 0xFF) as u8;
+                                channel_data[4..].copy_from_slice(&buf[..len]);
+
+                                if let Err(e) = main_socket_clone.send_to(&channel_data, &client_addr).await {
+                                    debug!(
+                                        %client_addr,
+                                        peer = %effective_peer,
+                                        channel = ch_num,
+                                        payload_len = len,
+                                        error = %e,
+                                        "failed to forward peer packet to client as ChannelData"
+                                    );
+                                }
+                            } else {
+                                // Send as Data Indication
+                                let indication = build_data_indication(effective_peer, &buf[..len]);
+                                if let Err(e) = main_socket_clone.send_to(&indication, &client_addr).await {
+                                    debug!(
+                                        %client_addr,
+                                        peer = %effective_peer,
+                                        payload_len = len,
+                                        error = %e,
+                                        "failed to forward peer packet to client as Data Indication"
+                                    );
+                                }
                             }
                         }
                         Err(e) => {
@@ -933,8 +976,8 @@ async fn spawn_allocation_task(
                             }
                         }
                         AllocationMessage::ChannelData { data, channel_num: _ } => {
-                            // Forward channel data - data already has channel header
-                            if let Err(e) = socket_clone.send_to(&data, &client_addr).await {
+                            // Forward channel data via main socket (not relay socket)
+                            if let Err(e) = main_socket_clone.send_to(&data, &client_addr).await {
                                 debug!(
                                     %client_addr,
                                     payload_len = data.len(),
@@ -969,9 +1012,10 @@ async fn spawn_allocation_task(
     }
 }
 
+#[derive(Clone)]
 pub struct ChannelTable {
-    channels: RwLock<HashMap<(SocketAddr, u16), ChannelBinding>>,
-    next_channel: u16,
+    channels: Arc<RwLock<HashMap<(SocketAddr, u16), ChannelBinding>>>,
+    next_channel: Arc<std::sync::atomic::AtomicU16>,
 }
 
 #[derive(Clone)]
@@ -1000,8 +1044,8 @@ impl ChannelBinding {
 impl ChannelTable {
     pub fn new() -> Self {
         ChannelTable {
-            channels: RwLock::new(HashMap::new()),
-            next_channel: 0x4000,
+            channels: Arc::new(RwLock::new(HashMap::new())),
+            next_channel: Arc::new(std::sync::atomic::AtomicU16::new(0x4000)),
         }
     }
 
@@ -1052,6 +1096,22 @@ impl ChannelTable {
         None
     }
 
+    /// Look up channel binding by (relayed_addr, peer_addr).
+    /// Used by allocation task to find the channel number for peer-to-client relay.
+    pub fn get_by_peer_for_relayed(
+        &self,
+        relayed_addr: &SocketAddr,
+        peer_addr: &SocketAddr,
+    ) -> Option<u16> {
+        let channels = self.channels.read();
+        for ((ra, channel_id), ch) in channels.iter() {
+            if ra == relayed_addr && ch.peer_addr == *peer_addr {
+                return Some(*channel_id);
+            }
+        }
+        None
+    }
+
     pub fn get_relayed_by_peer(&self, peer_addr: &SocketAddr) -> Option<SocketAddr> {
         let channels = self.channels.read();
         for ch in channels.values() {
@@ -1067,11 +1127,12 @@ impl ChannelTable {
         channels.remove(&(relayed_addr, channel_id))
     }
 
-    pub fn next_id(&mut self) -> u16 {
-        let id = self.next_channel;
-        self.next_channel = self.next_channel.wrapping_add(1);
-        if self.next_channel == 0 {
-            self.next_channel = 0x4000;
+    pub fn next_id(&self) -> u16 {
+        use std::sync::atomic::Ordering;
+        let id = self.next_channel.fetch_add(1, Ordering::Relaxed);
+        // Wrap around if we exceed 0x7FFF
+        if self.next_channel.load(Ordering::Relaxed) > 0x7FFF {
+            self.next_channel.store(0x4000, Ordering::Relaxed);
         }
         id
     }
@@ -1188,7 +1249,8 @@ mod tests {
             None,
         );
         let client: SocketAddr = "192.168.1.1:12345".parse().unwrap();
-        let alloc = table.create_allocation(client, Some(600)).await.unwrap();
+        let channel_table = ChannelTable::new();
+        let alloc = table.create_allocation(client, Some(600), &channel_table).await.unwrap();
         assert!(!alloc.read().is_expired());
     }
 
@@ -1205,7 +1267,8 @@ mod tests {
             None,
         );
         let client: SocketAddr = "192.168.1.1:12345".parse().unwrap();
-        let alloc = table.create_allocation(client, Some(0)).await.unwrap();
+        let channel_table = ChannelTable::new();
+        let alloc = table.create_allocation(client, Some(0), &channel_table).await.unwrap();
         std::thread::sleep(Duration::from_millis(10));
         assert!(alloc.read().is_expired());
     }
@@ -1282,14 +1345,15 @@ mod tests {
             None,
             None,
         );
+        let channel_table = ChannelTable::new();
         let client1: SocketAddr = "192.168.1.1:12345".parse().unwrap();
         let client2: SocketAddr = "192.168.1.2:12345".parse().unwrap();
         let client3: SocketAddr = "192.168.1.3:12345".parse().unwrap();
 
-        let _ = table.create_allocation(client1, Some(600)).await.unwrap();
-        let _ = table.create_allocation(client2, Some(600)).await.unwrap();
+        let _ = table.create_allocation(client1, Some(600), &channel_table).await.unwrap();
+        let _ = table.create_allocation(client2, Some(600), &channel_table).await.unwrap();
 
-        let result = table.create_allocation(client3, Some(600)).await;
+        let result = table.create_allocation(client3, Some(600), &channel_table).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::AllocationQuotaReached));
     }
@@ -1309,7 +1373,8 @@ mod tests {
         );
         let client: SocketAddr = "192.168.1.10:12345".parse().unwrap();
 
-        let allocation = table.create_allocation(client, Some(600)).await.unwrap();
+        let channel_table = ChannelTable::new();
+        let allocation = table.create_allocation(client, Some(600), &channel_table).await.unwrap();
         let relayed_addr = allocation.read().relayed_addr;
 
         assert_eq!(
@@ -1330,9 +1395,10 @@ mod tests {
             None,
             None,
         );
+        let channel_table = ChannelTable::new();
         let client1: SocketAddr = "192.168.1.1:12345".parse().unwrap();
 
-        let alloc1 = table.create_allocation(client1, Some(600)).await.unwrap();
+        let alloc1 = table.create_allocation(client1, Some(600), &channel_table).await.unwrap();
         let port1 = alloc1.read().relayed_addr.port();
 
         // Verify port is allocated
