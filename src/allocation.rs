@@ -594,7 +594,11 @@ impl AllocationTable {
         allocations.get(relayed_addr).cloned()
     }
 
-    pub fn remove_allocation(&self, relayed_addr: &SocketAddr) -> Option<Arc<RwLock<Allocation>>> {
+    pub fn remove_allocation(
+        &self,
+        relayed_addr: &SocketAddr,
+        channel_table: Option<&ChannelTable>,
+    ) -> Option<Arc<RwLock<Allocation>>> {
         let mut allocations = self.allocations.write();
         let result = allocations.remove(relayed_addr);
         if let Some(ref alloc) = result {
@@ -610,6 +614,10 @@ impl AllocationTable {
             // Unregister from bandwidth manager to prevent memory leak
             self.bandwidth_manager
                 .unregister_allocation(&relayed_addr.to_string());
+            // Clean up channel bindings for this relayed address
+            if let Some(ch_table) = channel_table {
+                ch_table.remove_for_relayed(relayed_addr);
+            }
         }
         result
     }
@@ -786,8 +794,8 @@ impl AllocationTable {
         )
     }
 
-    /// Clean up expired allocations
-    pub fn cleanup_expired(&self) -> usize {
+    /// Clean up expired allocations and their channel bindings
+    pub fn cleanup_expired(&self, channel_table: Option<&ChannelTable>) -> usize {
         let mut count = 0;
         let mut allocations = self.allocations.write();
 
@@ -818,6 +826,10 @@ impl AllocationTable {
                 // Unregister from bandwidth manager to prevent memory leak
                 self.bandwidth_manager
                     .unregister_allocation(&addr.to_string());
+                // Clean up channel bindings for this relayed address
+                if let Some(ch_table) = channel_table {
+                    ch_table.remove_for_relayed(&addr);
+                }
                 count += 1;
             }
         }
@@ -1143,6 +1155,16 @@ impl ChannelTable {
         id
     }
 
+    /// Remove all channel bindings for a given relayed address.
+    /// Called when an allocation is removed to prevent stale bindings from
+    /// leaking into a new allocation that reuses the same port.
+    pub fn remove_for_relayed(&self, relayed_addr: &SocketAddr) -> usize {
+        let mut channels = self.channels.write();
+        let before = channels.len();
+        channels.retain(|(ra, _), _| ra != relayed_addr);
+        before.saturating_sub(channels.len())
+    }
+
     /// Clean up expired channel bindings
     /// Returns the number of expired channels removed
     pub fn cleanup_expired(&self) -> usize {
@@ -1412,7 +1434,7 @@ mod tests {
 
         // Remove allocation and drop the reference so socket is released
         let relayed_addr = alloc1.read().relayed_addr;
-        table.remove_allocation(&relayed_addr);
+        table.remove_allocation(&relayed_addr, Some(&channel_table));
         drop(alloc1);
 
         // Port should be released in the allocator bitmap
@@ -1423,5 +1445,208 @@ mod tests {
         let (allocated, available) = table.port_stats();
         assert_eq!(allocated, 0);
         assert!(available > 0);
+    }
+
+    /// Verify that removing an allocation also cleans up its channel bindings,
+    /// so a new allocation on the same port doesn't inherit stale bindings.
+    #[tokio::test]
+    async fn test_channel_bindings_cleaned_on_allocation_removal() {
+        let (min_port, max_port) = alloc_test_port_range();
+        let table = AllocationTable::with_port_range(
+            Ipv4Addr::new(127, 0, 0, 1),
+            "test".to_string(),
+            min_port,
+            max_port,
+            None,
+            None,
+            None,
+        );
+        let channel_table = ChannelTable::new();
+        let client: SocketAddr = "192.168.1.1:12345".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+
+        // Create allocation and bind a channel
+        let alloc1 = table.create_allocation(client, Some(600), &channel_table).await.unwrap();
+        let relayed_addr = alloc1.read().relayed_addr;
+        channel_table.bind(0x4000, peer, relayed_addr).unwrap();
+
+        // Verify binding exists
+        assert!(channel_table.get_by_channel(relayed_addr, 0x4000).is_some());
+        assert_eq!(channel_table.len(), 1);
+
+        // Remove allocation WITH channel cleanup
+        table.remove_allocation(&relayed_addr, Some(&channel_table));
+        drop(alloc1);
+
+        // Channel binding should be gone
+        assert!(channel_table.get_by_channel(relayed_addr, 0x4000).is_none());
+        assert_eq!(channel_table.len(), 0);
+    }
+
+    /// Verify the exact scenario from the bug report: same client rapidly
+    /// alloc/dealloc/alloc on the same port — old channel bindings must not
+    /// prevent new ChannelBind from succeeding.
+    #[tokio::test]
+    async fn test_port_reuse_channel_bind_no_conflict() {
+        let (min_port, max_port) = alloc_test_port_range();
+        let table = AllocationTable::with_port_range(
+            Ipv4Addr::new(127, 0, 0, 1),
+            "test".to_string(),
+            min_port,
+            max_port,
+            None,
+            None,
+            None,
+        );
+        let channel_table = ChannelTable::new();
+        let client: SocketAddr = "192.168.1.1:12345".parse().unwrap();
+        let old_peer: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let new_peer: SocketAddr = "10.0.0.3:6000".parse().unwrap();
+
+        // --- First allocation ---
+        let alloc1 = table.create_allocation(client, Some(600), &channel_table).await.unwrap();
+        let relayed1 = alloc1.read().relayed_addr;
+        // Bind channel 0x4005 to old_peer (simulates the stale binding from the logs)
+        channel_table.bind(0x4005, old_peer, relayed1).unwrap();
+
+        // Remove allocation (triggers channel cleanup)
+        table.remove_allocation(&relayed1, Some(&channel_table));
+        drop(alloc1);
+
+        // Give OS time to release the socket
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // --- Second allocation (likely same port) ---
+        let alloc2 = table.create_allocation(client, Some(600), &channel_table).await.unwrap();
+        let relayed2 = alloc2.read().relayed_addr;
+
+        // Binding channel 0x4005 to new_peer must succeed — no stale binding conflict
+        let result = channel_table.bind(0x4005, new_peer, relayed2);
+        assert!(
+            result.is_ok(),
+            "ChannelBind should succeed on reused port, but got {:?}",
+            result
+        );
+
+        // Verify the binding points to the new peer
+        let binding = channel_table.get_by_channel(relayed2, 0x4005).unwrap();
+        assert_eq!(binding.peer_addr, new_peer);
+    }
+
+    /// Verify that cleanup_expired also removes channel bindings for each
+    /// expired allocation.
+    #[tokio::test]
+    async fn test_cleanup_expired_also_cleans_channels() {
+        let (min_port, max_port) = alloc_test_port_range();
+        let table = AllocationTable::with_port_range(
+            Ipv4Addr::new(127, 0, 0, 1),
+            "test".to_string(),
+            min_port,
+            max_port,
+            None,
+            None,
+            None,
+        );
+        let channel_table = ChannelTable::new();
+        let client1: SocketAddr = "192.168.1.1:12345".parse().unwrap();
+        let client2: SocketAddr = "192.168.1.1:12346".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+
+        // Create two allocations: one expired, one active
+        let alloc_expired = table.create_allocation(client1, Some(0), &channel_table).await.unwrap();
+        let alloc_active = table.create_allocation(client2, Some(600), &channel_table).await.unwrap();
+        let relayed_expired = alloc_expired.read().relayed_addr;
+        let relayed_active = alloc_active.read().relayed_addr;
+
+        // Bind channels on both
+        channel_table.bind(0x4000, peer, relayed_expired).unwrap();
+        channel_table.bind(0x4001, peer, relayed_active).unwrap();
+        assert_eq!(channel_table.len(), 2);
+
+        // Let the expired one actually expire
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Cleanup
+        let removed = table.cleanup_expired(Some(&channel_table));
+        assert_eq!(removed, 1);
+
+        // Expired allocation's channel binding should be gone
+        assert!(channel_table.get_by_channel(relayed_expired, 0x4000).is_none());
+        // Active allocation's channel binding should remain
+        assert!(channel_table.get_by_channel(relayed_active, 0x4001).is_some());
+        assert_eq!(channel_table.len(), 1);
+    }
+
+    /// Verify that when a client re-allocates (same client_addr), only one
+    /// allocation exists — the old one is removed first.
+    #[tokio::test]
+    async fn test_realloc_same_client_removes_old() {
+        let (min_port, max_port) = alloc_test_port_range();
+        let table = AllocationTable::with_port_range(
+            Ipv4Addr::new(127, 0, 0, 1),
+            "test".to_string(),
+            min_port,
+            max_port,
+            None,
+            None,
+            None,
+        );
+        let channel_table = ChannelTable::new();
+        let client: SocketAddr = "192.168.1.1:12345".parse().unwrap();
+
+        // First allocation
+        let alloc1 = table.create_allocation(client, Some(600), &channel_table).await.unwrap();
+        let _relayed1 = alloc1.read().relayed_addr;
+
+        // Simulate what handle_allocate does: remove old allocation before creating new one
+        if let Some(old_relayed) = table.find_allocation_by_client(&client) {
+            table.remove_allocation(&old_relayed, Some(&channel_table));
+        }
+        drop(alloc1);
+
+        // Give OS time to release the socket
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Second allocation (same client)
+        let alloc2 = table.create_allocation(client, Some(600), &channel_table).await.unwrap();
+        let relayed2 = alloc2.read().relayed_addr;
+
+        // There should be exactly one allocation for this client
+        let found = table.find_allocation_by_client(&client);
+        assert_eq!(found, Some(relayed2));
+
+        // The new allocation should be accessible
+        assert!(table.get_allocation(&relayed2).is_some());
+
+        // Active count should be 1 (old was removed, new was created)
+        assert_eq!(table.stats().active_allocations.load(Ordering::Relaxed), 1);
+    }
+
+    /// Verify remove_for_relayed only removes bindings for the specific
+    /// relayed_addr and leaves others untouched.
+    #[test]
+    fn test_channel_table_remove_for_relayed_selective() {
+        let table = ChannelTable::new();
+        let relayed_a: SocketAddr = "10.0.0.1:49152".parse().unwrap();
+        let relayed_b: SocketAddr = "10.0.0.1:49153".parse().unwrap();
+        let peer1: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let peer2: SocketAddr = "10.0.0.3:5001".parse().unwrap();
+
+        // Bind channels on two different allocations
+        table.bind(0x4000, peer1, relayed_a).unwrap();
+        table.bind(0x4001, peer2, relayed_a).unwrap();
+        table.bind(0x4000, peer1, relayed_b).unwrap();
+        assert_eq!(table.len(), 3);
+
+        // Remove only bindings for relayed_a
+        let removed = table.remove_for_relayed(&relayed_a);
+        assert_eq!(removed, 2);
+        assert_eq!(table.len(), 1);
+
+        // relayed_b's binding survives
+        assert!(table.get_by_channel(relayed_b, 0x4000).is_some());
+        // relayed_a's bindings are gone
+        assert!(table.get_by_channel(relayed_a, 0x4000).is_none());
+        assert!(table.get_by_channel(relayed_a, 0x4001).is_none());
     }
 }

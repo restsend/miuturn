@@ -418,6 +418,7 @@ impl TurnServer {
     /// Start a background task to clean up expired allocations
     pub fn start_allocation_cleanup_task(&self) {
         let allocation_table = self.allocation_table.clone();
+        let channel_table = self.channel_table.clone();
         const CLEANUP_INTERVAL_SECONDS: u64 = 30;
 
         if tokio::runtime::Handle::try_current().is_err() {
@@ -429,7 +430,9 @@ impl TurnServer {
                 tokio::time::interval(tokio::time::Duration::from_secs(CLEANUP_INTERVAL_SECONDS));
             loop {
                 interval.tick().await;
-                let removed_count = allocation_table.cleanup_expired();
+                let ch_table = channel_table.read().await;
+                let removed_count = allocation_table.cleanup_expired(Some(&*ch_table));
+                drop(ch_table);
                 if removed_count > 0 {
                     let (active_count, total_allocations) = allocation_table.port_stats();
                     tracing::info!(
@@ -993,7 +996,18 @@ async fn handle_allocate(
         "received TURN Allocate request"
     );
 
+    // Remove any existing allocation for this client before creating a new one.
+    // This prevents stale state (channel bindings, permissions) from leaking
+    // into the new allocation when the same client rapidly recycles.
     let ch_table = server.channel_table.read().await.clone();
+    if let Some(old_relayed) = server.allocation_table.find_allocation_by_client(&client_addr) {
+        tracing::info!(
+            %client_addr,
+            old_relayed = %old_relayed,
+            "removing existing allocation before creating new one"
+        );
+        server.allocation_table.remove_allocation(&old_relayed, Some(&ch_table));
+    }
     let allocation = match server
         .allocation_table
         .create_allocation(client_addr, Some(lifetime), &ch_table)
