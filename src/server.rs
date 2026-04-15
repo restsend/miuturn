@@ -499,7 +499,7 @@ impl TurnServer {
                 drop(channel_table);
 
                 if removed_count > 0 {
-                    tracing::debug!("Cleaned up {} expired channel bindings", removed_count);
+                    tracing::info!("Cleaned up {} expired channel bindings", removed_count);
                 }
             }
         });
@@ -1092,9 +1092,10 @@ async fn handle_refresh(
     client_addr: SocketAddr,
 ) -> Option<Bytes> {
     // Verify auth
-    if let Err(resp) = verify_turn_auth(&msg, server, client_addr) {
-        return Some(resp);
-    }
+    let username = match verify_turn_auth(&msg, server, client_addr) {
+        Ok(u) => u,
+        Err(resp) => return Some(resp),
+    };
 
     let lifetime = get_lifetime(&msg);
     if let Some(relayed) = server
@@ -1112,12 +1113,24 @@ async fn handle_refresh(
                 server,
             ));
         }
+        tracing::info!(
+            %client_addr,
+            relayed = %relayed,
+            lifetime,
+            "TURN Refresh succeeded"
+        );
         // Return Refresh Success with LIFETIME
         let mut response = crate::message::create_success_response(&msg.header);
         response.attributes.push(Attribute {
             attr_type: Attribute::LIFETIME,
             value: Bytes::from(lifetime.to_be_bytes().to_vec()),
         });
+        if !server.auth_disabled {
+            if let Some(password) = server.get_password_for_user(&username) {
+                let key = compute_message_integrity_key(&username, &server.realm, &password);
+                add_response_message_integrity(&mut response, &key);
+            }
+        }
         return Some(response.encode());
     }
     Some(create_error_response_bytes(
@@ -1135,9 +1148,10 @@ async fn handle_create_permission(
     client_addr: SocketAddr,
 ) -> Option<Bytes> {
     // Verify auth
-    if let Err(resp) = verify_turn_auth(&msg, server, client_addr) {
-        return Some(resp);
-    }
+    let username = match verify_turn_auth(&msg, server, client_addr) {
+        Ok(u) => u,
+        Err(resp) => return Some(resp),
+    };
 
     // Client must have an active allocation
     if server
@@ -1189,7 +1203,13 @@ async fn handle_create_permission(
     );
 
     // Return CreatePermission Success
-    let response = crate::message::create_success_response(&msg.header);
+    let mut response = crate::message::create_success_response(&msg.header);
+    if !server.auth_disabled {
+        if let Some(password) = server.get_password_for_user(&username) {
+            let key = compute_message_integrity_key(&username, &server.realm, &password);
+            add_response_message_integrity(&mut response, &key);
+        }
+    }
     Some(response.encode())
 }
 
@@ -1199,9 +1219,10 @@ async fn handle_channel_bind(
     client_addr: SocketAddr,
 ) -> Option<Bytes> {
     // Verify auth
-    if let Err(resp) = verify_turn_auth(&msg, server, client_addr) {
-        return Some(resp);
-    }
+    let username = match verify_turn_auth(&msg, server, client_addr) {
+        Ok(u) => u,
+        Err(resp) => return Some(resp),
+    };
 
     if let Some(relayed_addr) = server
         .allocation_table
@@ -1233,7 +1254,13 @@ async fn handle_channel_bind(
                         channel_num,
                         "ChannelBind succeeded"
                     );
-                    let response = crate::message::create_success_response(&msg.header);
+                    let mut response = crate::message::create_success_response(&msg.header);
+                    if !server.auth_disabled {
+                        if let Some(password) = server.get_password_for_user(&username) {
+                            let key = compute_message_integrity_key(&username, &server.realm, &password);
+                            add_response_message_integrity(&mut response, &key);
+                        }
+                    }
                     return Some(response.encode());
                 }
                 debug!(
@@ -1601,5 +1628,337 @@ mod tests {
                 .is_some()
         );
         assert!(success_msg.get_attribute(Attribute::LIFETIME).is_some());
+    }
+
+    fn build_authenticated_create_permission_request(
+        transaction_id: [u8; 12],
+        peer_addr: SocketAddr,
+        username: &str,
+        realm: &str,
+        nonce: &str,
+        password: &str,
+    ) -> Message {
+        let mut msg = Message {
+            header: MessageHeader {
+                method: Method::CreatePermission,
+                event_type: EventType::Request,
+                message_length: 0,
+                magic_cookie: 0x2112A442,
+                transaction_id,
+            },
+            attributes: Vec::new(),
+        };
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::USERNAME,
+            value: Bytes::copy_from_slice(username.as_bytes()),
+        });
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::REALM,
+            value: Bytes::copy_from_slice(realm.as_bytes()),
+        });
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::NONCE,
+            value: Bytes::copy_from_slice(nonce.as_bytes()),
+        });
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::PEER_ADDRESS,
+            value: crate::message::encode_xor_address(peer_addr, 0x2112A442, &transaction_id),
+        });
+        let key = compute_message_integrity_key(username, realm, password);
+        add_response_message_integrity(&mut msg, &key);
+        msg
+    }
+
+    fn build_authenticated_channel_bind_request(
+        transaction_id: [u8; 12],
+        peer_addr: SocketAddr,
+        channel_num: u16,
+        username: &str,
+        realm: &str,
+        nonce: &str,
+        password: &str,
+    ) -> Message {
+        let mut msg = Message {
+            header: MessageHeader {
+                method: Method::ChannelBind,
+                event_type: EventType::Request,
+                message_length: 0,
+                magic_cookie: 0x2112A442,
+                transaction_id,
+            },
+            attributes: Vec::new(),
+        };
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::USERNAME,
+            value: Bytes::copy_from_slice(username.as_bytes()),
+        });
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::REALM,
+            value: Bytes::copy_from_slice(realm.as_bytes()),
+        });
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::NONCE,
+            value: Bytes::copy_from_slice(nonce.as_bytes()),
+        });
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::PEER_ADDRESS,
+            value: crate::message::encode_xor_address(peer_addr, 0x2112A442, &transaction_id),
+        });
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::CHANNEL_NUMBER,
+            value: Bytes::from(vec![(channel_num >> 8) as u8, (channel_num & 0xFF) as u8]),
+        });
+        let key = compute_message_integrity_key(username, realm, password);
+        add_response_message_integrity(&mut msg, &key);
+        msg
+    }
+
+    fn build_authenticated_refresh_request(
+        transaction_id: [u8; 12],
+        lifetime: u32,
+        username: &str,
+        realm: &str,
+        nonce: &str,
+        password: &str,
+    ) -> Message {
+        let mut msg = Message {
+            header: MessageHeader {
+                method: Method::Refresh,
+                event_type: EventType::Request,
+                message_length: 0,
+                magic_cookie: 0x2112A442,
+                transaction_id,
+            },
+            attributes: Vec::new(),
+        };
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::USERNAME,
+            value: Bytes::copy_from_slice(username.as_bytes()),
+        });
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::REALM,
+            value: Bytes::copy_from_slice(realm.as_bytes()),
+        });
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::NONCE,
+            value: Bytes::copy_from_slice(nonce.as_bytes()),
+        });
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::LIFETIME,
+            value: Bytes::from(lifetime.to_be_bytes().to_vec()),
+        });
+        let key = compute_message_integrity_key(username, realm, password);
+        add_response_message_integrity(&mut msg, &key);
+        msg
+    }
+
+    #[tokio::test]
+    async fn test_authenticated_create_permission_success_contains_message_integrity() {
+        let realm = "test-realm".to_string();
+        let username = "admin";
+        let password = "password";
+        let server = TurnServer::with_password(
+            Ipv4Addr::new(127, 0, 0, 1),
+            realm.clone(),
+            password.to_string(),
+        );
+        let client_addr: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+
+        let unauth_msg = build_allocate_request([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        let nonce_response = process_message(unauth_msg, &server, client_addr)
+            .await
+            .unwrap();
+        let nonce_msg = Message::parse(&nonce_response).unwrap();
+        let nonce = String::from_utf8(
+            nonce_msg
+                .get_attribute(Attribute::NONCE)
+                .unwrap()
+                .value
+                .to_vec(),
+        )
+        .unwrap();
+
+        let mut relayed_addr = None;
+        for attempt in 0..5 {
+            let mut tid = [0u8; 12];
+            tid[11] = attempt;
+            let auth_msg =
+                build_authenticated_allocate_request(tid, username, &realm, &nonce, password);
+            let response = process_message(auth_msg, &server, client_addr)
+                .await
+                .unwrap();
+            let parsed = Message::parse(&response).unwrap();
+            if parsed.header.event_type == EventType::Success {
+                if let Some(attr) = parsed.get_attribute(Attribute::XOR_RELAYED_ADDRESS) {
+                    relayed_addr = crate::message::decode_xor_address(
+                        &attr.value,
+                        0x2112A442,
+                        &parsed.header.transaction_id,
+                    );
+                }
+                break;
+            }
+        }
+        let relayed_addr = relayed_addr.expect("allocation should succeed");
+
+        let cp_msg = build_authenticated_create_permission_request(
+            [11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+            relayed_addr,
+            username,
+            &realm,
+            &nonce,
+            password,
+        );
+        let cp_response = process_message(cp_msg, &server, client_addr)
+            .await
+            .unwrap();
+        let cp_parsed = Message::parse(&cp_response).unwrap();
+        assert_eq!(cp_parsed.header.event_type, EventType::Success);
+        assert!(
+            cp_parsed
+                .get_attribute(Attribute::MESSAGE_INTEGRITY)
+                .is_some(),
+            "CreatePermission success should include MESSAGE-INTEGRITY"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authenticated_channel_bind_success_contains_message_integrity() {
+        let realm = "test-realm".to_string();
+        let username = "admin";
+        let password = "password";
+        let server = TurnServer::with_password(
+            Ipv4Addr::new(127, 0, 0, 1),
+            realm.clone(),
+            password.to_string(),
+        );
+        let client_addr: SocketAddr = "127.0.0.1:50002".parse().unwrap();
+
+        let unauth_msg = build_allocate_request([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        let nonce_response = process_message(unauth_msg, &server, client_addr)
+            .await
+            .unwrap();
+        let nonce_msg = Message::parse(&nonce_response).unwrap();
+        let nonce = String::from_utf8(
+            nonce_msg
+                .get_attribute(Attribute::NONCE)
+                .unwrap()
+                .value
+                .to_vec(),
+        )
+        .unwrap();
+
+        let mut relayed_addr = None;
+        for attempt in 0..5 {
+            let mut tid = [0u8; 12];
+            tid[11] = attempt;
+            let auth_msg =
+                build_authenticated_allocate_request(tid, username, &realm, &nonce, password);
+            let response = process_message(auth_msg, &server, client_addr)
+                .await
+                .unwrap();
+            let parsed = Message::parse(&response).unwrap();
+            if parsed.header.event_type == EventType::Success {
+                if let Some(attr) = parsed.get_attribute(Attribute::XOR_RELAYED_ADDRESS) {
+                    relayed_addr = crate::message::decode_xor_address(
+                        &attr.value,
+                        0x2112A442,
+                        &parsed.header.transaction_id,
+                    );
+                }
+                break;
+            }
+        }
+        let _relayed_addr = relayed_addr.expect("allocation should succeed");
+
+        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let cb_msg = build_authenticated_channel_bind_request(
+            [11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+            peer_addr,
+            0x4000,
+            username,
+            &realm,
+            &nonce,
+            password,
+        );
+        let cb_response = process_message(cb_msg, &server, client_addr)
+            .await
+            .unwrap();
+        let cb_parsed = Message::parse(&cb_response).unwrap();
+        assert_eq!(cb_parsed.header.event_type, EventType::Success);
+        assert!(
+            cb_parsed
+                .get_attribute(Attribute::MESSAGE_INTEGRITY)
+                .is_some(),
+            "ChannelBind success should include MESSAGE-INTEGRITY"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authenticated_refresh_success_contains_message_integrity() {
+        let realm = "test-realm".to_string();
+        let username = "admin";
+        let password = "password";
+        let server = TurnServer::with_password(
+            Ipv4Addr::new(127, 0, 0, 1),
+            realm.clone(),
+            password.to_string(),
+        );
+        let client_addr: SocketAddr = "127.0.0.1:50003".parse().unwrap();
+
+        let unauth_msg = build_allocate_request([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        let nonce_response = process_message(unauth_msg, &server, client_addr)
+            .await
+            .unwrap();
+        let nonce_msg = Message::parse(&nonce_response).unwrap();
+        let nonce = String::from_utf8(
+            nonce_msg
+                .get_attribute(Attribute::NONCE)
+                .unwrap()
+                .value
+                .to_vec(),
+        )
+        .unwrap();
+
+        for attempt in 0..5 {
+            let mut tid = [0u8; 12];
+            tid[11] = attempt;
+            let auth_msg =
+                build_authenticated_allocate_request(tid, username, &realm, &nonce, password);
+            let response = process_message(auth_msg, &server, client_addr)
+                .await
+                .unwrap();
+            let parsed = Message::parse(&response).unwrap();
+            if parsed.header.event_type == EventType::Success {
+                break;
+            }
+            if attempt == 4 {
+                panic!("allocation should succeed");
+            }
+        }
+
+        let refresh_msg = build_authenticated_refresh_request(
+            [11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+            600,
+            username,
+            &realm,
+            &nonce,
+            password,
+        );
+        let refresh_response = process_message(refresh_msg, &server, client_addr)
+            .await
+            .unwrap();
+        let refresh_parsed = Message::parse(&refresh_response).unwrap();
+        assert_eq!(refresh_parsed.header.event_type, EventType::Success);
+        assert!(
+            refresh_parsed
+                .get_attribute(Attribute::MESSAGE_INTEGRITY)
+                .is_some(),
+            "Refresh success should include MESSAGE-INTEGRITY"
+        );
+        assert!(
+            refresh_parsed.get_attribute(Attribute::LIFETIME).is_some(),
+            "Refresh success should include LIFETIME"
+        );
     }
 }

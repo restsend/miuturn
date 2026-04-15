@@ -800,6 +800,15 @@ impl AllocationTable {
 
         for addr in expired {
             if let Some(alloc) = allocations.remove(&addr) {
+                {
+                    let a = alloc.read();
+                    debug!(
+                        relayed_addr = %addr,
+                        client_addr = %a.client_addr,
+                        remaining = a.remaining_lifetime(),
+                        "removing expired allocation"
+                    );
+                }
                 // Abort the allocation task
                 if let Some(ref relay) = alloc.read().relay {
                     relay.task_handle.abort();
@@ -899,13 +908,10 @@ async fn spawn_allocation_task(
                             } else {
                                 peer_addr
                             };
-                            // Construct the external relay address for the sender by swapping in
-                            // the same external IP we use for our own relayed address.
-                            let sender_relayed = SocketAddr::new(relayed_addr.ip(), peer_addr.port());
 
                             // RFC 5766 §10.4: if a channel binding exists for this peer on this
                             // allocation, send ChannelData; otherwise send Data Indication.
-                            let channel_num = channel_table.get_by_peer_for_relayed(&sender_relayed, &effective_peer);
+                            let channel_num = channel_table.get_by_peer_for_relayed(&relayed_addr, &effective_peer);
 
                             if let Some(ch_num) = channel_num {
                                 // Send as ChannelData

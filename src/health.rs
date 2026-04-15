@@ -185,6 +185,7 @@ pub async fn create_admin_routes(
         .route("/api/v1/turn-credentials", post(turn_credentials_handler))
         .route("/logout", post(logout_handler))
         .route("/metrics", get(prometheus_metrics_handler))
+        .route("/turn-test", get(turn_test_handler))
         .layer(cors)
         .with_state(state);
 
@@ -233,6 +234,10 @@ async fn dashboard_handler(jar: CookieJar, State(state): State<AppState>) -> Htm
 
     let html = include_str!("../static/admin.html");
     Html(html.to_string())
+}
+
+async fn turn_test_handler() -> Html<&'static str> {
+    Html(include_str!("../static/turn_test.html"))
 }
 
 #[derive(Debug, serde::Deserialize)]
