@@ -196,6 +196,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let external_ip = config.server.external_ip.clone();
         let listen_configs = config.server.listening.clone();
 
+        let admin_acl = http.admin_acl.clone();
+        let trust_proxy = http.trust_proxy.unwrap_or(false);
+
         tokio::spawn(async move {
             if let Err(e) = miuturn::create_admin_routes(
                 http_addr.to_string(),
@@ -210,6 +213,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Some(config_path),
                 external_ip,
                 listen_configs,
+                admin_acl,
+                trust_proxy,
             )
             .await
             {

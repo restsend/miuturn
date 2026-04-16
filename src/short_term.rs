@@ -15,7 +15,7 @@ pub struct ShortTermCredentialManager {
     /// Secret key for HMAC
     secret_key: Vec<u8>,
     /// Default lifetime in seconds
-    default_lifetime_secs: u64,
+    pub default_lifetime_secs: u64,
 }
 
 impl ShortTermCredentialManager {
@@ -33,12 +33,13 @@ impl ShortTermCredentialManager {
 
     /// Generate a short-term credential
     /// Returns (username, password, expires_at)
-    pub fn generate(&self, user_id: &str) -> (String, String, u64) {
+    pub fn generate(&self, user_id: &str, life_time_secs: Option<u64>) -> (String, String, u64) {
+        let life_time_secs = life_time_secs.unwrap_or(self.default_lifetime_secs);
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
-            + self.default_lifetime_secs;
+            + life_time_secs;
 
         let username = format!("{}:{}", timestamp, user_id);
         let password = self.compute_password(&username);
@@ -116,7 +117,7 @@ mod tests {
     #[test]
     fn test_short_term_credential_generation() {
         let manager = ShortTermCredentialManager::new("my_secret_key".to_string());
-        let (username, password, expires) = manager.generate("user123");
+        let (username, password, expires) = manager.generate("user123", None);
 
         assert!(username.contains("user123"));
         assert!(!password.is_empty());
@@ -129,7 +130,7 @@ mod tests {
     #[test]
     fn test_short_term_credential_verification() {
         let manager = ShortTermCredentialManager::new("secret".to_string());
-        let (username, password, _) = manager.generate("testuser");
+        let (username, password, _) = manager.generate("testuser", None);
 
         // Wrong password should fail
         assert!(!manager.verify(&username, "wrong_password"));
@@ -150,7 +151,7 @@ mod tests {
     #[test]
     fn test_parse_username() {
         let manager = ShortTermCredentialManager::new("secret".to_string());
-        let (username, _, _) = manager.generate("myuser");
+        let (username, _, _) = manager.generate("myuser", None);
 
         if let Some((timestamp, user_id)) = manager.parse_username(&username) {
             assert_eq!(user_id, "myuser");
@@ -163,7 +164,7 @@ mod tests {
     #[test]
     fn test_username_format_timestamp_userid() {
         let manager = ShortTermCredentialManager::new("secret".to_string());
-        let (username, _, expires) = manager.generate("testuser");
+        let (username, _, expires) = manager.generate("testuser", None);
 
         // Username should be in format timestamp:userid
         let parts: Vec<&str> = username.split(':').collect();
@@ -180,7 +181,7 @@ mod tests {
         let manager1 = ShortTermCredentialManager::new("secret1".to_string());
         let manager2 = ShortTermCredentialManager::new("secret2".to_string());
 
-        let (username, password, _) = manager1.generate("user");
+        let (username, password, _) = manager1.generate("user", None);
 
         // manager1 can verify
         assert!(manager1.verify(&username, &password));
@@ -215,7 +216,7 @@ mod tests {
     fn test_with_lifetime() {
         let manager = ShortTermCredentialManager::new("secret".to_string()).with_lifetime(7200);
 
-        let (_username, _, expires) = manager.generate("user");
+        let (_username, _, expires) = manager.generate("user", None);
 
         // Check that the expires time is in the future (approximately 7200 seconds from now)
         let now = std::time::SystemTime::now()
@@ -246,7 +247,7 @@ mod tests {
         let manager1 = ShortTermCredentialManager::new("secret".to_string());
         let manager2 = manager1.clone();
 
-        let (username, password, _) = manager1.generate("user");
+        let (username, password, _) = manager1.generate("user", None);
 
         // Both managers should verify the same credentials
         assert!(manager1.verify(&username, &password));
@@ -257,8 +258,8 @@ mod tests {
     fn test_different_user_different_credentials() {
         let manager = ShortTermCredentialManager::new("secret".to_string());
 
-        let (user1_name, user1_pass, _) = manager.generate("user1");
-        let (user2_name, user2_pass, _) = manager.generate("user2");
+        let (user1_name, user1_pass, _) = manager.generate("user1", None);
+        let (user2_name, user2_pass, _) = manager.generate("user2", None);
 
         assert_ne!(user1_name, user2_name);
         assert_ne!(user1_pass, user2_pass);

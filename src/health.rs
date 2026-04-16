@@ -5,7 +5,9 @@ use crate::metrics::Metrics;
 use crate::short_term::ShortTermCredentialManager;
 use axum::{
     Form, Router,
-    extract::State,
+    extract::{ConnectInfo, State},
+    http::StatusCode,
+    middleware::{self, Next},
     response::{Html, IntoResponse, Json, Redirect},
     routing::{get, post},
 };
@@ -43,6 +45,8 @@ struct AppState {
     config_path: Option<PathBuf>,
     external_ip: String,
     listen_configs: Vec<ListenConfig>,
+    admin_acl: Vec<String>,
+    trust_proxy: bool,
 }
 
 const SESSION_COOKIE: &str = "admin_session";
@@ -58,6 +62,49 @@ fn check_auth(jar: &CookieJar, admin_state: &AdminState) -> bool {
     jar.get(SESSION_COOKIE)
         .map(|cookie| cookie.value() == SESSION_VALUE)
         .unwrap_or(false)
+}
+
+// Middleware to enforce admin ACL by IP
+async fn admin_acl_middleware(
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> impl IntoResponse {
+    let ip = if state.trust_proxy {
+        request
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(|s| s.trim().to_string())
+            .or_else(|| {
+                request
+                    .headers()
+                    .get("x-real-ip")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.trim().to_string())
+            })
+            .unwrap_or_else(|| addr.ip().to_string())
+    } else {
+        addr.ip().to_string()
+    };
+    let allowed = state.admin_acl.is_empty()
+        || state
+            .admin_acl
+            .iter()
+            .any(|range| crate::auth::AuthManager::ip_in_range(&ip, range));
+    if allowed {
+        next.run(request).await
+    } else {
+        tracing::warn!("Admin access denied for IP: {}", ip);
+        (
+            StatusCode::FORBIDDEN,
+            [("content-type", "text/plain; charset=utf-8")],
+            "Forbidden: admin access denied from this IP",
+        )
+            .into_response()
+    }
 }
 
 // Helper function to save config to file
@@ -130,6 +177,8 @@ pub async fn create_admin_routes(
     config_path: Option<PathBuf>,
     external_ip: String,
     listen_configs: Vec<ListenConfig>,
+    admin_acl: Vec<String>,
+    trust_proxy: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let turn_rest_state = if turn_rest_enabled {
         let secret = turn_rest_secret.unwrap_or_else(|| "default-secret-key".to_string());
@@ -158,6 +207,8 @@ pub async fn create_admin_routes(
         config_path,
         external_ip,
         listen_configs,
+        admin_acl,
+        trust_proxy,
     };
 
     let cors = CorsLayer::new()
@@ -165,12 +216,18 @@ pub async fn create_admin_routes(
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let app = Router::new()
+    // Public routes (no ACL check)
+    let public_routes = Router::new()
+        .route("/health", get(health_proxy_handler))
+        .route("/api/v1/turn-credentials", post(turn_credentials_handler))
+        .route("/api/v1/iceservers", get(ice_servers_handler));
+
+    // Admin routes (protected by ACL)
+    let admin_routes = Router::new()
         .route("/", get(root_handler))
         .route("/console", get(console_handler))
         .route("/console/dashboard", get(dashboard_handler))
         .route("/login", post(login_handler))
-        .route("/health", get(health_proxy_handler))
         .route("/api/stats", get(stats_json_handler))
         .route("/api/v1/stats", get(stats_json_handler))
         .route("/api/v1/reload", post(reload_handler))
@@ -188,16 +245,22 @@ pub async fn create_admin_routes(
                 .delete(delete_acl_handler)
                 .put(update_acl_handler),
         )
-        .route("/api/v1/turn-credentials", post(turn_credentials_handler))
-        .route("/api/v1/iceservers", get(ice_servers_handler))
         .route("/logout", post(logout_handler))
         .route("/metrics", get(prometheus_metrics_handler))
+        .layer(middleware::from_fn_with_state(state.clone(), admin_acl_middleware));
+
+    let app = public_routes
+        .merge(admin_routes)
         .layer(cors)
         .with_state(state);
 
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("Admin console available at http://{}", addr);
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -720,8 +783,7 @@ async fn ice_servers_handler(
         }
     };
 
-    let _lifetime = req.lifetime.unwrap_or(3600);
-    let (username, password, _expires) = manager.generate(&req.username);
+    let (username, password, _expires) = manager.generate(&req.username, req.lifetime);
 
     let mut urls = Vec::new();
     for config in &state.listen_configs {
@@ -734,7 +796,10 @@ async fn ice_servers_handler(
                 urls.push(format!("turn:{}:{}?transport=tcp", state.external_ip, port));
             }
             "tls" | "dtls" => {
-                urls.push(format!("turns:{}:{}?transport=tcp", state.external_ip, port));
+                urls.push(format!(
+                    "turns:{}:{}?transport=tcp",
+                    state.external_ip, port
+                ));
             }
             _ => {}
         }
@@ -772,15 +837,13 @@ async fn turn_credentials_handler(
         }
     };
 
-    let lifetime = req.lifetime.unwrap_or(3600);
-    let (username, password, expires) = manager.generate(&req.username);
+    let (username, password, expires) = manager.generate(&req.username, req.lifetime);
 
     Json(serde_json::json!({
         "success": true,
         "username": username,
         "password": password,
         "expires": expires,
-        "lifetime": lifetime,
     }))
 }
 
@@ -976,6 +1039,8 @@ mod tests {
                     address: "0.0.0.0:3478".to_string(),
                 },
             ],
+            admin_acl: vec!["127.0.0.1".to_string()],
+            trust_proxy: false,
         };
 
         let query = IceServersQuery {
@@ -987,13 +1052,11 @@ mod tests {
 
         let urls = json[0]["urls"].as_array().unwrap();
         assert!(urls.iter().any(|u| u == "turn:192.168.1.1:3478"));
-        assert!(urls.iter().any(|u| u == "turn:192.168.1.1:3478?transport=tcp"));
         assert!(
-            json[0]["username"]
-                .as_str()
-                .unwrap()
-                .contains("testuser")
+            urls.iter()
+                .any(|u| u == "turn:192.168.1.1:3478?transport=tcp")
         );
+        assert!(json[0]["username"].as_str().unwrap().contains("testuser"));
         assert!(json[0]["credential"].as_str().is_some());
     }
 
@@ -1023,6 +1086,8 @@ mod tests {
             config_path: None,
             external_ip: "192.168.1.1".to_string(),
             listen_configs: vec![],
+            admin_acl: vec!["127.0.0.1".to_string()],
+            trust_proxy: false,
         };
 
         let query = IceServersQuery {

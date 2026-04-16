@@ -110,7 +110,7 @@ impl AuthManager {
         true
     }
 
-    fn ip_in_range(ip: &str, range: &str) -> bool {
+    pub fn ip_in_range(ip: &str, range: &str) -> bool {
         if range.contains('/') {
             let parts: Vec<&str> = range.split('/').collect();
             if parts.len() != 2 {

@@ -66,6 +66,21 @@ pub struct HttpConfig {
     pub admin_username: Option<String>,
     /// Admin console password
     pub admin_password: Option<String>,
+    /// Admin console ACL: list of allowed IPs/CIDRs (default: ["127.0.0.1"])
+    #[serde(default = "HttpConfig::default_admin_acl")]
+    pub admin_acl: Vec<String>,
+    /// Trust X-Forwarded-For and X-Real-IP headers for admin ACL IP detection
+    #[serde(default = "HttpConfig::default_trust_proxy")]
+    pub trust_proxy: Option<bool>,
+}
+
+impl HttpConfig {
+    fn default_admin_acl() -> Vec<String> {
+        vec!["127.0.0.1".to_string()]
+    }
+    fn default_trust_proxy() -> Option<bool> {
+        Some(false)
+    }
 }
 
 impl Default for HttpConfig {
@@ -77,6 +92,8 @@ impl Default for HttpConfig {
             turn_rest_default_lifetime: Some(3600),
             admin_username: None,
             admin_password: None,
+            admin_acl: Self::default_admin_acl(),
+            trust_proxy: Self::default_trust_proxy(),
         }
     }
 }

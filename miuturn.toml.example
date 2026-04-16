@@ -25,6 +25,10 @@ address = "0.0.0.0:3478"
 
 #[http]
 #address = "0.0.0.0:8080"
+# Admin console ACL: list of allowed IPs/CIDRs (default: ["127.0.0.1"])
+#admin_acl = ["127.0.0.1", "192.168.1.0/24"]
+# Trust X-Forwarded-For / X-Real-IP headers when checking admin ACL (default: false)
+#trust_proxy = false
 
 [[auth.users]]
 username = "miuturn.admin"
