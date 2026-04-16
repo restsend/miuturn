@@ -1,6 +1,6 @@
 use crate::allocation::ServerStatsSnapshot;
 use crate::auth::{AclAction, AclRule, SharedAuthManager, User, UserType};
-use crate::config::{AclRuleConfig, Config, UserConfig};
+use crate::config::{AclRuleConfig, Config, ListenConfig, UserConfig};
 use crate::metrics::Metrics;
 use crate::short_term::ShortTermCredentialManager;
 use axum::{
@@ -41,6 +41,8 @@ struct AppState {
     turn_rest: TurnRestState,
     metrics: Option<Metrics>,
     config_path: Option<PathBuf>,
+    external_ip: String,
+    listen_configs: Vec<ListenConfig>,
 }
 
 const SESSION_COOKIE: &str = "admin_session";
@@ -126,6 +128,8 @@ pub async fn create_admin_routes(
     turn_rest_default_lifetime: u64,
     metrics: Option<Metrics>,
     config_path: Option<PathBuf>,
+    external_ip: String,
+    listen_configs: Vec<ListenConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let turn_rest_state = if turn_rest_enabled {
         let secret = turn_rest_secret.unwrap_or_else(|| "default-secret-key".to_string());
@@ -152,6 +156,8 @@ pub async fn create_admin_routes(
         turn_rest: turn_rest_state,
         metrics,
         config_path,
+        external_ip,
+        listen_configs,
     };
 
     let cors = CorsLayer::new()
@@ -183,6 +189,7 @@ pub async fn create_admin_routes(
                 .put(update_acl_handler),
         )
         .route("/api/v1/turn-credentials", post(turn_credentials_handler))
+        .route("/api/v1/iceservers", get(ice_servers_handler))
         .route("/logout", post(logout_handler))
         .route("/metrics", get(prometheus_metrics_handler))
         .layer(cors)
@@ -692,6 +699,58 @@ pub struct TurnCredentialsRequest {
     lifetime: Option<u64>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct IceServersQuery {
+    username: String,
+    lifetime: Option<u64>,
+}
+
+async fn ice_servers_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(req): axum::extract::Query<IceServersQuery>,
+) -> Json<serde_json::Value> {
+    if !state.turn_rest.enabled {
+        return Json(serde_json::json!([]));
+    }
+
+    let manager = match &state.turn_rest.credential_manager {
+        Some(m) => m,
+        None => {
+            return Json(serde_json::json!([]));
+        }
+    };
+
+    let _lifetime = req.lifetime.unwrap_or(3600);
+    let (username, password, _expires) = manager.generate(&req.username);
+
+    let mut urls = Vec::new();
+    for config in &state.listen_configs {
+        let port = config.addr().port();
+        match config.protocol.as_str() {
+            "udp" => {
+                urls.push(format!("turn:{}:{}", state.external_ip, port));
+            }
+            "tcp" => {
+                urls.push(format!("turn:{}:{}?transport=tcp", state.external_ip, port));
+            }
+            "tls" | "dtls" => {
+                urls.push(format!("turns:{}:{}?transport=tcp", state.external_ip, port));
+            }
+            _ => {}
+        }
+    }
+    urls.sort();
+    urls.dedup();
+
+    Json(serde_json::json!([
+        {
+            "urls": urls,
+            "username": username,
+            "credential": password,
+        }
+    ]))
+}
+
 async fn turn_credentials_handler(
     State(state): State<AppState>,
     Json(req): Json<TurnCredentialsRequest>,
@@ -791,6 +850,7 @@ async fn health_handler(State(state): State<HealthState>) -> Json<serde_json::Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AuthManager;
 
     #[test]
     fn test_turn_rest_state_disabled() {
@@ -878,5 +938,100 @@ mod tests {
             admin_password: Some("secret".to_string()),
         };
         assert!(!check_auth(&jar, &admin_state));
+    }
+
+    #[tokio::test]
+    async fn test_ice_servers_handler_success() {
+        use axum::extract::{Query, State};
+
+        let manager = ShortTermCredentialManager::new("test-secret".to_string());
+        let state = AppState {
+            admin: AdminState {
+                admin_username: None,
+                admin_password: None,
+            },
+            health: HealthState {
+                stats_fn: Arc::new(|| ServerStatsSnapshot {
+                    total_allocations: 0,
+                    active_allocations: 0,
+                    total_bytes_relayed: 0,
+                    total_messages: 0,
+                }),
+            },
+            auth: Arc::new(AuthManager::new("test".to_string())),
+            turn_rest: TurnRestState {
+                enabled: true,
+                credential_manager: Some(manager),
+            },
+            metrics: None,
+            config_path: None,
+            external_ip: "192.168.1.1".to_string(),
+            listen_configs: vec![
+                ListenConfig {
+                    protocol: "udp".to_string(),
+                    address: "0.0.0.0:3478".to_string(),
+                },
+                ListenConfig {
+                    protocol: "tcp".to_string(),
+                    address: "0.0.0.0:3478".to_string(),
+                },
+            ],
+        };
+
+        let query = IceServersQuery {
+            username: "testuser".to_string(),
+            lifetime: Some(7200),
+        };
+        let response = ice_servers_handler(State(state), Query(query)).await;
+        let json = response.0;
+
+        let urls = json[0]["urls"].as_array().unwrap();
+        assert!(urls.iter().any(|u| u == "turn:192.168.1.1:3478"));
+        assert!(urls.iter().any(|u| u == "turn:192.168.1.1:3478?transport=tcp"));
+        assert!(
+            json[0]["username"]
+                .as_str()
+                .unwrap()
+                .contains("testuser")
+        );
+        assert!(json[0]["credential"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_ice_servers_handler_disabled() {
+        use axum::extract::{Query, State};
+
+        let state = AppState {
+            admin: AdminState {
+                admin_username: None,
+                admin_password: None,
+            },
+            health: HealthState {
+                stats_fn: Arc::new(|| ServerStatsSnapshot {
+                    total_allocations: 0,
+                    active_allocations: 0,
+                    total_bytes_relayed: 0,
+                    total_messages: 0,
+                }),
+            },
+            auth: Arc::new(AuthManager::new("test".to_string())),
+            turn_rest: TurnRestState {
+                enabled: false,
+                credential_manager: None,
+            },
+            metrics: None,
+            config_path: None,
+            external_ip: "192.168.1.1".to_string(),
+            listen_configs: vec![],
+        };
+
+        let query = IceServersQuery {
+            username: "testuser".to_string(),
+            lifetime: None,
+        };
+        let response = ice_servers_handler(State(state), Query(query)).await;
+        let json = response.0;
+
+        assert!(json.as_array().unwrap().is_empty());
     }
 }

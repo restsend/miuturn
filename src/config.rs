@@ -47,7 +47,7 @@ impl ServerConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ListenConfig {
     pub protocol: String,
     pub address: String,

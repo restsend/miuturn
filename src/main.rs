@@ -193,6 +193,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("miuturn.toml"));
 
+        let external_ip = config.server.external_ip.clone();
+        let listen_configs = config.server.listening.clone();
+
         tokio::spawn(async move {
             if let Err(e) = miuturn::create_admin_routes(
                 http_addr.to_string(),
@@ -205,6 +208,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 turn_rest_default_lifetime,
                 Some(metrics),
                 Some(config_path),
+                external_ip,
+                listen_configs,
             )
             .await
             {
