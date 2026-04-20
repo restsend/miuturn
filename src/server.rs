@@ -7,6 +7,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use hmac::{Hmac, KeyInit, Mac};
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -572,7 +573,14 @@ impl TurnServer {
         // Set main socket for Data Indication NAT traversal
         self.allocation_table.set_main_socket(socket.clone());
 
-        // Optimized worker pool with round-robin message distribution
+        // Optimized worker pool with stable per-client message distribution.
+        //
+        // TURN requests like CreatePermission and Send Indication are order-sensitive.
+        // If packets from the same client are handled by different workers, Send may run
+        // before CreatePermission is applied and get dropped spuriously.
+        //
+        // We therefore hash client_addr to pick a worker so packets from one client are
+        // processed by the same worker in receive order.
         let num_workers = num_cpus::get().max(4);
         info!("Starting {} UDP worker tasks", num_workers);
 
@@ -600,11 +608,10 @@ impl TurnServer {
             });
         }
 
-        // Main loop - receives datagrams and distributes round-robin to workers
+        // Main loop - receives datagrams and distributes by stable client hash
         let socket_clone = socket.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
-            let mut worker_idx: usize = 0;
 
             loop {
                 let (len, peer_addr) = match socket_clone.recv_from(&mut buf).await {
@@ -616,13 +623,16 @@ impl TurnServer {
                 };
 
                 let data = Bytes::copy_from_slice(&buf[..len]);
+                let worker_idx = {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    peer_addr.hash(&mut hasher);
+                    (hasher.finish() as usize) % num_workers
+                };
 
-                // Round-robin distribution: each message goes to exactly one worker
+                // Stable distribution by client address: preserves per-client ordering.
                 if senders[worker_idx].try_send((data, peer_addr)).is_err() {
                     error!("Worker {} queue full, dropping message", worker_idx);
                 }
-
-                worker_idx = (worker_idx + 1) % num_workers;
             }
         });
 
@@ -1179,21 +1189,20 @@ async fn handle_create_permission(
     };
 
     // Client must have an active allocation
-    if server
-        .allocation_table
-        .find_allocation_by_client(&client_addr)
-        .is_none()
-    {
-        debug!(
-            %client_addr,
-            "CreatePermission rejected because client has no active allocation"
-        );
-        return Some(create_error_response_bytes(
-            &msg,
-            ErrorCode::AllocationMismatch,
-            server,
-        ));
-    }
+    let relayed_addr = match server.allocation_table.find_allocation_by_client(&client_addr) {
+        Some(addr) => addr,
+        None => {
+            debug!(
+                %client_addr,
+                "CreatePermission rejected because client has no active allocation"
+            );
+            return Some(create_error_response_bytes(
+                &msg,
+                ErrorCode::AllocationMismatch,
+                server,
+            ));
+        }
+    };
 
     // Parse XOR-PEER-ADDRESS attributes and add permissions
     let mut peers = Vec::new();
@@ -1212,17 +1221,34 @@ async fn handle_create_permission(
     if peers.is_empty() {
         debug!(
             %client_addr,
+            %relayed_addr,
+            transaction_id = ?msg.header.transaction_id,
             "CreatePermission rejected because no valid XOR-PEER-ADDRESS was provided"
         );
         return Some(create_error_response_bytes(&msg, ErrorCode::BadRequest, server));
     }
 
-    server
-        .allocation_table
-        .add_permissions(&client_addr, &peers);
+    let added = server.allocation_table.add_permissions(&client_addr, &peers);
+    if !added {
+        debug!(
+            %client_addr,
+            %relayed_addr,
+            peers = ?peers,
+            transaction_id = ?msg.header.transaction_id,
+            "CreatePermission raced with allocation removal while updating permissions"
+        );
+        return Some(create_error_response_bytes(
+            &msg,
+            ErrorCode::AllocationMismatch,
+            server,
+        ));
+    }
 
     debug!(
         %client_addr,
+        %relayed_addr,
+        peers = ?peers,
+        transaction_id = ?msg.header.transaction_id,
         peer_count = peers.len(),
         "CreatePermission succeeded"
     );
@@ -1338,11 +1364,21 @@ async fn handle_send(msg: Message, server: &TurnServer, client_addr: SocketAddr)
             return None;
         }
     };
-    let peer_addr = crate::message::decode_xor_address(
+    let peer_addr = match crate::message::decode_xor_address(
         &peer_attr.value,
         0x2112A442,
         &msg.header.transaction_id,
-    )?;
+    ) {
+        Some(addr) => addr,
+        None => {
+            debug!(
+                %client_addr,
+                transaction_id = ?msg.header.transaction_id,
+                "Send indication dropped because PEER-ADDRESS could not be decoded"
+            );
+            return None;
+        }
+    };
 
     let data_attr = match msg.get_attribute(Attribute::DATA) {
         Some(attr) => attr,
@@ -1372,6 +1408,13 @@ async fn handle_send(msg: Message, server: &TurnServer, client_addr: SocketAddr)
         );
         return None;
     }
+    trace!(
+        %client_addr,
+        %peer_addr,
+        transaction_id = ?msg.header.transaction_id,
+        payload_len = data.len(),
+        "Send indication accepted and forwarded to relay"
+    );
     // Send indication doesn't generate a response
     None
 }

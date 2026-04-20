@@ -721,12 +721,29 @@ impl AllocationTable {
         for alloc in allocations.values() {
             let mut a = alloc.write();
             if a.client_addr == *client_addr {
+                let before = a.permissions.len();
                 for peer in peers {
                     a.permissions.insert(peer.ip());
                 }
+                let after = a.permissions.len();
+                debug!(
+                    %client_addr,
+                    relayed_addr = %a.relayed_addr,
+                    permission_before = before,
+                    permission_after = after,
+                    requested_peer_count = peers.len(),
+                    peers = ?peers,
+                    "updated TURN permissions for allocation"
+                );
                 return true;
             }
         }
+        debug!(
+            %client_addr,
+            requested_peer_count = peers.len(),
+            peers = ?peers,
+            "failed to update TURN permissions because allocation was not found"
+        );
         false
     }
 
@@ -749,37 +766,53 @@ impl AllocationTable {
         peer: SocketAddr,
         data: &[u8],
     ) -> Option<()> {
-        // Look up the relay socket under lock, then release before await
-        let socket: Option<Arc<UdpSocket>> = {
+        // Look up relay state under lock, then release before await.
+        let relay_state: Option<(Arc<UdpSocket>, SocketAddr, usize)> = {
             let allocations = self.allocations.read();
             let mut found = None;
             for alloc in allocations.values() {
                 let a = alloc.read();
                 if a.client_addr == *client_addr {
+                    let permission_count = a.permissions.len();
                     // Check permission
                     if !a.permissions.contains(&peer.ip()) {
                         debug!(
                             %client_addr,
                             %peer,
+                            relayed_addr = %a.relayed_addr,
+                            permission_count,
+                            permissions = ?a.permissions,
                             payload_len = data.len(),
                             "dropping relay packet because peer is not in permission list"
                         );
                         return None;
                     }
-                    // Clone the socket Arc so we can send after releasing the lock
+                    // Clone the socket Arc so we can send after releasing the lock.
                     if let Some(ref relay) = a.relay {
-                        found = Some(relay.socket.clone());
+                        found = Some((relay.socket.clone(), a.relayed_addr, permission_count));
+                    } else {
+                        debug!(
+                            %client_addr,
+                            %peer,
+                            relayed_addr = %a.relayed_addr,
+                            permission_count,
+                            payload_len = data.len(),
+                            "dropping relay packet because allocation has no active relay socket"
+                        );
+                        return None;
                     }
                     break;
                 }
             }
             found
         };
-        if let Some(socket) = socket {
+        if let Some((socket, relayed_addr, permission_count)) = relay_state {
             if let Err(err) = socket.send_to(data, &peer).await {
                 debug!(
                     %client_addr,
                     %peer,
+                    %relayed_addr,
+                    permission_count,
                     payload_len = data.len(),
                     error = %err,
                     "failed to send relay packet to peer"
@@ -790,13 +823,21 @@ impl AllocationTable {
                 .total_bytes_relayed
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
             self.stats.total_messages.fetch_add(1, Ordering::Relaxed);
+            trace!(
+                %client_addr,
+                %peer,
+                %relayed_addr,
+                permission_count,
+                payload_len = data.len(),
+                "relay packet forwarded to peer"
+            );
             return Some(());
         }
         debug!(
             %client_addr,
             %peer,
             payload_len = data.len(),
-            "dropping relay packet because no active relay socket was found"
+            "dropping relay packet because allocation was not found for client"
         );
         None
     }
