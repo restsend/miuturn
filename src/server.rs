@@ -885,7 +885,11 @@ fn verify_turn_auth(
     if let Some(ref am) = server.auth_manager {
         let client_ip = client_addr.ip().to_string();
         if !am.check_acl(&client_ip) {
-            return Err(create_error_response_bytes(msg, ErrorCode::Forbidden, server));
+            return Err(create_error_response_bytes(
+                msg,
+                ErrorCode::Forbidden,
+                server,
+            ));
         }
     }
 
@@ -1010,13 +1014,18 @@ async fn handle_allocate(
     // This prevents stale state (channel bindings, permissions) from leaking
     // into the new allocation when the same client rapidly recycles.
     let ch_table = server.channel_table.read().await.clone();
-    if let Some(old_relayed) = server.allocation_table.find_allocation_by_client(&client_addr) {
+    if let Some(old_relayed) = server
+        .allocation_table
+        .find_allocation_by_client(&client_addr)
+    {
         tracing::info!(
             %client_addr,
             old_relayed = %old_relayed,
             "removing existing allocation before creating new one"
         );
-        server.allocation_table.remove_allocation(&old_relayed, Some(&ch_table));
+        server
+            .allocation_table
+            .remove_allocation(&old_relayed, Some(&ch_table));
     }
     let allocation = match server
         .allocation_table
@@ -1047,7 +1056,9 @@ async fn handle_allocate(
                 "TURN Allocate request failed"
             );
 
-            return Some(create_error_response_bytes_with_reason(&msg, code, &reason, server));
+            return Some(create_error_response_bytes_with_reason(
+                &msg, code, &reason, server,
+            ));
         }
     };
 
@@ -1130,12 +1141,27 @@ async fn handle_refresh(
             // Refresh with lifetime=0 means explicit deletion (RFC 5766 §7).
             // Remove immediately instead of waiting for the cleanup task.
             let ch_table = server.channel_table.read().await.clone();
-            server.allocation_table.remove_allocation(&relayed, Some(&ch_table));
-            tracing::info!(
-                %client_addr,
-                relayed = %relayed,
-                "TURN Refresh lifetime=0: allocation removed"
-            );
+            if let Some(alloc_arc) = server
+                .allocation_table
+                .remove_allocation(&relayed, Some(&ch_table))
+            {
+                let a = alloc_arc.read();
+                let bytes = a.bytes_forwarded.load(std::sync::atomic::Ordering::Relaxed);
+                let messages = a
+                    .messages_forwarded
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let permission_count = a.permissions.len();
+                let lived_secs = a.created_at.elapsed().as_secs();
+                tracing::info!(
+                    %client_addr,
+                    relayed = %relayed,
+                    lived_secs,
+                    bytes_forwarded = bytes,
+                    messages_forwarded = messages,
+                    permission_count,
+                    "TURN Refresh lifetime=0: allocation removed"
+                );
+            }
         } else if server
             .allocation_table
             .refresh_allocation(&relayed, lifetime)
@@ -1189,7 +1215,10 @@ async fn handle_create_permission(
     };
 
     // Client must have an active allocation
-    let relayed_addr = match server.allocation_table.find_allocation_by_client(&client_addr) {
+    let relayed_addr = match server
+        .allocation_table
+        .find_allocation_by_client(&client_addr)
+    {
         Some(addr) => addr,
         None => {
             debug!(
@@ -1225,10 +1254,16 @@ async fn handle_create_permission(
             transaction_id = ?msg.header.transaction_id,
             "CreatePermission rejected because no valid XOR-PEER-ADDRESS was provided"
         );
-        return Some(create_error_response_bytes(&msg, ErrorCode::BadRequest, server));
+        return Some(create_error_response_bytes(
+            &msg,
+            ErrorCode::BadRequest,
+            server,
+        ));
     }
 
-    let added = server.allocation_table.add_permissions(&client_addr, &peers);
+    let added = server
+        .allocation_table
+        .add_permissions(&client_addr, &peers);
     if !added {
         debug!(
             %client_addr,
@@ -1308,7 +1343,8 @@ async fn handle_channel_bind(
                     let mut response = crate::message::create_success_response(&msg.header);
                     if !server.auth_disabled {
                         if let Some(password) = server.get_password_for_user(&username) {
-                            let key = compute_message_integrity_key(&username, &server.realm, &password);
+                            let key =
+                                compute_message_integrity_key(&username, &server.realm, &password);
                             add_response_message_integrity(&mut response, &key);
                         }
                     }
@@ -1408,13 +1444,6 @@ async fn handle_send(msg: Message, server: &TurnServer, client_addr: SocketAddr)
         );
         return None;
     }
-    trace!(
-        %client_addr,
-        %peer_addr,
-        transaction_id = ?msg.header.transaction_id,
-        payload_len = data.len(),
-        "Send indication accepted and forwarded to relay"
-    );
     // Send indication doesn't generate a response
     None
 }
@@ -1877,9 +1906,7 @@ mod tests {
             &nonce,
             password,
         );
-        let cp_response = process_message(cp_msg, &server, client_addr)
-            .await
-            .unwrap();
+        let cp_response = process_message(cp_msg, &server, client_addr).await.unwrap();
         let cp_parsed = Message::parse(&cp_response).unwrap();
         assert_eq!(cp_parsed.header.event_type, EventType::Success);
         assert!(
@@ -1949,9 +1976,7 @@ mod tests {
             &nonce,
             password,
         );
-        let cb_response = process_message(cb_msg, &server, client_addr)
-            .await
-            .unwrap();
+        let cb_response = process_message(cb_msg, &server, client_addr).await.unwrap();
         let cb_parsed = Message::parse(&cb_response).unwrap();
         assert_eq!(cb_parsed.header.event_type, EventType::Success);
         assert!(
@@ -2079,14 +2104,25 @@ mod tests {
 
         // Verify allocation exists
         assert!(
-            server.allocation_table.find_allocation_by_client(&client_addr).is_some(),
+            server
+                .allocation_table
+                .find_allocation_by_client(&client_addr)
+                .is_some(),
             "allocation should exist before refresh"
         );
 
         // Bind a channel to verify it gets cleaned up
-        let relayed = server.allocation_table.find_allocation_by_client(&client_addr).unwrap();
+        let relayed = server
+            .allocation_table
+            .find_allocation_by_client(&client_addr)
+            .unwrap();
         let peer: SocketAddr = "10.0.0.2:5000".parse().unwrap();
-        server.channel_table.write().await.bind(0x4000, peer, relayed).unwrap();
+        server
+            .channel_table
+            .write()
+            .await
+            .bind(0x4000, peer, relayed)
+            .unwrap();
         assert_eq!(server.channel_table.read().await.len(), 1);
 
         // Refresh with lifetime=0
@@ -2106,12 +2142,19 @@ mod tests {
 
         // Allocation should be immediately gone
         assert!(
-            server.allocation_table.find_allocation_by_client(&client_addr).is_none(),
+            server
+                .allocation_table
+                .find_allocation_by_client(&client_addr)
+                .is_none(),
             "allocation should be removed immediately after Refresh lifetime=0"
         );
         // Active count should be 0
         assert_eq!(
-            server.allocation_table.stats().active_allocations.load(std::sync::atomic::Ordering::Relaxed),
+            server
+                .allocation_table
+                .stats()
+                .active_allocations
+                .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "active_allocations should be 0 after Refresh lifetime=0"
         );

@@ -85,6 +85,10 @@ pub struct Allocation {
     pub relay: Option<AllocationRelay>,
     /// Permitted peer addresses (IP-only, port is ignored per RFC 5766)
     pub permissions: std::collections::HashSet<std::net::IpAddr>,
+    /// Bytes successfully relayed through this allocation
+    pub bytes_forwarded: Arc<AtomicU64>,
+    /// Messages successfully relayed through this allocation
+    pub messages_forwarded: Arc<AtomicU64>,
 }
 
 impl Allocation {
@@ -105,6 +109,8 @@ impl Allocation {
             five_tuple: (src, dst),
             relay: None,
             permissions: std::collections::HashSet::new(),
+            bytes_forwarded: Arc::new(AtomicU64::new(0)),
+            messages_forwarded: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -126,6 +132,8 @@ impl Allocation {
             five_tuple: (src, dst),
             relay: Some(relay),
             permissions: std::collections::HashSet::new(),
+            bytes_forwarded: Arc::new(AtomicU64::new(0)),
+            messages_forwarded: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -767,9 +775,21 @@ impl AllocationTable {
         data: &[u8],
     ) -> Option<()> {
         // Look up relay state under lock, then release before await.
-        let relay_state: Option<(Arc<UdpSocket>, SocketAddr, usize)> = {
+        let relay_state: Option<(
+            Arc<UdpSocket>,
+            SocketAddr,
+            usize,
+            Arc<AtomicU64>,
+            Arc<AtomicU64>,
+        )> = {
             let allocations = self.allocations.read();
-            let mut found = None;
+            let mut found: Option<(
+                Arc<UdpSocket>,
+                SocketAddr,
+                usize,
+                Arc<AtomicU64>,
+                Arc<AtomicU64>,
+            )> = None;
             for alloc in allocations.values() {
                 let a = alloc.read();
                 if a.client_addr == *client_addr {
@@ -789,7 +809,13 @@ impl AllocationTable {
                     }
                     // Clone the socket Arc so we can send after releasing the lock.
                     if let Some(ref relay) = a.relay {
-                        found = Some((relay.socket.clone(), a.relayed_addr, permission_count));
+                        found = Some((
+                            relay.socket.clone(),
+                            a.relayed_addr,
+                            permission_count,
+                            a.bytes_forwarded.clone(),
+                            a.messages_forwarded.clone(),
+                        ));
                     } else {
                         debug!(
                             %client_addr,
@@ -806,7 +832,8 @@ impl AllocationTable {
             }
             found
         };
-        if let Some((socket, relayed_addr, permission_count)) = relay_state {
+        if let Some((socket, relayed_addr, permission_count, bytes_fwd, messages_fwd)) = relay_state
+        {
             if let Err(err) = socket.send_to(data, &peer).await {
                 debug!(
                     %client_addr,
@@ -819,18 +846,13 @@ impl AllocationTable {
                 );
                 return None;
             }
+            let n = data.len() as u64;
             self.stats
                 .total_bytes_relayed
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
+                .fetch_add(n, Ordering::Relaxed);
             self.stats.total_messages.fetch_add(1, Ordering::Relaxed);
-            trace!(
-                %client_addr,
-                %peer,
-                %relayed_addr,
-                permission_count,
-                payload_len = data.len(),
-                "relay packet forwarded to peer"
-            );
+            bytes_fwd.fetch_add(n, Ordering::Relaxed);
+            messages_fwd.fetch_add(1, Ordering::Relaxed);
             return Some(());
         }
         debug!(
@@ -903,11 +925,18 @@ impl AllocationTable {
             if let Some(alloc) = allocations.remove(&addr) {
                 {
                     let a = alloc.read();
-                    debug!(
+                    let bytes = a.bytes_forwarded.load(Ordering::Relaxed);
+                    let messages = a.messages_forwarded.load(Ordering::Relaxed);
+                    let permission_count = a.permissions.len();
+                    let lived_secs = a.created_at.elapsed().as_secs();
+                    tracing::info!(
                         relayed_addr = %addr,
                         client_addr = %a.client_addr,
-                        remaining = a.remaining_lifetime(),
-                        "removing expired allocation"
+                        lived_secs,
+                        bytes_forwarded = bytes,
+                        messages_forwarded = messages,
+                        permission_count,
+                        "allocation expired and removed"
                     );
                 }
                 // Abort the allocation task
@@ -1447,7 +1476,11 @@ mod tests {
 
         let mut ports = allocated.lock().unwrap().clone();
         assert_eq!(ports.len(), 200, "should allocate all 200 ports");
-        assert_eq!(errors.load(Ordering::Relaxed), 0, "no allocation failures expected");
+        assert_eq!(
+            errors.load(Ordering::Relaxed),
+            0,
+            "no allocation failures expected"
+        );
 
         ports.sort();
         ports.dedup();
@@ -1486,7 +1519,10 @@ mod tests {
         );
         let client: SocketAddr = "192.168.1.1:12345".parse().unwrap();
         let channel_table = ChannelTable::new();
-        let alloc = table.create_allocation(client, Some(600), &channel_table).await.unwrap();
+        let alloc = table
+            .create_allocation(client, Some(600), &channel_table)
+            .await
+            .unwrap();
         assert!(!alloc.read().is_expired());
     }
 
@@ -1504,7 +1540,10 @@ mod tests {
         );
         let client: SocketAddr = "192.168.1.1:12345".parse().unwrap();
         let channel_table = ChannelTable::new();
-        let alloc = table.create_allocation(client, Some(0), &channel_table).await.unwrap();
+        let alloc = table
+            .create_allocation(client, Some(0), &channel_table)
+            .await
+            .unwrap();
         std::thread::sleep(Duration::from_millis(10));
         assert!(alloc.read().is_expired());
     }
@@ -1586,10 +1625,18 @@ mod tests {
         let client2: SocketAddr = "192.168.1.2:12345".parse().unwrap();
         let client3: SocketAddr = "192.168.1.3:12345".parse().unwrap();
 
-        let _ = table.create_allocation(client1, Some(600), &channel_table).await.unwrap();
-        let _ = table.create_allocation(client2, Some(600), &channel_table).await.unwrap();
+        let _ = table
+            .create_allocation(client1, Some(600), &channel_table)
+            .await
+            .unwrap();
+        let _ = table
+            .create_allocation(client2, Some(600), &channel_table)
+            .await
+            .unwrap();
 
-        let result = table.create_allocation(client3, Some(600), &channel_table).await;
+        let result = table
+            .create_allocation(client3, Some(600), &channel_table)
+            .await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::AllocationQuotaReached));
     }
@@ -1610,7 +1657,10 @@ mod tests {
         let client: SocketAddr = "192.168.1.10:12345".parse().unwrap();
 
         let channel_table = ChannelTable::new();
-        let allocation = table.create_allocation(client, Some(600), &channel_table).await.unwrap();
+        let allocation = table
+            .create_allocation(client, Some(600), &channel_table)
+            .await
+            .unwrap();
         let relayed_addr = allocation.read().relayed_addr;
 
         assert_eq!(
@@ -1634,7 +1684,10 @@ mod tests {
         let channel_table = ChannelTable::new();
         let client1: SocketAddr = "192.168.1.1:12345".parse().unwrap();
 
-        let alloc1 = table.create_allocation(client1, Some(600), &channel_table).await.unwrap();
+        let alloc1 = table
+            .create_allocation(client1, Some(600), &channel_table)
+            .await
+            .unwrap();
         let port1 = alloc1.read().relayed_addr.port();
 
         // Verify port is allocated
@@ -1674,7 +1727,10 @@ mod tests {
         let peer: SocketAddr = "10.0.0.2:5000".parse().unwrap();
 
         // Create allocation and bind a channel
-        let alloc1 = table.create_allocation(client, Some(600), &channel_table).await.unwrap();
+        let alloc1 = table
+            .create_allocation(client, Some(600), &channel_table)
+            .await
+            .unwrap();
         let relayed_addr = alloc1.read().relayed_addr;
         channel_table.bind(0x4000, peer, relayed_addr).unwrap();
 
@@ -1712,7 +1768,10 @@ mod tests {
         let new_peer: SocketAddr = "10.0.0.3:6000".parse().unwrap();
 
         // --- First allocation ---
-        let alloc1 = table.create_allocation(client, Some(600), &channel_table).await.unwrap();
+        let alloc1 = table
+            .create_allocation(client, Some(600), &channel_table)
+            .await
+            .unwrap();
         let relayed1 = alloc1.read().relayed_addr;
         // Bind channel 0x4005 to old_peer (simulates the stale binding from the logs)
         channel_table.bind(0x4005, old_peer, relayed1).unwrap();
@@ -1725,7 +1784,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // --- Second allocation (likely same port) ---
-        let alloc2 = table.create_allocation(client, Some(600), &channel_table).await.unwrap();
+        let alloc2 = table
+            .create_allocation(client, Some(600), &channel_table)
+            .await
+            .unwrap();
         let relayed2 = alloc2.read().relayed_addr;
 
         // Binding channel 0x4005 to new_peer must succeed — no stale binding conflict
@@ -1761,8 +1823,14 @@ mod tests {
         let peer: SocketAddr = "10.0.0.2:5000".parse().unwrap();
 
         // Create two allocations: one expired, one active
-        let alloc_expired = table.create_allocation(client1, Some(0), &channel_table).await.unwrap();
-        let alloc_active = table.create_allocation(client2, Some(600), &channel_table).await.unwrap();
+        let alloc_expired = table
+            .create_allocation(client1, Some(0), &channel_table)
+            .await
+            .unwrap();
+        let alloc_active = table
+            .create_allocation(client2, Some(600), &channel_table)
+            .await
+            .unwrap();
         let relayed_expired = alloc_expired.read().relayed_addr;
         let relayed_active = alloc_active.read().relayed_addr;
 
@@ -1779,9 +1847,17 @@ mod tests {
         assert_eq!(removed, 1);
 
         // Expired allocation's channel binding should be gone
-        assert!(channel_table.get_by_channel(relayed_expired, 0x4000).is_none());
+        assert!(
+            channel_table
+                .get_by_channel(relayed_expired, 0x4000)
+                .is_none()
+        );
         // Active allocation's channel binding should remain
-        assert!(channel_table.get_by_channel(relayed_active, 0x4001).is_some());
+        assert!(
+            channel_table
+                .get_by_channel(relayed_active, 0x4001)
+                .is_some()
+        );
         assert_eq!(channel_table.len(), 1);
     }
 
@@ -1803,7 +1879,10 @@ mod tests {
         let client: SocketAddr = "192.168.1.1:12345".parse().unwrap();
 
         // First allocation
-        let alloc1 = table.create_allocation(client, Some(600), &channel_table).await.unwrap();
+        let alloc1 = table
+            .create_allocation(client, Some(600), &channel_table)
+            .await
+            .unwrap();
         let _relayed1 = alloc1.read().relayed_addr;
 
         // Simulate what handle_allocate does: remove old allocation before creating new one
@@ -1816,7 +1895,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Second allocation (same client)
-        let alloc2 = table.create_allocation(client, Some(600), &channel_table).await.unwrap();
+        let alloc2 = table
+            .create_allocation(client, Some(600), &channel_table)
+            .await
+            .unwrap();
         let relayed2 = alloc2.read().relayed_addr;
 
         // There should be exactly one allocation for this client
