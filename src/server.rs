@@ -684,7 +684,7 @@ async fn handle_udp_message(
 
         if let Some(channel) = channel_binding {
             // Get the relay socket from the allocation (must release lock before await)
-            let relay_socket = allocation.and_then(|alloc| {
+            let relay_socket = allocation.as_ref().and_then(|alloc| {
                 let a = alloc.read();
                 a.relay.as_ref().map(|r| r.socket.clone())
             });

@@ -610,6 +610,7 @@ impl AllocationTable {
             relay_socket.clone(),
             main_socket, // Use main socket for sending Data Indication
             client_addr,
+            relay_bind_addr,
             relayed_addr,
             self.stats.clone(),
             channel_table.clone(),
@@ -1005,12 +1006,28 @@ fn build_data_indication(peer_addr: SocketAddr, payload: &[u8]) -> Bytes {
     msg.encode()
 }
 
+fn normalize_peer_addr_for_client(
+    peer_addr: SocketAddr,
+    relay_bind_addr: SocketAddr,
+    relayed_addr: SocketAddr,
+) -> SocketAddr {
+    // Only rewrite addresses that originate from this server's relay bind
+    // interface. External peer traffic must keep the original source address
+    // so CreatePermission / ChannelBind matching remains correct.
+    if peer_addr.ip() == relay_bind_addr.ip() && relay_bind_addr.ip() != relayed_addr.ip() {
+        SocketAddr::new(relayed_addr.ip(), peer_addr.port())
+    } else {
+        peer_addr
+    }
+}
+
 /// Spawn a dedicated task for an allocation to handle relay traffic
 /// This eliminates lock contention by giving each allocation its own processing loop
 async fn spawn_allocation_task(
     socket: Arc<UdpSocket>,
     main_socket: Arc<UdpSocket>, // Main socket for sending Data Indication / ChannelData to client
     client_addr: SocketAddr,
+    relay_bind_addr: SocketAddr,
     relayed_addr: SocketAddr,
     stats: Arc<ServerStats>,
     channel_table: ChannelTable,
@@ -1033,15 +1050,13 @@ async fn spawn_allocation_task(
                             stats.total_bytes_relayed.fetch_add(len as u64, Ordering::Relaxed);
                             stats.total_messages.fetch_add(1, Ordering::Relaxed);
 
-                            // Fix peer address: when data comes from another relay socket on the
-                            // same server, the source address is the bind address (e.g. 127.0.0.1:port),
-                            // but the browser knows the peer by its external relay address.
-                            // Map bind_addr:port → external_addr:port so the PEER-ADDRESS is correct.
-                            let effective_peer = if peer_addr.ip() != relayed_addr.ip() {
-                                SocketAddr::new(relayed_addr.ip(), peer_addr.port())
-                            } else {
-                                peer_addr
-                            };
+                            // Only rewrite local relay-bind source addresses to external relay IP.
+                            // Real peer traffic from external hosts must keep original source IP.
+                            let effective_peer = normalize_peer_addr_for_client(
+                                peer_addr,
+                                relay_bind_addr,
+                                relayed_addr,
+                            );
 
                             // RFC 5766 §10.4: if a channel binding exists for this peer on this
                             // allocation, send ChannelData; otherwise send Data Indication.
@@ -1105,13 +1120,6 @@ async fn spawn_allocation_task(
                                     payload_len = data.len(),
                                     error = %e,
                                     "allocation task failed to forward client data to peer"
-                                );
-                            } else {
-                                debug!(
-                                    %client_addr,
-                                    %peer_addr,
-                                    payload_len = data.len(),
-                                    "allocation task forwarded client data to peer"
                                 );
                             }
                         }
@@ -1938,5 +1946,22 @@ mod tests {
         // relayed_a's bindings are gone
         assert!(table.get_by_channel(relayed_a, 0x4000).is_none());
         assert!(table.get_by_channel(relayed_a, 0x4001).is_none());
+    }
+
+    #[test]
+    fn test_normalize_peer_addr_for_client_rewrites_only_bind_ip() {
+        let relay_bind_addr: SocketAddr = "127.0.0.1:49152".parse().unwrap();
+        let relayed_addr: SocketAddr = "146.56.243.54:49152".parse().unwrap();
+        let local_peer: SocketAddr = "127.0.0.1:63746".parse().unwrap();
+        let external_peer: SocketAddr = "129.211.168.132:63746".parse().unwrap();
+
+        assert_eq!(
+            normalize_peer_addr_for_client(local_peer, relay_bind_addr, relayed_addr),
+            "146.56.243.54:63746".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            normalize_peer_addr_for_client(external_peer, relay_bind_addr, relayed_addr),
+            external_peer
+        );
     }
 }
