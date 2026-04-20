@@ -674,7 +674,7 @@ async fn handle_udp_message(
 
         if let Some(channel) = channel_binding {
             // Get the relay socket from the allocation (must release lock before await)
-            let relay_socket = allocation.and_then(|alloc| {
+            let relay_socket = allocation.as_ref().and_then(|alloc| {
                 let a = alloc.read();
                 a.relay.as_ref().map(|r| r.socket.clone())
             });
@@ -1179,11 +1179,10 @@ async fn handle_create_permission(
     };
 
     // Client must have an active allocation
-    if server
+    let relayed_addr = server
         .allocation_table
-        .find_allocation_by_client(&client_addr)
-        .is_none()
-    {
+        .find_allocation_by_client(&client_addr);
+    if relayed_addr.is_none() {
         debug!(
             %client_addr,
             "CreatePermission rejected because client has no active allocation"
