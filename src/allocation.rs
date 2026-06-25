@@ -692,6 +692,7 @@ impl AllocationTable {
         if let Some(allocation) = allocations.get(relayed_addr) {
             let mut alloc = allocation.write();
             alloc.lifetime = Duration::from_secs(lifetime as u64);
+            alloc.created_at = Instant::now();
             Ok(())
         } else {
             Err(Error::NotFound)
@@ -1946,6 +1947,47 @@ mod tests {
         // relayed_a's bindings are gone
         assert!(table.get_by_channel(relayed_a, 0x4000).is_none());
         assert!(table.get_by_channel(relayed_a, 0x4001).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_refresh_allocation_resets_created_at() {
+        let (min_port, max_port) = alloc_test_port_range();
+        let table = AllocationTable::with_port_range(
+            Ipv4Addr::new(127, 0, 0, 1),
+            "test".to_string(),
+            min_port,
+            max_port,
+            None,
+            None,
+            None,
+        );
+        let channel_table = ChannelTable::new();
+        let client: SocketAddr = "192.168.1.1:12345".parse().unwrap();
+
+        // Create allocation with short lifetime (2 seconds)
+        let alloc = table
+            .create_allocation(client, Some(2), &channel_table)
+            .await
+            .unwrap();
+        let relayed = alloc.read().relayed_addr;
+
+        // Wait 1 second (allocation should still be alive)
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!alloc.read().is_expired(), "allocation should be alive 1s into a 2s lifetime");
+
+        // Refresh with lifetime=2 (extend another 2 seconds from now)
+        table.refresh_allocation(&relayed, 2).unwrap();
+
+        // Wait 1.5 seconds more (total ~2.5s since creation)
+        // With the BUG: refresh_allocation does not reset created_at, so
+        // elapsed=2.5s > lifetime=2s → allocation is expired
+        // With the FIX: created_at was reset at refresh, so elapsed≈1.5s < 2s → alive
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        assert!(
+            !alloc.read().is_expired(),
+            "allocation expired early because refresh_allocation did not reset created_at"
+        );
     }
 
     #[test]

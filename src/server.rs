@@ -540,9 +540,6 @@ impl TurnServer {
                             {
                                 break;
                             }
-                            if buf.is_empty() {
-                                break;
-                            }
                         }
                         Err(e) => {
                             error!("Read error: {}", e);
@@ -645,6 +642,40 @@ async fn handle_tcp_message(
     server: &TurnServer,
     peer_addr: SocketAddr,
 ) -> Option<Bytes> {
+    // Handle ChannelData (RFC 5766 §11.4)
+    if data.len() >= 4 {
+        let channel_num = (data[0] as u16) << 8 | (data[1] as u16);
+        if (0x4000..=0x7FFF).contains(&channel_num) {
+            let data_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+            let payload_end = 4 + data_len.min(data.len().saturating_sub(4));
+            let payload = data.slice(4..payload_end);
+
+            let allocation = server.allocation_table.get_allocation_by_client(&peer_addr);
+            let relayed_addr = allocation.as_ref().map(|alloc| alloc.read().relayed_addr);
+            let channel_binding = if let Some(relayed_addr) = relayed_addr {
+                server
+                    .channel_table
+                    .read()
+                    .await
+                    .get_by_channel(relayed_addr, channel_num)
+            } else {
+                None
+            };
+
+            if let Some(channel) = channel_binding {
+                let relay_socket = allocation.as_ref().and_then(|alloc| {
+                    let a = alloc.read();
+                    a.relay.as_ref().map(|r| r.socket.clone())
+                });
+
+                if let Some(relay_sock) = relay_socket {
+                    let _ = relay_sock.send_to(&payload, &channel.peer_addr).await;
+                }
+            }
+            return None;
+        }
+    }
+
     if let Some(msg) = Message::parse(&data[..]) {
         let response = process_message(msg, server, peer_addr).await;
         if let Some(r) = response {
