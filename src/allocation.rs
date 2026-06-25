@@ -2,6 +2,7 @@ use crate::errors::Error;
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -1022,6 +1023,16 @@ fn normalize_peer_addr_for_client(
     }
 }
 
+/// Determine if a UDP recv_from error kind is fatal (should permanently exit
+/// the relay task) or transient (should be tolerated with a retry).
+///
+/// On Linux, a UDP recv_from can fail with `ECONNREFUSED` when the kernel
+/// delivers an ICMP port-unreachable from a previous `send_to` target. Such
+/// errors are transient and must not kill the relay loop.
+fn is_fatal_recv_error(kind: io::ErrorKind) -> bool {
+    matches!(kind, io::ErrorKind::PermissionDenied)
+}
+
 /// Spawn a dedicated task for an allocation to handle relay traffic
 /// This eliminates lock contention by giving each allocation its own processing loop
 async fn spawn_allocation_task(
@@ -1040,6 +1051,8 @@ async fn spawn_allocation_task(
 
     let task_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
+        let mut consecutive_recv_errors: u32 = 0;
+        const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 100;
 
         loop {
             tokio::select! {
@@ -1047,6 +1060,9 @@ async fn spawn_allocation_task(
                 result = socket_clone.recv_from(&mut buf) => {
                     match result {
                         Ok((len, peer_addr)) => {
+                            // Reset error counter on success
+                            consecutive_recv_errors = 0;
+
                             // Update stats using atomics - no lock contention
                             stats.total_bytes_relayed.fetch_add(len as u64, Ordering::Relaxed);
                             stats.total_messages.fetch_add(1, Ordering::Relaxed);
@@ -1074,7 +1090,7 @@ async fn spawn_allocation_task(
                                 channel_data[4..].copy_from_slice(&buf[..len]);
 
                                 if let Err(e) = main_socket_clone.send_to(&channel_data, &client_addr).await {
-                                    debug!(
+                                    warn!(
                                         %client_addr,
                                         peer = %effective_peer,
                                         channel = ch_num,
@@ -1087,7 +1103,7 @@ async fn spawn_allocation_task(
                                 // Send as Data Indication
                                 let indication = build_data_indication(effective_peer, &buf[..len]);
                                 if let Err(e) = main_socket_clone.send_to(&indication, &client_addr).await {
-                                    debug!(
+                                    warn!(
                                         %client_addr,
                                         peer = %effective_peer,
                                         payload_len = len,
@@ -1098,13 +1114,38 @@ async fn spawn_allocation_task(
                             }
                         }
                         Err(e) => {
-                            // Socket error, likely allocation closed
-                            debug!(
+                            consecutive_recv_errors += 1;
+
+                            if is_fatal_recv_error(e.kind()) {
+                                warn!(
+                                    %client_addr,
+                                    consecutive_errors = consecutive_recv_errors,
+                                    error = %e,
+                                    "relay socket fatal recv error, exiting relay loop"
+                                );
+                                break;
+                            }
+
+                            if consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                                warn!(
+                                    %client_addr,
+                                    consecutive_errors = consecutive_recv_errors,
+                                    max_consecutive = MAX_CONSECUTIVE_RECV_ERRORS,
+                                    error = %e,
+                                    "relay socket too many consecutive recv errors, exiting relay loop"
+                                );
+                                break;
+                            }
+
+                            warn!(
                                 %client_addr,
+                                consecutive_errors = consecutive_recv_errors,
                                 error = %e,
-                                "relay socket recv loop exiting"
+                                "relay socket transient recv error, continuing"
                             );
-                            break;
+
+                            // Brief sleep to avoid tight loop on persistent errors
+                            tokio::time::sleep(Duration::from_millis(10)).await;
                         }
                     }
                 }
@@ -1115,7 +1156,7 @@ async fn spawn_allocation_task(
                         AllocationMessage::ClientData { data, peer_addr } => {
                             // Forward client data to peer
                             if let Err(e) = socket_clone.send_to(&data, &peer_addr).await {
-                                debug!(
+                                warn!(
                                     %client_addr,
                                     %peer_addr,
                                     payload_len = data.len(),
@@ -1127,17 +1168,11 @@ async fn spawn_allocation_task(
                         AllocationMessage::ChannelData { data, channel_num: _ } => {
                             // Forward channel data via main socket (not relay socket)
                             if let Err(e) = main_socket_clone.send_to(&data, &client_addr).await {
-                                debug!(
+                                warn!(
                                     %client_addr,
                                     payload_len = data.len(),
                                     error = %e,
                                     "allocation task failed to forward channel data to client"
-                                );
-                            } else {
-                                debug!(
-                                    %client_addr,
-                                    payload_len = data.len(),
-                                    "allocation task forwarded channel data to client"
                                 );
                             }
                         }
@@ -2004,6 +2039,98 @@ mod tests {
         assert_eq!(
             normalize_peer_addr_for_client(external_peer, relay_bind_addr, relayed_addr),
             external_peer
+        );
+    }
+
+    /// Verify that `is_fatal_recv_error` correctly classifies error kinds.
+    /// Transient errors like ECONNREFUSED (ICMP port-unreachable) must not be
+    /// treated as fatal, otherwise the relay task dies and causes one-way audio
+    /// drops in long-running WebRTC calls.
+    #[test]
+    fn test_is_fatal_recv_error_classification() {
+        // Transient errors — must NOT kill the relay task
+        assert!(!is_fatal_recv_error(io::ErrorKind::ConnectionRefused));
+        assert!(!is_fatal_recv_error(io::ErrorKind::ConnectionReset));
+        assert!(!is_fatal_recv_error(io::ErrorKind::WouldBlock));
+        assert!(!is_fatal_recv_error(io::ErrorKind::TimedOut));
+        assert!(!is_fatal_recv_error(io::ErrorKind::Interrupted));
+        assert!(!is_fatal_recv_error(io::ErrorKind::OutOfMemory));
+        assert!(!is_fatal_recv_error(io::ErrorKind::UnexpectedEof));
+        assert!(!is_fatal_recv_error(io::ErrorKind::AddrInUse));
+        assert!(!is_fatal_recv_error(io::ErrorKind::AddrNotAvailable));
+
+        // Fatal errors — SHOULD kill the relay task
+        assert!(is_fatal_recv_error(io::ErrorKind::PermissionDenied));
+    }
+
+    /// End-to-end test: verify the relay task survives ICMP port-unreachable
+    /// errors triggered by sending to a recently-closed port.
+    #[tokio::test]
+    async fn test_relay_task_survives_icmp_error() {
+        let (min_port, max_port) = alloc_test_port_range();
+        let table = AllocationTable::with_port_range(
+            Ipv4Addr::new(127, 0, 0, 1),
+            "test".to_string(),
+            min_port,
+            max_port,
+            None,
+            None,
+            None,
+        );
+        let channel_table = ChannelTable::new();
+        let client: SocketAddr = "127.0.0.1:23456".parse().unwrap();
+
+        let alloc = table
+            .create_allocation(client, Some(600), &channel_table)
+            .await
+            .unwrap();
+        let relayed_addr = alloc.read().relayed_addr;
+        let relay_socket = alloc.read().relay.as_ref().unwrap().socket.clone();
+
+        // Step 1: Send data from a peer → relay task should process it
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        peer.send_to(b"hello", &relayed_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let stats_before = table
+            .stats()
+            .total_bytes_relayed
+            .load(Ordering::Relaxed);
+        assert!(
+            stats_before >= 5,
+            "relay task should process peer data, got {} bytes",
+            stats_before
+        );
+
+        // Step 2: Trigger ICMP port-unreachable
+        // Bind a temp socket, note its port, close it, then send to that port
+        // from the relay socket to generate ICMP error.
+        {
+            let temp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let temp_addr = temp.local_addr().unwrap();
+            drop(temp);
+            // Send multiple times to ensure ICMP error is delivered
+            for _ in 0..10 {
+                let _ = relay_socket.send_to(b"trigger-icmp", &temp_addr).await;
+            }
+        }
+        // Wait for ICMP to propagate to the relay socket's error queue
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Step 3: Send more data → relay task should still process it
+        peer.send_to(b"world", &relayed_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let stats_after = table
+            .stats()
+            .total_bytes_relayed
+            .load(Ordering::Relaxed);
+
+        assert!(
+            stats_after > stats_before,
+            "relay task should survive ICMP error: before={}, after={}",
+            stats_before,
+            stats_after
         );
     }
 }

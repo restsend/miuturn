@@ -1,6 +1,6 @@
 [package]
 name = "miuturn"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "A high-performance TURN server implemented in Rust, designed for WebRTC applications."
 authors = ["jinti<shenjindi@fourz.cn>"]

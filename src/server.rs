@@ -1015,9 +1015,16 @@ fn verify_turn_auth(
         ));
     }
 
-    // Do NOT remove the nonce after successful auth.
-    // The turn crate client reuses the same nonce for CreatePermission, ChannelBind, etc.
-    // Nonce will expire naturally after 600 seconds via the cleanup task.
+    // Refresh the nonce's created_at so it stays valid as long as the client
+    // keeps authenticating with it (e.g. periodic Refresh requests during a call).
+    // Without this, the nonce expires independently after 600 seconds and causes
+    // "invalid nonce" errors on Refresh, leading to allocation expiry and silent
+    // audio drops in long-running WebRTC calls.
+    if let Some(mut map_lock) = server.nonce_map.try_write()
+        && let Some(entry) = map_lock.get_mut(&nonce)
+    {
+        entry.created_at = std::time::Instant::now();
+    }
 
     Ok(username)
 }
@@ -2194,6 +2201,195 @@ mod tests {
             server.channel_table.read().await.len(),
             0,
             "channel bindings should be cleaned up after Refresh lifetime=0"
+        );
+    }
+
+    /// Verify that successful auth refreshes the nonce's created_at so it doesn't
+    /// expire during long-running calls. This is the fix for the "no audio after
+    /// several minutes" bug where nonce expiry caused Refresh to fail → allocation
+    /// expired → relay stopped.
+    #[tokio::test]
+    async fn test_nonce_refreshed_on_successful_auth() {
+        let realm = "test-realm".to_string();
+        let username = "admin";
+        let password = "password";
+        let server = TurnServer::with_password(
+            Ipv4Addr::new(127, 0, 0, 1),
+            realm.clone(),
+            password.to_string(),
+        );
+        let client_addr: SocketAddr = "127.0.0.1:50020".parse().unwrap();
+
+        // Step 1: Get an initial nonce via unauthenticated Allocate
+        let unauth_msg = build_allocate_request([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        let nonce_response = process_message(unauth_msg, &server, client_addr)
+            .await
+            .unwrap();
+        let nonce_msg = Message::parse(&nonce_response).unwrap();
+        let nonce1 = String::from_utf8(
+            nonce_msg
+                .get_attribute(Attribute::NONCE)
+                .unwrap()
+                .value
+                .to_vec(),
+        )
+        .unwrap();
+
+        // Step 2: Allocate with nonce1
+        for attempt in 0..5 {
+            let mut tid = [0u8; 12];
+            tid[11] = attempt;
+            let auth_msg =
+                build_authenticated_allocate_request(tid, username, &realm, &nonce1, password);
+            let response = process_message(auth_msg, &server, client_addr)
+                .await
+                .unwrap();
+            let parsed = Message::parse(&response).unwrap();
+            if parsed.header.event_type == EventType::Success {
+                break;
+            }
+            if attempt == 4 {
+                panic!("allocation should succeed");
+            }
+        }
+
+        assert!(
+            server
+                .allocation_table
+                .find_allocation_by_client(&client_addr)
+                .is_some(),
+            "allocation should be created"
+        );
+
+        // Step 3: After successful Allocate, nonce1's created_at should be recent
+        // (the fix refreshes it on every successful auth)
+        {
+            let nonce1_age = server.nonce_map.read().get(&nonce1).unwrap().created_at.elapsed();
+            assert!(
+                nonce1_age.as_secs() < 5,
+                "nonce1 created_at should be refreshed to recent after successful Allocate, age={}s",
+                nonce1_age.as_secs()
+            );
+        }
+
+        // Step 4: Simulate nonce expiry — manually age nonce1 to 601 seconds old
+        {
+            let mut map = server.nonce_map.write();
+            let entry = map.get_mut(&nonce1).unwrap();
+            entry.created_at = std::time::Instant::now() - std::time::Duration::from_secs(601);
+        }
+
+        // Step 5: Refresh with expired nonce1 → must fail with 401 "Nonce expired"
+        let refresh_msg1 = build_authenticated_refresh_request(
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            600,
+            username,
+            &realm,
+            &nonce1,
+            password,
+        );
+        let refresh_response1 = process_message(refresh_msg1, &server, client_addr)
+            .await
+            .unwrap();
+        let refresh_parsed1 = Message::parse(&refresh_response1).unwrap();
+        assert_eq!(
+            refresh_parsed1.header.event_type,
+            EventType::Error,
+            "expired nonce should be rejected"
+        );
+
+        // Extract new nonce from 401
+        let nonce2 = String::from_utf8(
+            refresh_parsed1
+                .get_attribute(Attribute::NONCE)
+                .unwrap()
+                .value
+                .to_vec(),
+        )
+        .unwrap();
+        assert_ne!(
+            nonce1, nonce2,
+            "server should issue a new nonce when old one expires"
+        );
+
+        // Step 6: Refresh with new nonce2 → must succeed
+        let refresh_msg2 = build_authenticated_refresh_request(
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            600,
+            username,
+            &realm,
+            &nonce2,
+            password,
+        );
+        let refresh_response2 = process_message(refresh_msg2, &server, client_addr)
+            .await
+            .unwrap();
+        let refresh_parsed2 = Message::parse(&refresh_response2).unwrap();
+        assert_eq!(
+            refresh_parsed2.header.event_type,
+            EventType::Success,
+            "Refresh with new nonce after expiry should succeed"
+        );
+
+        // Step 7: Verify nonce2's created_at was refreshed by the fix
+        {
+            let nonce2_age = server.nonce_map.read().get(&nonce2).unwrap().created_at.elapsed();
+            assert!(
+                nonce2_age.as_secs() < 5,
+                "nonce2 created_at should be refreshed after successful Refresh, age={}s",
+                nonce2_age.as_secs()
+            );
+        }
+
+        // Step 8: Manually age nonce2 to 590s (near expiry but still valid)
+        {
+            let mut map = server.nonce_map.write();
+            let entry = map.get_mut(&nonce2).unwrap();
+            entry.created_at = std::time::Instant::now() - std::time::Duration::from_secs(590);
+        }
+
+        // Step 9: Refresh with near-expiry nonce2 — should succeed and reset created_at
+        let refresh_msg3 = build_authenticated_refresh_request(
+            [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+            600,
+            username,
+            &realm,
+            &nonce2,
+            password,
+        );
+        let refresh_response3 = process_message(refresh_msg3, &server, client_addr)
+            .await
+            .unwrap();
+        let refresh_parsed3 = Message::parse(&refresh_response3).unwrap();
+        assert_eq!(
+            refresh_parsed3.header.event_type,
+            EventType::Success,
+            "Refresh with near-expiry nonce should still succeed"
+        );
+
+        // Step 10: Verify nonce2's created_at is recent again
+        {
+            let nonce2_age_after = server
+                .nonce_map
+                .read()
+                .get(&nonce2)
+                .unwrap()
+                .created_at
+                .elapsed();
+            assert!(
+                nonce2_age_after.as_secs() < 5,
+                "nonce2 created_at should be reset to recent after successful Refresh, age={}s",
+                nonce2_age_after.as_secs()
+            );
+        }
+
+        // Allocation should still be alive after all this
+        assert!(
+            server
+                .allocation_table
+                .find_allocation_by_client(&client_addr)
+                .is_some(),
+            "allocation should persist after successful Refresh"
         );
     }
 }
