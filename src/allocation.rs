@@ -41,14 +41,14 @@ use tracing::{debug, trace, warn};
 /// Message types for allocation task communication
 #[derive(Debug)]
 pub enum AllocationMessage {
-    /// Data from peer to be relayed to client
-    PeerData { data: Bytes, peer_addr: SocketAddr },
     /// Data from client to be relayed to peer (Send Indication)
     ClientData { data: Bytes, peer_addr: SocketAddr },
     /// Channel data from client
     ChannelData { data: Bytes, channel_num: u16 },
-    /// Refresh the allocation lifetime
-    Refresh { lifetime: u32 },
+    /// Update the client address (for NAT rebind detection)
+    UpdateClientAddr { client_addr: SocketAddr },
+    /// Set a channel to forward peer→client data (TCP fallback)
+    SetClientTx { tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>> },
     /// Shut down the allocation task
     Shutdown,
 }
@@ -334,7 +334,7 @@ impl PortAllocator {
 }
 
 pub struct AllocationTable {
-    allocations: RwLock<HashMap<SocketAddr, Arc<RwLock<Allocation>>>>,
+    pub(crate) allocations: RwLock<HashMap<SocketAddr, Arc<RwLock<Allocation>>>>,
     port_allocator: PortAllocator,
     bind_addr: Ipv4Addr,
     external_addr: Ipv4Addr,
@@ -664,6 +664,12 @@ impl AllocationTable {
         let mut allocations = self.allocations.write();
         let result = allocations.remove(relayed_addr);
         if let Some(ref alloc) = result {
+            // Clean up channel bindings FIRST, before releasing the port,
+            // to prevent a re-allocate on the same port from inheriting
+            // stale bindings or having its fresh bindings incorrectly removed.
+            if let Some(ch_table) = channel_table {
+                ch_table.remove_for_relayed(relayed_addr);
+            }
             // Abort the allocation task to release the socket
             if let Some(ref relay) = alloc.read().relay {
                 relay.task_handle.abort();
@@ -676,10 +682,6 @@ impl AllocationTable {
             // Unregister from bandwidth manager to prevent memory leak
             self.bandwidth_manager
                 .unregister_allocation(&relayed_addr.to_string());
-            // Clean up channel bindings for this relayed address
-            if let Some(ch_table) = channel_table {
-                ch_table.remove_for_relayed(relayed_addr);
-            }
         }
         result
     }
@@ -838,7 +840,7 @@ impl AllocationTable {
         if let Some((socket, relayed_addr, permission_count, bytes_fwd, messages_fwd)) = relay_state
         {
             if let Err(err) = socket.send_to(data, &peer).await {
-                debug!(
+                warn!(
                     %client_addr,
                     %peer,
                     %relayed_addr,
@@ -865,24 +867,6 @@ impl AllocationTable {
             "dropping relay packet because allocation was not found for client"
         );
         None
-    }
-
-    pub fn relay_to_peer(
-        &self,
-        relayed_addr: &SocketAddr,
-        data: Bytes,
-    ) -> Result<SocketAddr, Error> {
-        let allocations = self.allocations.read();
-        if let Some(allocation) = allocations.get(relayed_addr) {
-            let alloc = allocation.read();
-            self.stats
-                .total_bytes_relayed
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
-            self.stats.total_messages.fetch_add(1, Ordering::Relaxed);
-            Ok(alloc.client_addr)
-        } else {
-            Err(Error::NoAllocation)
-        }
     }
 
     pub fn peer_to_relay(&self, peer_addr: &SocketAddr) -> Result<SocketAddr, Error> {
@@ -1038,7 +1022,7 @@ fn is_fatal_recv_error(kind: io::ErrorKind) -> bool {
 async fn spawn_allocation_task(
     socket: Arc<UdpSocket>,
     main_socket: Arc<UdpSocket>, // Main socket for sending Data Indication / ChannelData to client
-    client_addr: SocketAddr,
+    mut client_addr: SocketAddr,
     relay_bind_addr: SocketAddr,
     relayed_addr: SocketAddr,
     stats: Arc<ServerStats>,
@@ -1052,7 +1036,13 @@ async fn spawn_allocation_task(
     let task_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         let mut consecutive_recv_errors: u32 = 0;
+        let mut last_recv_error_at: Option<Instant> = None;
         const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 100;
+        const RECV_ERROR_WINDOW_SECS: u64 = 10;
+        // Optional TCP client channel: if set, peer→client data goes via
+        // this channel (framed with RFC 6062 2-byte length prefix) instead
+        // of the UDP main_socket.
+        let mut tcp_client_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>> = None;
 
         loop {
             tokio::select! {
@@ -1062,6 +1052,7 @@ async fn spawn_allocation_task(
                         Ok((len, peer_addr)) => {
                             // Reset error counter on success
                             consecutive_recv_errors = 0;
+                            last_recv_error_at = None;
 
                             // Update stats using atomics - no lock contention
                             stats.total_bytes_relayed.fetch_add(len as u64, Ordering::Relaxed);
@@ -1089,7 +1080,15 @@ async fn spawn_allocation_task(
                                 channel_data[3] = (data_len & 0xFF) as u8;
                                 channel_data[4..].copy_from_slice(&buf[..len]);
 
-                                if let Err(e) = main_socket_clone.send_to(&channel_data, &client_addr).await {
+                                if let Some(ref tx) = tcp_client_tx {
+                                    let mut framed = vec![0u8; 2 + channel_data.len()];
+                                    framed[0] = (channel_data.len() >> 8) as u8;
+                                    framed[1] = (channel_data.len() & 0xFF) as u8;
+                                    framed[2..].copy_from_slice(&channel_data);
+                                    if let Err(e) = tx.send(framed) {
+                                        warn!(%client_addr, "TCP forward to client failed: {}", e);
+                                    }
+                                } else if let Err(e) = main_socket_clone.send_to(&channel_data, &client_addr).await {
                                     warn!(
                                         %client_addr,
                                         peer = %effective_peer,
@@ -1102,7 +1101,15 @@ async fn spawn_allocation_task(
                             } else {
                                 // Send as Data Indication
                                 let indication = build_data_indication(effective_peer, &buf[..len]);
-                                if let Err(e) = main_socket_clone.send_to(&indication, &client_addr).await {
+                                if let Some(ref tx) = tcp_client_tx {
+                                    let mut framed = vec![0u8; 2 + indication.len()];
+                                    framed[0] = (indication.len() >> 8) as u8;
+                                    framed[1] = (indication.len() & 0xFF) as u8;
+                                    framed[2..].copy_from_slice(&indication);
+                                    if let Err(e) = tx.send(framed) {
+                                        warn!(%client_addr, "TCP Data Indication forward failed: {}", e);
+                                    }
+                                } else if let Err(e) = main_socket_clone.send_to(&indication, &client_addr).await {
                                     warn!(
                                         %client_addr,
                                         peer = %effective_peer,
@@ -1115,6 +1122,15 @@ async fn spawn_allocation_task(
                         }
                         Err(e) => {
                             consecutive_recv_errors += 1;
+                            let now = Instant::now();
+
+                            // Time-based reset: if last error was > WINDOW ago, reset counter
+                            if let Some(last) = last_recv_error_at {
+                                if now.duration_since(last).as_secs() > RECV_ERROR_WINDOW_SECS {
+                                    consecutive_recv_errors = 1;
+                                }
+                            }
+                            last_recv_error_at = Some(now);
 
                             if is_fatal_recv_error(e.kind()) {
                                 warn!(
@@ -1131,8 +1147,9 @@ async fn spawn_allocation_task(
                                     %client_addr,
                                     consecutive_errors = consecutive_recv_errors,
                                     max_consecutive = MAX_CONSECUTIVE_RECV_ERRORS,
+                                    window_secs = RECV_ERROR_WINDOW_SECS,
                                     error = %e,
-                                    "relay socket too many consecutive recv errors, exiting relay loop"
+                                    "relay socket too many consecutive recv errors within window, exiting relay loop"
                                 );
                                 break;
                             }
@@ -1176,10 +1193,23 @@ async fn spawn_allocation_task(
                                 );
                             }
                         }
+                        AllocationMessage::UpdateClientAddr { client_addr: new_addr } => {
+                            if new_addr != client_addr {
+                                debug!(
+                                    old = %client_addr,
+                                    new = %new_addr,
+                                    "relay task updating client address (NAT rebind detected)"
+                                );
+                                client_addr = new_addr;
+                            }
+                        }
+                        AllocationMessage::SetClientTx { tx } => {
+                            debug!(%client_addr, "relay task received TCP client channel");
+                            tcp_client_tx = Some(tx);
+                        }
                         AllocationMessage::Shutdown => {
                             break;
                         }
-                        _ => {}
                     }
                 }
 
@@ -1313,12 +1343,22 @@ impl ChannelTable {
 
     pub fn next_id(&self) -> u16 {
         use std::sync::atomic::Ordering;
-        let id = self.next_channel.fetch_add(1, Ordering::Relaxed);
-        // Wrap around if we exceed 0x7FFF
-        if self.next_channel.load(Ordering::Relaxed) > 0x7FFF {
-            self.next_channel.store(0x4000, Ordering::Relaxed);
+        // Atomically fetch and wrap channel IDs within 0x4000..=0x7FFF
+        loop {
+            let current = self.next_channel.load(Ordering::Acquire);
+            let next = if current >= 0x7FFF {
+                0x4000
+            } else {
+                current + 1
+            };
+            if self
+                .next_channel
+                .compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                return current;
+            }
         }
-        id
     }
 
     /// Remove all channel bindings for a given relayed address.

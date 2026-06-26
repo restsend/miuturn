@@ -12,6 +12,10 @@ use tokio::time::sleep;
 
 use miuturn::TurnServer;
 
+// Reduce scope in debug mode — debug builds are 10-50x slower
+#[cfg(debug_assertions)]
+const ITERATIONS: usize = 50;
+#[cfg(not(debug_assertions))]
 const ITERATIONS: usize = 1000;
 
 /// Benchmark 1: Many parallel clients (current approach)
@@ -141,8 +145,13 @@ async fn throughput_optimization_benchmark() {
     println!("{}", "=".repeat(70));
 
     // Test different client counts
-    for num_clients in [10, 50, 100, 200, 500] {
-        let mbps = benchmark_many_clients(server_addr, num_clients).await;
+    let client_counts: &[usize] = if cfg!(debug_assertions) {
+        &[5, 10]
+    } else {
+        &[10, 50, 100, 200, 500]
+    };
+    for num_clients in client_counts {
+        let mbps = benchmark_many_clients(server_addr, *num_clients).await;
         println!("{} clients:  {:.2} Mbps", num_clients, mbps);
     }
 
@@ -156,15 +165,25 @@ async fn throughput_optimization_benchmark() {
     );
 
     // Single socket pipelined
-    for conc in [10, 50, 100] {
-        let mbps = benchmark_single_socket_pipelined(server_addr, conc).await;
+    let pipelined_concurrency: &[usize] = if cfg!(debug_assertions) {
+        &[5, 10]
+    } else {
+        &[10, 50, 100]
+    };
+    for conc in pipelined_concurrency {
+        let mbps = benchmark_single_socket_pipelined(server_addr, *conc).await;
         println!("single socket (pipelined x{}): {:.2} Mbps", conc, mbps);
     }
 
     // Optimized clients
     println!();
-    for num_clients in [50, 100, 200] {
-        let mbps = benchmark_optimized_clients(server_addr, num_clients).await;
+    let optimized_counts: &[usize] = if cfg!(debug_assertions) {
+        &[5, 10]
+    } else {
+        &[50, 100, 200]
+    };
+    for num_clients in optimized_counts {
+        let mbps = benchmark_optimized_clients(server_addr, *num_clients).await;
         println!("optimized {} clients: {:.2} Mbps", num_clients, mbps);
     }
 

@@ -11,6 +11,9 @@ pub mod server;
 pub mod short_term;
 pub mod tls;
 
+#[cfg(test)]
+mod allocation_tests;
+
 pub use allocation::{
     Allocation, AllocationTable, ChannelBinding, ChannelTable, ServerStats, ServerStatsSnapshot,
 };

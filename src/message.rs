@@ -1,5 +1,6 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use tracing::warn;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -229,80 +230,131 @@ impl Attribute {
 /// Fast STUN Binding success response - optimized for hot path
 #[inline]
 pub fn create_binding_response_fast(transaction_id: [u8; 12], client_addr: SocketAddr) -> Bytes {
-    let mut buf = BytesMut::with_capacity(32 + 8);
-
-    // Header: Binding Success Response
-    // method=0x001, class=Success(2) -> RFC 5389 encoded: 0x0101
-    buf.put_u16(0x0101);
-    buf.put_u16(12); // message length: attr header(4) + attr value(8) = 12
-    buf.put_u32(0x2112A442); // magic cookie
-    buf.put_slice(&transaction_id);
-
-    // XOR-MAPPED-ADDRESS attribute
-    buf.put_u16(0x0020); // attr type
-    buf.put_u16(8); // attr length
+    let magic = 0x2112A442u32;
 
     match client_addr {
         SocketAddr::V4(v4) => {
+            // XOR-MAPPED-ADDRESS for IPv4: 4 header + 8 value = 12 bytes
+            let mut buf = BytesMut::with_capacity(32);
+
+            // Header: Binding Success Response
+            buf.put_u16(0x0101); // method=0x001, class=Success(2) -> RFC 5389
+            buf.put_u16(12); // message length
+            buf.put_u32(magic);
+            buf.put_slice(&transaction_id);
+
+            // XOR-MAPPED-ADDRESS
+            buf.put_u16(0x0020); // attr type
+            buf.put_u16(8); // attr length
             buf.put_u8(0); // reserved
-            buf.put_u8(0x01); // IPv4 family
-            let port = v4.port() ^ 0x2112;
+            buf.put_u8(0x01); // family
+            let port = v4.port() ^ (magic >> 16) as u16;
             buf.put_u16(port);
             let ip = v4.ip().octets();
-            buf.put_u8(ip[0] ^ 0x21);
-            buf.put_u8(ip[1] ^ 0x12);
-            buf.put_u8(ip[2] ^ 0xa4);
-            buf.put_u8(ip[3] ^ 0x42);
+            buf.put_u8(ip[0] ^ (magic >> 24) as u8);
+            buf.put_u8(ip[1] ^ (magic >> 16) as u8);
+            buf.put_u8(ip[2] ^ (magic >> 8) as u8);
+            buf.put_u8(ip[3] ^ magic as u8);
+
+            buf.freeze()
         }
-        SocketAddr::V6(_) => {
-            buf.put_u8(0);
-            buf.put_u8(0x02); // IPv6 family - simplified, full impl needs more bytes
-            buf.put_u16(0); // placeholder
+        SocketAddr::V6(v6) => {
+            // XOR-MAPPED-ADDRESS for IPv6: 4 header + 20 value = 24 bytes
+            let mut buf = BytesMut::with_capacity(44);
+
+            buf.put_u16(0x0101);
+            buf.put_u16(24); // message length: attr header(4) + attr value(20) = 24
+            buf.put_u32(magic);
+            buf.put_slice(&transaction_id);
+
+            buf.put_u16(0x0020); // attr type
+            buf.put_u16(20); // attr length
+            buf.put_u8(0); // reserved
+            buf.put_u8(0x02); // family
+            buf.put_u16(v6.port() ^ (magic >> 16) as u16);
+            // First 4 bytes XOR'd with magic cookie
+            let octets = v6.ip().octets();
+            buf.put_u8(octets[0] ^ (magic >> 24) as u8);
+            buf.put_u8(octets[1] ^ (magic >> 16) as u8);
+            buf.put_u8(octets[2] ^ (magic >> 8) as u8);
+            buf.put_u8(octets[3] ^ magic as u8);
+            // Remaining 12 bytes XOR'd with transaction ID
+            for i in 0..12 {
+                buf.put_u8(octets[4 + i] ^ transaction_id[i]);
+            }
+
+            buf.freeze()
         }
     }
-
-    buf.freeze()
 }
 
-pub fn encode_xor_address(addr: SocketAddr, magic_cookie: u32, _tid: &[u8; 12]) -> Bytes {
-    let mut buf = BytesMut::with_capacity(8);
+pub fn encode_xor_address(addr: SocketAddr, magic_cookie: u32, tid: &[u8; 12]) -> Bytes {
     match addr {
         SocketAddr::V4(v4) => {
-            buf.put_u8(0); // byte 0: padding (decode doesn't use it)
-            buf.put_u8(0x01); // byte 1: family
-            let ip = v4.ip().octets();
-            let xored: [u8; 4] = [
-                ip[0] ^ ((magic_cookie >> 24) as u8),
-                ip[1] ^ ((magic_cookie >> 16) as u8),
-                ip[2] ^ ((magic_cookie >> 8) as u8),
-                ip[3] ^ (magic_cookie as u8),
-            ];
+            let mut buf = BytesMut::with_capacity(8);
+            buf.put_u8(0); // reserved
+            buf.put_u8(0x01); // family
             buf.put_u16(v4.port() ^ (magic_cookie >> 16) as u16);
-            buf.put_slice(&xored);
+            let ip = v4.ip().octets();
+            buf.put_u8(ip[0] ^ (magic_cookie >> 24) as u8);
+            buf.put_u8(ip[1] ^ (magic_cookie >> 16) as u8);
+            buf.put_u8(ip[2] ^ (magic_cookie >> 8) as u8);
+            buf.put_u8(ip[3] ^ magic_cookie as u8);
+            buf.freeze()
         }
-        SocketAddr::V6(_) => {
-            buf.put_u8(0); // byte 0: padding
-            buf.put_u8(0x02); // byte 1: family
-            buf.put_u16(addr.port() ^ (magic_cookie >> 16) as u16);
-            buf.put_u32(0); // placeholder
+        SocketAddr::V6(v6) => {
+            // Per RFC 5389: IPv6 XOR-ADDRESS is 20 bytes:
+            // reserved(1) + family(1) + xport(2) + xip(16)
+            let mut buf = BytesMut::with_capacity(20);
+            buf.put_u8(0); // reserved
+            buf.put_u8(0x02); // family
+            buf.put_u16(v6.port() ^ (magic_cookie >> 16) as u16);
+            let octets = v6.ip().octets();
+            // First 4 IP bytes XOR'd with magic cookie
+            buf.put_u8(octets[0] ^ (magic_cookie >> 24) as u8);
+            buf.put_u8(octets[1] ^ (magic_cookie >> 16) as u8);
+            buf.put_u8(octets[2] ^ (magic_cookie >> 8) as u8);
+            buf.put_u8(octets[3] ^ magic_cookie as u8);
+            // Remaining 12 IP bytes XOR'd with transaction ID
+            for i in 0..12 {
+                buf.put_u8(octets[4 + i] ^ tid[i]);
+            }
+            buf.freeze()
         }
     }
-    buf.freeze()
 }
 
-pub fn decode_xor_address(data: &[u8], magic_cookie: u32, _tid: &[u8; 12]) -> Option<SocketAddr> {
+pub fn decode_xor_address(data: &[u8], magic_cookie: u32, tid: &[u8; 12]) -> Option<SocketAddr> {
     if data.len() < 8 {
         return None;
     }
     let family = data[1];
     let port = u16::from_be_bytes([data[2], data[3]]) ^ (magic_cookie >> 16) as u16;
     if family == 0x01 {
+        if data.len() < 8 {
+            return None;
+        }
         let mut ip = [0u8; 4];
         ip[0] = data[4] ^ ((magic_cookie >> 24) as u8);
         ip[1] = data[5] ^ ((magic_cookie >> 16) as u8);
         ip[2] = data[6] ^ ((magic_cookie >> 8) as u8);
         ip[3] = data[7] ^ (magic_cookie as u8);
         Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), port)))
+    } else if family == 0x02 && data.len() >= 20 {
+        let mut octets = [0u8; 16];
+        octets[0] = data[4] ^ (magic_cookie >> 24) as u8;
+        octets[1] = data[5] ^ (magic_cookie >> 16) as u8;
+        octets[2] = data[6] ^ (magic_cookie >> 8) as u8;
+        octets[3] = data[7] ^ magic_cookie as u8;
+        for i in 0..12 {
+            octets[4 + i] = data[8 + i] ^ tid[i];
+        }
+        Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::from(octets),
+            port,
+            0,
+            0,
+        )))
     } else {
         None
     }
@@ -333,26 +385,33 @@ impl Message {
         let end_offset = total_length;
         let mut attributes = Vec::new();
 
-        while offset < end_offset {
-            // Need at least 4 bytes for attribute header
-            if offset + 4 > end_offset {
-                return None;
+        while offset + 4 <= end_offset {
+            let attr_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+            let padding = (4 - (attr_len % 4)) % 4;
+            let total_attr_size = 4 + attr_len + padding;
+
+            if offset + total_attr_size > end_offset {
+                // Malformed attribute: declared length exceeds remaining data.
+                // Skip past the 4-byte type+length header and continue.
+                warn!(
+                    "STUN attribute at offset {} declares length {} but only {} bytes remain",
+                    offset,
+                    attr_len,
+                    end_offset - offset
+                );
+                offset += 4;
+                if offset + 4 <= end_offset {
+                    continue;
+                }
+                break;
             }
 
             if let Some(attr) = Attribute::decode(&data[offset..end_offset]) {
-                let attr_len = attr.value.len() + 4;
-                let padding = (4 - (attr_len % 4)) % 4;
-
-                // Check that padding doesn't overflow
-                let total_attr_size = attr_len.saturating_add(padding);
-                if total_attr_size == 0 || offset.saturating_add(total_attr_size) > end_offset {
-                    return None;
-                }
-
                 attributes.push(attr);
                 offset += total_attr_size;
             } else {
-                break;
+                // Unknown/malformed attribute: skip past it using declared length + padding
+                offset += total_attr_size;
             }
         }
 

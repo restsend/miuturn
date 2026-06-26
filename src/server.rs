@@ -78,7 +78,6 @@ pub struct TurnServer {
 }
 
 struct NonceEntry {
-    _nonce: String,
     created_at: std::time::Instant,
 }
 
@@ -516,37 +515,77 @@ impl TurnServer {
         let listener = TcpListener::bind(addr).await?;
         info!("TURN TCP server listening on {}", addr);
         loop {
-            let (mut socket, peer_addr) = listener.accept().await?;
+            let (socket, peer_addr) = listener.accept().await?;
             let server = self.clone();
             tokio::spawn(async move {
-                const MAX_TCP_BUFFER_SIZE: usize = 10 * 1024 * 1024; // 10MB limit
+                let (mut tcp_reader, tcp_writer) = tokio::io::split(socket);
+                // Unbounded channel: both STUN responses AND peer→client relay data
+                // flow through this channel to a single TCP writer task.
+                let (tcp_tx, mut tcp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+                // Writer task: drain the channel into the TCP socket
+                let wr = tokio::spawn(async move {
+                    let mut w = tcp_writer;
+                    while let Some(data) = tcp_rx.recv().await {
+                        if w.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+
                 let mut buf = BytesMut::with_capacity(65536);
                 loop {
                     buf.reserve(1024);
-
-                    // Check buffer size limit to prevent memory exhaustion
-                    if buf.capacity() > MAX_TCP_BUFFER_SIZE {
-                        error!("TCP buffer exceeded maximum size from {}", peer_addr);
-                        break;
-                    }
-
-                    match socket.read_buf(&mut buf).await {
+                    match tcp_reader.read_buf(&mut buf).await {
                         Ok(0) => break,
-                        Ok(_n) => {
-                            let data = buf.split().freeze();
-                            if let Some(response) =
-                                handle_tcp_message(&data, &server, peer_addr).await
-                                && socket.write_all(&response).await.is_err()
-                            {
-                                break;
+                        Ok(_) => {
+                            loop {
+                                if buf.len() < 2 { break; }
+                                let msg_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+                                let total = 2 + msg_len;
+                                if buf.len() < total { break; }
+
+                                let msg_bytes = buf.split_to(total).freeze();
+                                let msg_data = msg_bytes.slice(2..);
+
+                                if let Some(response) =
+                                    handle_tcp_message(&msg_data, &server, peer_addr).await
+                                {
+                                    let rlen = response.len();
+                                    if rlen > 65535 {
+                                        error!("TCP response too large ({} B) from {}", rlen, peer_addr);
+                                        break;
+                                    }
+                                    let mut frame = Vec::with_capacity(2 + rlen);
+                                    frame.push((rlen >> 8) as u8);
+                                    frame.push((rlen & 0xFF) as u8);
+                                    frame.extend_from_slice(&response);
+                                    if tcp_tx.send(frame).is_err() {
+                                        break;
+                                    }
+                                }
+
+                                // Wire relay task's peer→client data through TCP
+                                if let Some(relayed) = server.allocation_table.find_allocation_by_client(&peer_addr) {
+                                    if let Some(alloc) = server.allocation_table.get_allocation(&relayed) {
+                                        if let Some(ref relay) = alloc.read().relay {
+                                            let _ = relay.tx.try_send(
+                                                crate::allocation::AllocationMessage::SetClientTx {
+                                                    tx: tcp_tx.clone(),
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                         Err(e) => {
-                            error!("Read error: {}", e);
+                            error!("TCP read error from {}: {}", peer_addr, e);
                             break;
                         }
                     }
                 }
+                wr.abort();
             });
         }
     }
@@ -645,35 +684,49 @@ async fn handle_tcp_message(
     // Handle ChannelData (RFC 5766 §11.4)
     if data.len() >= 4 {
         let channel_num = (data[0] as u16) << 8 | (data[1] as u16);
-        if (0x4000..=0x7FFF).contains(&channel_num) {
-            let data_len = u16::from_be_bytes([data[2], data[3]]) as usize;
-            let payload_end = 4 + data_len.min(data.len().saturating_sub(4));
-            let payload = data.slice(4..payload_end);
+                    if (0x4000..=0x7FFF).contains(&channel_num) {
+                        let declared_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+                        // Validate the declared length matches actual payload (RFC 5766 §11.4)
+                        if 4 + declared_len != data.len() {
+                            warn!(
+                                "TCP ChannelData length mismatch from {}: declared={} actual={}",
+                                peer_addr,
+                                declared_len,
+                                data.len().saturating_sub(4)
+                            );
+                            return None;
+                        }
+                        let payload = data.slice(4..);
 
-            let allocation = server.allocation_table.get_allocation_by_client(&peer_addr);
-            let relayed_addr = allocation.as_ref().map(|alloc| alloc.read().relayed_addr);
-            let channel_binding = if let Some(relayed_addr) = relayed_addr {
-                server
-                    .channel_table
-                    .read()
-                    .await
-                    .get_by_channel(relayed_addr, channel_num)
-            } else {
-                None
-            };
+                        let allocation = server.allocation_table.get_allocation_by_client(&peer_addr);
+                        let relayed_addr = allocation.as_ref().map(|alloc| alloc.read().relayed_addr);
+                        let channel_binding = if let Some(relayed_addr) = relayed_addr {
+                            server
+                                .channel_table
+                                .read()
+                                .await
+                                .get_by_channel(relayed_addr, channel_num)
+                        } else {
+                            None
+                        };
 
-            if let Some(channel) = channel_binding {
-                let relay_socket = allocation.as_ref().and_then(|alloc| {
-                    let a = alloc.read();
-                    a.relay.as_ref().map(|r| r.socket.clone())
-                });
+                        if let Some(channel) = channel_binding {
+                            let relay_socket = allocation.as_ref().and_then(|alloc| {
+                                let a = alloc.read();
+                                a.relay.as_ref().map(|r| r.socket.clone())
+                            });
 
-                if let Some(relay_sock) = relay_socket {
-                    let _ = relay_sock.send_to(&payload, &channel.peer_addr).await;
-                }
-            }
-            return None;
-        }
+                            if let Some(relay_sock) = relay_socket {
+                                if let Err(e) = relay_sock.send_to(&payload, &channel.peer_addr).await {
+                                    warn!(
+                                        "TCP ChannelData send to peer {} failed: {}",
+                                        channel.peer_addr, e
+                                    );
+                                }
+                            }
+                        }
+                        return None;
+                    }
     }
 
     if let Some(msg) = Message::parse(&data[..]) {
@@ -696,9 +749,18 @@ async fn handle_udp_message(
     }
     let channel_num = (data[0] as u16) << 8 | (data[1] as u16);
     if (0x4000..=0x7FFF).contains(&channel_num) {
-        let data_len = u16::from_be_bytes([data[2], data[3]]) as usize;
-        let payload_end = 4 + data_len.min(data.len().saturating_sub(4));
-        let payload = data.slice(4..payload_end);
+        let declared_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+        // Validate the declared length matches actual payload (RFC 5766 §11.4)
+        if 4 + declared_len != data.len() {
+            warn!(
+                "UDP ChannelData length mismatch from {}: declared={} actual={}",
+                peer_addr,
+                declared_len,
+                data.len().saturating_sub(4)
+            );
+            return None;
+        }
+        let payload = data.slice(4..);
 
         let allocation = server.allocation_table.get_allocation_by_client(&peer_addr);
         let has_allocation = allocation.is_some();
@@ -721,7 +783,12 @@ async fn handle_udp_message(
             });
 
             if let Some(relay_sock) = relay_socket {
-                let _ = relay_sock.send_to(&payload, &channel.peer_addr).await;
+                if let Err(e) = relay_sock.send_to(&payload, &channel.peer_addr).await {
+                    warn!(
+                        "UDP ChannelData send to peer {} failed: {}",
+                        channel.peer_addr, e
+                    );
+                }
             }
         } else {
             tracing::debug!(
@@ -866,6 +933,11 @@ fn verify_message_integrity(msg: &Message, key: &[u8]) -> bool {
     let mut buf = BytesMut::new();
     header.encode(&mut buf);
     buf.extend_from_slice(&attr_buf.freeze());
+
+    if integrity_attr.value.len() < 20 {
+        debug!("MESSAGE-INTEGRITY value too short ({} bytes)", integrity_attr.value.len());
+        return false;
+    }
 
     let mut mac = HmacSha1::new_from_slice(key).ok().unwrap();
     mac.update(&buf);
@@ -1051,7 +1123,7 @@ async fn handle_allocate(
     // Remove any existing allocation for this client before creating a new one.
     // This prevents stale state (channel bindings, permissions) from leaking
     // into the new allocation when the same client rapidly recycles.
-    let ch_table = server.channel_table.read().await.clone();
+    let ch_table = server.channel_table.read().await;
     if let Some(old_relayed) = server
         .allocation_table
         .find_allocation_by_client(&client_addr)
@@ -1211,6 +1283,16 @@ async fn handle_refresh(
                 server,
             ));
         } else {
+            // Update client address in the relay task (handles NAT rebind)
+            if let Some(alloc) = server.allocation_table.get_allocation(&relayed) {
+                if let Some(ref relay) = alloc.read().relay {
+                    let _ = relay
+                        .tx
+                        .try_send(crate::allocation::AllocationMessage::UpdateClientAddr {
+                            client_addr,
+                        });
+                }
+            }
             tracing::info!(
                 %client_addr,
                 relayed = %relayed,
@@ -1362,6 +1444,18 @@ async fn handle_channel_bind(
             .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
             let channel_attr = msg.get_attribute(Attribute::CHANNEL_NUMBER);
             if let Some(channel_attr) = channel_attr {
+                if channel_attr.value.len() < 2 {
+                    debug!(
+                        %client_addr,
+                        "ChannelBind rejected because CHANNEL-NUMBER value is too short ({} bytes)",
+                        channel_attr.value.len()
+                    );
+                    return Some(create_error_response_bytes(
+                        &msg,
+                        ErrorCode::BadRequest,
+                        server,
+                    ));
+                }
                 let channel_num =
                     ((channel_attr.value[0] as u16) << 8) | (channel_attr.value[1] as u16);
                 if server
@@ -1504,7 +1598,6 @@ fn create_401_response(
     server.nonce_map.write().insert(
         nonce.clone(),
         NonceEntry {
-            _nonce: nonce.clone(),
             created_at: std::time::Instant::now(),
         },
     );
@@ -1555,8 +1648,13 @@ fn create_error_response_bytes_with_reason(
 
 fn get_lifetime(msg: &Message) -> u32 {
     if let Some(attr) = msg.get_attribute(Attribute::LIFETIME) {
-        let mut buf = attr.value.clone();
-        buf.get_u32()
+        if attr.value.len() >= 4 {
+            let mut buf = attr.value.clone();
+            buf.get_u32()
+        } else {
+            debug!("LIFETIME attribute too short ({} bytes), using default", attr.value.len());
+            600
+        }
     } else {
         600
     }
