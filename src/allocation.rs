@@ -80,6 +80,7 @@ pub struct Allocation {
     pub relayed_addr: SocketAddr,
     pub client_addr: SocketAddr,
     pub created_at: Instant,
+    pub refreshed_at: Instant,
     pub lifetime: Duration,
     pub five_tuple: (SocketAddr, SocketAddr),
     /// Active relay connection (socket + task channel)
@@ -106,6 +107,7 @@ impl Allocation {
             relayed_addr,
             client_addr,
             created_at: Instant::now(),
+            refreshed_at: Instant::now(),
             lifetime,
             five_tuple: (src, dst),
             relay: None,
@@ -129,6 +131,7 @@ impl Allocation {
             relayed_addr,
             client_addr,
             created_at: Instant::now(),
+            refreshed_at: Instant::now(),
             lifetime,
             five_tuple: (src, dst),
             relay: Some(relay),
@@ -139,11 +142,11 @@ impl Allocation {
     }
 
     pub fn is_expired(&self) -> bool {
-        self.created_at.elapsed() > self.lifetime
+        self.refreshed_at.elapsed() > self.lifetime
     }
 
     pub fn remaining_lifetime(&self) -> u32 {
-        let elapsed = self.created_at.elapsed();
+        let elapsed = self.refreshed_at.elapsed();
         if elapsed >= self.lifetime {
             return 0;
         }
@@ -695,7 +698,7 @@ impl AllocationTable {
         if let Some(allocation) = allocations.get(relayed_addr) {
             let mut alloc = allocation.write();
             alloc.lifetime = Duration::from_secs(lifetime as u64);
-            alloc.created_at = Instant::now();
+            alloc.refreshed_at = Instant::now();
             Ok(())
         } else {
             Err(Error::NotFound)
@@ -916,10 +919,12 @@ impl AllocationTable {
                     let messages = a.messages_forwarded.load(Ordering::Relaxed);
                     let permission_count = a.permissions.len();
                     let lived_secs = a.created_at.elapsed().as_secs();
+                    let refresh_age_secs = a.refreshed_at.elapsed().as_secs();
                     tracing::info!(
                         relayed_addr = %addr,
                         client_addr = %a.client_addr,
                         lived_secs,
+                        refresh_age_secs,
                         bytes_forwarded = bytes,
                         messages_forwarded = messages,
                         permission_count,

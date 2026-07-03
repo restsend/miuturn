@@ -1262,10 +1262,12 @@ async fn handle_refresh(
                     .load(std::sync::atomic::Ordering::Relaxed);
                 let permission_count = a.permissions.len();
                 let lived_secs = a.created_at.elapsed().as_secs();
+                let refresh_age_secs = a.refreshed_at.elapsed().as_secs();
                 tracing::info!(
                     %client_addr,
                     relayed = %relayed,
                     lived_secs,
+                    refresh_age_secs,
                     bytes_forwarded = bytes,
                     messages_forwarded = messages,
                     permission_count,
