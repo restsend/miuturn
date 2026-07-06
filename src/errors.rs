@@ -48,3 +48,97 @@ impl From<std::io::Error> for Error {
         Error::Io(e)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn test_display_io_error() {
+        let err = Error::Io(io::Error::new(io::ErrorKind::NotFound, "missing"));
+        let s = format!("{}", err);
+        assert!(s.starts_with("IO error:"));
+        assert!(s.contains("missing"));
+    }
+
+    #[test]
+    fn test_display_protocol_error() {
+        let err = Error::Protocol("bad message".to_string());
+        assert_eq!(format!("{}", err), "Protocol error: bad message");
+    }
+
+    #[test]
+    fn test_display_simple_variants() {
+        assert_eq!(format!("{}", Error::NotFound), "Not found");
+        assert_eq!(format!("{}", Error::AlreadyExists), "Already exists");
+        assert_eq!(format!("{}", Error::InvalidChannel), "Invalid channel");
+        assert_eq!(format!("{}", Error::NoAllocation), "No allocation");
+        assert_eq!(format!("{}", Error::AllocationFailed), "Allocation failed");
+        assert_eq!(
+            format!("{}", Error::AllocationQuotaReached),
+            "Allocation quota reached"
+        );
+        assert_eq!(
+            format!("{}", Error::RelayPortExhausted),
+            "No relay ports available"
+        );
+        assert_eq!(
+            format!("{}", Error::BandwidthLimitExceeded),
+            "Bandwidth limit exceeded"
+        );
+    }
+
+    #[test]
+    fn test_display_relay_bind_failed() {
+        let addr: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let err = Error::RelayBindFailed {
+            addr,
+            source: "addr in use".to_string(),
+        };
+        let s = format!("{}", err);
+        assert!(s.contains("10.0.0.1:5000"));
+        assert!(s.contains("addr in use"));
+    }
+
+    #[test]
+    fn test_display_encode_decode() {
+        assert_eq!(
+            format!("{}", Error::Encode("stun header")),
+            "Encode error: stun header"
+        );
+        assert_eq!(
+            format!("{}", Error::Decode("attr length")),
+            "Decode error: attr length"
+        );
+    }
+
+    #[test]
+    fn test_from_io_error() {
+        let io_err = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let err: Error = io_err.into();
+        assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[test]
+    fn test_error_is_std_error() {
+        fn assert_error<T: std::error::Error>(_e: &T) {}
+        let err = Error::Protocol("x".to_string());
+        assert_error(&err);
+    }
+
+    #[test]
+    fn test_error_source_is_none() {
+        // Our Error has no wrapped source beyond what Display shows
+        let err = Error::NotFound;
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_debug_format_includes_variant() {
+        let err = Error::BandwidthLimitExceeded;
+        let dbg = format!("{:?}", err);
+        assert!(dbg.contains("BandwidthLimitExceeded"));
+    }
+}

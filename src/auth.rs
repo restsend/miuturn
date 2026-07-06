@@ -337,4 +337,285 @@ mod tests {
         assert_eq!(user.max_allocation_duration_secs, Some(3600));
         assert!(user.ip_whitelist.is_some());
     }
+
+    // =========================================================================
+    // authenticate() edge cases
+    // =========================================================================
+
+    fn make_fixed_user(name: &str, pass: &str) -> User {
+        User {
+            username: name.to_string(),
+            password: pass.to_string(),
+            user_type: UserType::Fixed,
+            created_at: 0,
+            expires_at: None,
+            max_allocations: 5,
+            bandwidth_limit: None,
+            ip_whitelist: None,
+            max_allocation_duration_secs: None,
+        }
+    }
+
+    #[test]
+    fn test_authenticate_wrong_password_returns_none() {
+        let manager = AuthManager::new("test".to_string());
+        manager.add_user(make_fixed_user("alice", "correct"));
+        assert!(manager.authenticate("alice", "wrong").is_none());
+    }
+
+    #[test]
+    fn test_authenticate_unknown_user_returns_none() {
+        let manager = AuthManager::new("test".to_string());
+        manager.add_user(make_fixed_user("alice", "pw"));
+        assert!(manager.authenticate("ghost", "pw").is_none());
+    }
+
+    #[test]
+    fn test_authenticate_expired_user_returns_none() {
+        let manager = AuthManager::new("test".to_string());
+        let mut user = make_fixed_user("temp", "pw");
+        // Expiry 1 second after epoch → guaranteed to be in the past
+        user.expires_at = Some(1);
+        manager.add_user(user);
+        assert!(manager.authenticate("temp", "pw").is_none());
+    }
+
+    #[test]
+    fn test_authenticate_future_expiry_still_valid() {
+        let manager = AuthManager::new("test".to_string());
+        let mut user = make_fixed_user("future", "pw");
+        user.expires_at = Some(u64::MAX);
+        manager.add_user(user);
+        assert!(manager.authenticate("future", "pw").is_some());
+    }
+
+    #[test]
+    fn test_authenticate_after_remove_user_fails() {
+        let manager = AuthManager::new("test".to_string());
+        manager.add_user(make_fixed_user("bob", "pw"));
+        assert!(manager.authenticate("bob", "pw").is_some());
+        manager.remove_user("bob");
+        assert!(manager.authenticate("bob", "pw").is_none());
+    }
+
+    #[test]
+    fn test_authenticate_api_key() {
+        let manager = AuthManager::new("test".to_string());
+        let mut api_keys = std::collections::HashMap::new();
+        api_keys.insert("key-123".to_string(), "api-user".to_string());
+        manager.load_from_config(vec![], api_keys, vec![]);
+
+        assert_eq!(
+            manager.authenticate_api_key("key-123"),
+            Some("api-user".to_string())
+        );
+        assert!(manager.authenticate_api_key("unknown").is_none());
+    }
+
+    #[test]
+    fn test_get_user_password() {
+        let manager = AuthManager::new("test".to_string());
+        manager.add_user(make_fixed_user("carol", "secret"));
+        assert_eq!(
+            manager.get_user_password("carol"),
+            Some("secret".to_string())
+        );
+        assert!(manager.get_user_password("nobody").is_none());
+    }
+
+    #[test]
+    fn test_get_user_password_expired_returns_none() {
+        let manager = AuthManager::new("test".to_string());
+        let mut user = make_fixed_user("exp", "pw");
+        user.expires_at = Some(1);
+        manager.add_user(user);
+        assert!(manager.get_user_password("exp").is_none());
+    }
+
+    #[test]
+    fn test_list_users() {
+        let manager = AuthManager::new("test".to_string());
+        manager.add_user(make_fixed_user("u1", "p1"));
+        manager.add_user(make_fixed_user("u2", "p2"));
+        let mut names: Vec<String> = manager
+            .list_users()
+            .into_iter()
+            .map(|u| u.username)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["u1".to_string(), "u2".to_string()]);
+
+        manager.remove_user("u1");
+        assert_eq!(manager.list_users().len(), 1);
+    }
+
+    #[test]
+    fn test_realm_accessor() {
+        let manager = AuthManager::new("my-realm".to_string());
+        assert_eq!(manager.realm(), "my-realm");
+    }
+
+    // =========================================================================
+    // ACL rule management
+    // =========================================================================
+
+    #[test]
+    fn test_check_acl_default_allow_when_no_rules() {
+        let manager = AuthManager::new("test".to_string());
+        // No rules → everything allowed
+        assert!(manager.check_acl("8.8.8.8"));
+        assert!(manager.check_acl("192.168.1.1"));
+    }
+
+    #[test]
+    fn test_add_acl_rule_sorts_by_priority_desc() {
+        let manager = AuthManager::new("test".to_string());
+        manager.add_acl_rule(AclRule {
+            ip_range: "10.0.0.0/8".to_string(),
+            action: AclAction::Deny,
+            priority: 1,
+        });
+        manager.add_acl_rule(AclRule {
+            ip_range: "192.168.1.0/24".to_string(),
+            action: AclAction::Allow,
+            priority: 10,
+        });
+        manager.add_acl_rule(AclRule {
+            ip_range: "172.16.0.0/12".to_string(),
+            action: AclAction::Deny,
+            priority: 5,
+        });
+
+        let rules = manager.list_acl_rules();
+        assert_eq!(rules.len(), 3);
+        // Highest priority first
+        assert_eq!(rules[0].priority, 10);
+        assert_eq!(rules[1].priority, 5);
+        assert_eq!(rules[2].priority, 1);
+    }
+
+    #[test]
+    fn test_remove_acl_rule_by_range_and_priority() {
+        let manager = AuthManager::new("test".to_string());
+        manager.add_acl_rule(AclRule {
+            ip_range: "10.0.0.0/8".to_string(),
+            action: AclAction::Deny,
+            priority: 5,
+        });
+        manager.add_acl_rule(AclRule {
+            ip_range: "192.168.1.0/24".to_string(),
+            action: AclAction::Allow,
+            priority: 5,
+        });
+        assert_eq!(manager.list_acl_rules().len(), 2);
+
+        // Remove only the 10.0.0.0/8 rule (same priority, different range)
+        manager.remove_acl_rule("10.0.0.0/8", 5);
+        let rules = manager.list_acl_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].ip_range, "192.168.1.0/24");
+    }
+
+    #[test]
+    fn test_check_acl_priority_overrides() {
+        let manager = AuthManager::new("test".to_string());
+        // Low-priority broad allow
+        manager.add_acl_rule(AclRule {
+            ip_range: "0.0.0.0/0".to_string(),
+            action: AclAction::Allow,
+            priority: 1,
+        });
+        // High-priority specific deny
+        manager.add_acl_rule(AclRule {
+            ip_range: "10.0.0.0/8".to_string(),
+            action: AclAction::Deny,
+            priority: 100,
+        });
+
+        assert!(!manager.check_acl("10.1.2.3"), "high-priority deny wins");
+        assert!(manager.check_acl("192.168.1.1"), "falls through to allow");
+    }
+
+    // =========================================================================
+    // ip_in_range / subnet matching
+    // =========================================================================
+
+    #[test]
+    fn test_ip_in_range_exact_match() {
+        assert!(AuthManager::ip_in_range("192.168.1.1", "192.168.1.1"));
+        assert!(!AuthManager::ip_in_range("192.168.1.2", "192.168.1.1"));
+    }
+
+    #[test]
+    fn test_ip_in_range_cidr_24() {
+        assert!(AuthManager::ip_in_range("192.168.1.0", "192.168.1.0/24"));
+        assert!(AuthManager::ip_in_range("192.168.1.255", "192.168.1.0/24"));
+        assert!(!AuthManager::ip_in_range("192.168.2.1", "192.168.1.0/24"));
+    }
+
+    #[test]
+    fn test_ip_in_range_cidr_32() {
+        assert!(AuthManager::ip_in_range("10.0.0.1", "10.0.0.1/32"));
+        assert!(!AuthManager::ip_in_range("10.0.0.2", "10.0.0.1/32"));
+    }
+
+    #[test]
+    fn test_ip_in_range_cidr_0_matches_all() {
+        assert!(AuthManager::ip_in_range("1.2.3.4", "0.0.0.0/0"));
+        assert!(AuthManager::ip_in_range("255.255.255.255", "0.0.0.0/0"));
+    }
+
+    #[test]
+    fn test_ip_in_range_invalid_cidr_parts() {
+        // Too many slashes → splits into >2 parts → treated as exact match (false)
+        assert!(!AuthManager::ip_in_range("1.2.3.4", "1.2.3.4/24/8"));
+    }
+
+    #[test]
+    fn test_ip_in_range_invalid_ip_falls_back_to_zero() {
+        // Non-numeric octets parse to 0, so matching 0.0.0.0/24 should succeed
+        assert!(AuthManager::ip_in_range("not.an.ip.addr", "0.0.0.0/24"));
+    }
+
+    #[test]
+    fn test_load_from_config_merges_users_replaces_keys_and_acl() {
+        let manager = AuthManager::new("test".to_string());
+        // Pre-populate with stale data
+        manager.add_user(make_fixed_user("stale", "pw"));
+        manager.add_acl_rule(AclRule {
+            ip_range: "0.0.0.0/0".to_string(),
+            action: AclAction::Deny,
+            priority: 1,
+        });
+
+        let mut api_keys = std::collections::HashMap::new();
+        api_keys.insert("k1".to_string(), "u1".to_string());
+        manager.load_from_config(
+            // Users are merged (insert/overwrite), not cleared
+            vec![
+                make_fixed_user("stale", "newpw"),
+                make_fixed_user("fresh", "pw"),
+            ],
+            api_keys,
+            // ACL rules are fully replaced
+            vec![AclRule {
+                ip_range: "192.168.0.0/16".to_string(),
+                action: AclAction::Allow,
+                priority: 1,
+            }],
+        );
+
+        // Existing user was overwritten (new password wins)
+        assert!(manager.authenticate("stale", "newpw").is_some());
+        assert!(manager.authenticate("stale", "pw").is_none());
+        // New user added
+        assert!(manager.authenticate("fresh", "pw").is_some());
+        // API key loaded (replaces previous map)
+        assert_eq!(manager.authenticate_api_key("k1"), Some("u1".to_string()));
+        // ACL replaced: old deny-all gone, only the new rule remains
+        let rules = manager.list_acl_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].ip_range, "192.168.0.0/16");
+        assert_eq!(rules[0].action, AclAction::Allow);
+    }
 }
