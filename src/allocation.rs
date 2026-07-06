@@ -507,6 +507,20 @@ impl AllocationTable {
         self.stats.clone()
     }
 
+    /// Compute the effective allocation lifetime. When
+    /// `max_allocation_duration_secs` is configured, it ALWAYS overrides the
+    /// client's requested value — every allocation is forced to live exactly
+    /// that long, keeping allocation/channel-binding lifetimes in sync. When
+    /// unset, the client's request is honoured (defaulting to 600s). A
+    /// requested lifetime of 0 always means "delete" and is respected.
+    pub fn effective_allocation_lifetime(&self, requested: Option<u32>) -> u32 {
+        if requested == Some(0) {
+            return 0;
+        }
+        self.max_allocation_duration_secs
+            .unwrap_or_else(|| requested.unwrap_or(600))
+    }
+
     pub async fn create_allocation(
         &self,
         client_addr: SocketAddr,
@@ -526,12 +540,7 @@ impl AllocationTable {
             }
         }
 
-        let mut lifetime_secs = requested_lifetime.unwrap_or(600);
-        if let Some(max_lifetime) = self.max_allocation_duration_secs
-            && lifetime_secs > max_lifetime
-        {
-            lifetime_secs = max_lifetime;
-        }
+        let lifetime_secs = self.effective_allocation_lifetime(requested_lifetime);
         let lifetime = Duration::from_secs(lifetime_secs as u64);
 
         // Fast port allocation - O(1)
@@ -697,7 +706,8 @@ impl AllocationTable {
         let allocations = self.allocations.read();
         if let Some(allocation) = allocations.get(relayed_addr) {
             let mut alloc = allocation.write();
-            alloc.lifetime = Duration::from_secs(lifetime as u64);
+            let effective = self.effective_allocation_lifetime(Some(lifetime));
+            alloc.lifetime = Duration::from_secs(effective as u64);
             alloc.refreshed_at = Instant::now();
             Ok(())
         } else {
@@ -1235,6 +1245,7 @@ async fn spawn_allocation_task(
 pub struct ChannelTable {
     channels: Arc<RwLock<HashMap<(SocketAddr, u16), ChannelBinding>>>,
     next_channel: Arc<std::sync::atomic::AtomicU16>,
+    default_lifetime: Duration,
 }
 
 #[derive(Clone)]
@@ -1265,6 +1276,19 @@ impl ChannelTable {
         ChannelTable {
             channels: Arc::new(RwLock::new(HashMap::new())),
             next_channel: Arc::new(std::sync::atomic::AtomicU16::new(0x4000)),
+            default_lifetime: Duration::from_secs(600),
+        }
+    }
+
+    /// Build a ChannelTable whose bindings use `default_lifetime` instead of
+    /// the RFC 5766 default of 600s. This is used to align the channel binding
+    /// lifetime with the server's max allocation duration so channels do not
+    /// expire before their owning allocation.
+    pub fn with_lifetime(default_lifetime: Duration) -> Self {
+        ChannelTable {
+            channels: Arc::new(RwLock::new(HashMap::new())),
+            next_channel: Arc::new(std::sync::atomic::AtomicU16::new(0x4000)),
+            default_lifetime,
         }
     }
 
@@ -1290,7 +1314,7 @@ impl ChannelTable {
                 peer_addr,
                 relayed_addr,
                 created_at: Instant::now(),
-                lifetime: Duration::from_secs(600),
+                lifetime: self.default_lifetime,
             },
         );
         Ok(())

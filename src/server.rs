@@ -68,6 +68,9 @@ pub struct TurnServer {
     pub relay_addr: Ipv4Addr,
     pub relay_bind_addr: Ipv4Addr,
     pub realm: String,
+    /// Maximum allocation duration in seconds. Also drives the channel binding
+    /// lifetime so relay channels do not expire before their allocation.
+    pub max_allocation_duration_secs: Option<u32>,
     nonce_map: Arc<RwLock<HashMap<String, NonceEntry>>>,
     password: String,
     auth_disabled: bool,
@@ -79,6 +82,12 @@ pub struct TurnServer {
 
 struct NonceEntry {
     created_at: std::time::Instant,
+}
+
+/// Compute the channel binding lifetime from the server's max allocation
+/// duration. When unset, fall back to the RFC 5766 default of 600s.
+fn channel_binding_lifetime(max_allocation_duration_secs: Option<u32>) -> std::time::Duration {
+    std::time::Duration::from_secs(max_allocation_duration_secs.unwrap_or(600) as u64)
 }
 
 impl TurnServer {
@@ -149,6 +158,7 @@ impl TurnServer {
             relay_addr,
             relay_bind_addr,
             realm,
+            max_allocation_duration_secs: None,
             nonce_map: Arc::new(RwLock::new(HashMap::new())),
             password,
             auth_disabled: false,
@@ -211,10 +221,13 @@ impl TurnServer {
                 max_allocation_duration_secs,
                 max_bandwidth_bytes_per_sec,
             )),
-            channel_table: Arc::new(TokioRwLock::new(ChannelTable::new())),
+            channel_table: Arc::new(TokioRwLock::new(ChannelTable::with_lifetime(
+                channel_binding_lifetime(max_allocation_duration_secs),
+            ))),
             relay_addr,
             relay_bind_addr,
             realm,
+            max_allocation_duration_secs,
             nonce_map: Arc::new(RwLock::new(HashMap::new())),
             password,
             auth_disabled,
@@ -249,6 +262,7 @@ impl TurnServer {
             relay_addr,
             relay_bind_addr: relay_addr,
             realm,
+            max_allocation_duration_secs: None,
             nonce_map: Arc::new(RwLock::new(HashMap::new())),
             password: String::new(),
             auth_disabled: true,
@@ -298,10 +312,13 @@ impl TurnServer {
                 max_allocation_duration_secs,
                 max_bandwidth_bytes_per_sec,
             )),
-            channel_table: Arc::new(TokioRwLock::new(ChannelTable::new())),
+            channel_table: Arc::new(TokioRwLock::new(ChannelTable::with_lifetime(
+                channel_binding_lifetime(max_allocation_duration_secs),
+            ))),
             relay_addr,
             relay_bind_addr: relay_addr,
             realm,
+            max_allocation_duration_secs,
             nonce_map: Arc::new(RwLock::new(HashMap::new())),
             password,
             auth_disabled,
@@ -1173,6 +1190,9 @@ async fn handle_allocate(
     };
 
     let relayed_addr = allocation.read().relayed_addr;
+    let granted_lifetime = server
+        .allocation_table
+        .effective_allocation_lifetime(Some(lifetime));
     let magic = 0x2112A442;
 
     let mut response = Message {
@@ -1196,7 +1216,7 @@ async fn handle_allocate(
     });
     response.attributes.push(Attribute {
         attr_type: Attribute::LIFETIME,
-        value: Bytes::from(lifetime.to_be_bytes().to_vec()),
+        value: Bytes::from(granted_lifetime.to_be_bytes().to_vec()),
     });
     response.attributes.push(Attribute {
         attr_type: Attribute::REALM,
@@ -1224,7 +1244,8 @@ async fn handle_allocate(
         %client_addr,
         %username,
         relayed_addr = %relayed_addr,
-        lifetime,
+        requested_lifetime = lifetime,
+        granted_lifetime,
         "TURN Allocate request succeeded"
     );
 
@@ -1298,15 +1319,21 @@ async fn handle_refresh(
             tracing::info!(
                 %client_addr,
                 relayed = %relayed,
-                lifetime,
+                requested_lifetime = lifetime,
+                granted_lifetime = server
+                    .allocation_table
+                    .effective_allocation_lifetime(Some(lifetime)),
                 "TURN Refresh succeeded"
             );
         }
         // Return Refresh Success with LIFETIME
+        let granted_lifetime = server
+            .allocation_table
+            .effective_allocation_lifetime(Some(lifetime));
         let mut response = crate::message::create_success_response(&msg.header);
         response.attributes.push(Attribute {
             attr_type: Attribute::LIFETIME,
-            value: Bytes::from(lifetime.to_be_bytes().to_vec()),
+            value: Bytes::from(granted_lifetime.to_be_bytes().to_vec()),
         });
         if !server.auth_disabled {
             if let Some(password) = server.get_password_for_user(&username) {
