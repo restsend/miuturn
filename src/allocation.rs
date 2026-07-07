@@ -36,7 +36,7 @@ fn port_rand() -> u64 {
 }
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Message types for allocation task communication
 #[derive(Debug)]
@@ -48,7 +48,9 @@ pub enum AllocationMessage {
     /// Update the client address (for NAT rebind detection)
     UpdateClientAddr { client_addr: SocketAddr },
     /// Set a channel to forward peer→client data (TCP fallback)
-    SetClientTx { tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>> },
+    SetClientTx {
+        tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    },
     /// Shut down the allocation task
     Shutdown,
 }
@@ -507,18 +509,26 @@ impl AllocationTable {
         self.stats.clone()
     }
 
-    /// Compute the effective allocation lifetime. When
-    /// `max_allocation_duration_secs` is configured, it ALWAYS overrides the
-    /// client's requested value — every allocation is forced to live exactly
-    /// that long, keeping allocation/channel-binding lifetimes in sync. When
-    /// unset, the client's request is honoured (defaulting to 600s). A
-    /// requested lifetime of 0 always means "delete" and is respected.
+    /// Compute the effective allocation lifetime per RFC 5766 §2.7/§6.
+    ///
+    /// The client's requested LIFETIME is honoured; the server only clamps it
+    /// down to `max_allocation_duration_secs` when the request exceeds the
+    /// configured maximum (and never raises a short request up to the max). A
+    /// missing request defaults to 600s. A requested lifetime of 0 always means
+    /// "delete immediately" and is respected.
+    ///
+    /// Channel bindings are created with the server's maximum duration (see
+    /// `ChannelTable::with_lifetime`) so they never expire before their owning
+    /// allocation, regardless of the granted allocation lifetime.
     pub fn effective_allocation_lifetime(&self, requested: Option<u32>) -> u32 {
         if requested == Some(0) {
             return 0;
         }
-        self.max_allocation_duration_secs
-            .unwrap_or_else(|| requested.unwrap_or(600))
+        let lifetime = requested.unwrap_or(600);
+        match self.max_allocation_duration_secs {
+            Some(max) if lifetime > max => max,
+            _ => lifetime,
+        }
     }
 
     pub async fn create_allocation(
@@ -752,7 +762,7 @@ impl AllocationTable {
                     a.permissions.insert(peer.ip());
                 }
                 let after = a.permissions.len();
-                debug!(
+                info!(
                     %client_addr,
                     relayed_addr = %a.relayed_addr,
                     permission_before = before,
@@ -1662,6 +1672,42 @@ mod tests {
     }
 
     #[test]
+    fn test_effective_allocation_lifetime_rfc_clamping() {
+        let (min_port, max_port) = alloc_test_port_range();
+
+        // No max configured: client request is honoured, defaulting to 600s.
+        let table = AllocationTable::with_port_range(
+            Ipv4Addr::new(127, 0, 0, 1),
+            "test".to_string(),
+            min_port,
+            max_port,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(table.effective_allocation_lifetime(Some(60)), 60);
+        assert_eq!(table.effective_allocation_lifetime(None), 600);
+        assert_eq!(table.effective_allocation_lifetime(Some(0)), 0);
+
+        // Max configured: requests below max are honoured, above max are clamped
+        // (never raised up to max). 0 still means delete.
+        let table = AllocationTable::with_port_range(
+            Ipv4Addr::new(127, 0, 0, 1),
+            "test".to_string(),
+            min_port,
+            max_port,
+            None,
+            Some(600),
+            None,
+        );
+        assert_eq!(table.effective_allocation_lifetime(Some(60)), 60);
+        assert_eq!(table.effective_allocation_lifetime(None), 600);
+        assert_eq!(table.effective_allocation_lifetime(Some(600)), 600);
+        assert_eq!(table.effective_allocation_lifetime(Some(3600)), 600);
+        assert_eq!(table.effective_allocation_lifetime(Some(0)), 0);
+    }
+
+    #[test]
     fn test_channel_binding() {
         let table = ChannelTable::new();
         let client: SocketAddr = "192.168.1.1:12345".parse().unwrap();
@@ -2077,7 +2123,10 @@ mod tests {
 
         // Wait 1 second (allocation should still be alive)
         tokio::time::sleep(Duration::from_secs(1)).await;
-        assert!(!alloc.read().is_expired(), "allocation should be alive 1s into a 2s lifetime");
+        assert!(
+            !alloc.read().is_expired(),
+            "allocation should be alive 1s into a 2s lifetime"
+        );
 
         // Refresh with lifetime=2 (extend another 2 seconds from now)
         table.refresh_allocation(&relayed, 2).unwrap();
@@ -2161,10 +2210,7 @@ mod tests {
         peer.send_to(b"hello", &relayed_addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let stats_before = table
-            .stats()
-            .total_bytes_relayed
-            .load(Ordering::Relaxed);
+        let stats_before = table.stats().total_bytes_relayed.load(Ordering::Relaxed);
         assert!(
             stats_before >= 5,
             "relay task should process peer data, got {} bytes",
@@ -2190,10 +2236,7 @@ mod tests {
         peer.send_to(b"world", &relayed_addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let stats_after = table
-            .stats()
-            .total_bytes_relayed
-            .load(Ordering::Relaxed);
+        let stats_after = table.stats().total_bytes_relayed.load(Ordering::Relaxed);
 
         assert!(
             stats_after > stats_before,

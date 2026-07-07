@@ -491,7 +491,7 @@ impl TurnServer {
                 drop(nonce_map);
 
                 if removed_count > 0 {
-                    tracing::debug!("Cleaned up {} expired nonces", removed_count);
+                    tracing::info!("Cleaned up {} expired nonces", removed_count);
                 }
             }
         });
@@ -557,10 +557,14 @@ impl TurnServer {
                         Ok(0) => break,
                         Ok(_) => {
                             loop {
-                                if buf.len() < 2 { break; }
+                                if buf.len() < 2 {
+                                    break;
+                                }
                                 let msg_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
                                 let total = 2 + msg_len;
-                                if buf.len() < total { break; }
+                                if buf.len() < total {
+                                    break;
+                                }
 
                                 let msg_bytes = buf.split_to(total).freeze();
                                 let msg_data = msg_bytes.slice(2..);
@@ -570,7 +574,10 @@ impl TurnServer {
                                 {
                                     let rlen = response.len();
                                     if rlen > 65535 {
-                                        error!("TCP response too large ({} B) from {}", rlen, peer_addr);
+                                        error!(
+                                            "TCP response too large ({} B) from {}",
+                                            rlen, peer_addr
+                                        );
                                         break;
                                     }
                                     let mut frame = Vec::with_capacity(2 + rlen);
@@ -583,8 +590,13 @@ impl TurnServer {
                                 }
 
                                 // Wire relay task's peer→client data through TCP
-                                if let Some(relayed) = server.allocation_table.find_allocation_by_client(&peer_addr) {
-                                    if let Some(alloc) = server.allocation_table.get_allocation(&relayed) {
+                                if let Some(relayed) = server
+                                    .allocation_table
+                                    .find_allocation_by_client(&peer_addr)
+                                {
+                                    if let Some(alloc) =
+                                        server.allocation_table.get_allocation(&relayed)
+                                    {
                                         if let Some(ref relay) = alloc.read().relay {
                                             let _ = relay.tx.try_send(
                                                 crate::allocation::AllocationMessage::SetClientTx {
@@ -701,49 +713,49 @@ async fn handle_tcp_message(
     // Handle ChannelData (RFC 5766 §11.4)
     if data.len() >= 4 {
         let channel_num = (data[0] as u16) << 8 | (data[1] as u16);
-                    if (0x4000..=0x7FFF).contains(&channel_num) {
-                        let declared_len = u16::from_be_bytes([data[2], data[3]]) as usize;
-                        // Validate the declared length matches actual payload (RFC 5766 §11.4)
-                        if 4 + declared_len != data.len() {
-                            warn!(
-                                "TCP ChannelData length mismatch from {}: declared={} actual={}",
-                                peer_addr,
-                                declared_len,
-                                data.len().saturating_sub(4)
-                            );
-                            return None;
-                        }
-                        let payload = data.slice(4..);
+        if (0x4000..=0x7FFF).contains(&channel_num) {
+            let declared_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+            // Validate the declared length matches actual payload (RFC 5766 §11.4)
+            if 4 + declared_len != data.len() {
+                warn!(
+                    "TCP ChannelData length mismatch from {}: declared={} actual={}",
+                    peer_addr,
+                    declared_len,
+                    data.len().saturating_sub(4)
+                );
+                return None;
+            }
+            let payload = data.slice(4..);
 
-                        let allocation = server.allocation_table.get_allocation_by_client(&peer_addr);
-                        let relayed_addr = allocation.as_ref().map(|alloc| alloc.read().relayed_addr);
-                        let channel_binding = if let Some(relayed_addr) = relayed_addr {
-                            server
-                                .channel_table
-                                .read()
-                                .await
-                                .get_by_channel(relayed_addr, channel_num)
-                        } else {
-                            None
-                        };
+            let allocation = server.allocation_table.get_allocation_by_client(&peer_addr);
+            let relayed_addr = allocation.as_ref().map(|alloc| alloc.read().relayed_addr);
+            let channel_binding = if let Some(relayed_addr) = relayed_addr {
+                server
+                    .channel_table
+                    .read()
+                    .await
+                    .get_by_channel(relayed_addr, channel_num)
+            } else {
+                None
+            };
 
-                        if let Some(channel) = channel_binding {
-                            let relay_socket = allocation.as_ref().and_then(|alloc| {
-                                let a = alloc.read();
-                                a.relay.as_ref().map(|r| r.socket.clone())
-                            });
+            if let Some(channel) = channel_binding {
+                let relay_socket = allocation.as_ref().and_then(|alloc| {
+                    let a = alloc.read();
+                    a.relay.as_ref().map(|r| r.socket.clone())
+                });
 
-                            if let Some(relay_sock) = relay_socket {
-                                if let Err(e) = relay_sock.send_to(&payload, &channel.peer_addr).await {
-                                    warn!(
-                                        "TCP ChannelData send to peer {} failed: {}",
-                                        channel.peer_addr, e
-                                    );
-                                }
-                            }
-                        }
-                        return None;
+                if let Some(relay_sock) = relay_socket {
+                    if let Err(e) = relay_sock.send_to(&payload, &channel.peer_addr).await {
+                        warn!(
+                            "TCP ChannelData send to peer {} failed: {}",
+                            channel.peer_addr, e
+                        );
                     }
+                }
+            }
+            return None;
+        }
     }
 
     if let Some(msg) = Message::parse(&data[..]) {
@@ -952,7 +964,10 @@ fn verify_message_integrity(msg: &Message, key: &[u8]) -> bool {
     buf.extend_from_slice(&attr_buf.freeze());
 
     if integrity_attr.value.len() < 20 {
-        debug!("MESSAGE-INTEGRITY value too short ({} bytes)", integrity_attr.value.len());
+        debug!(
+            "MESSAGE-INTEGRITY value too short ({} bytes)",
+            integrity_attr.value.len()
+        );
         return false;
     }
 
@@ -1309,11 +1324,12 @@ async fn handle_refresh(
             // Update client address in the relay task (handles NAT rebind)
             if let Some(alloc) = server.allocation_table.get_allocation(&relayed) {
                 if let Some(ref relay) = alloc.read().relay {
-                    let _ = relay
-                        .tx
-                        .try_send(crate::allocation::AllocationMessage::UpdateClientAddr {
-                            client_addr,
-                        });
+                    let _ =
+                        relay
+                            .tx
+                            .try_send(crate::allocation::AllocationMessage::UpdateClientAddr {
+                                client_addr,
+                            });
                 }
             }
             tracing::info!(
@@ -1428,11 +1444,11 @@ async fn handle_create_permission(
         ));
     }
 
-    debug!(
+    info!(
         %client_addr,
         %relayed_addr,
         peers = ?peers,
-        transaction_id = ?msg.header.transaction_id,
+        transaction_id = %hex::encode(msg.header.transaction_id),
         peer_count = peers.len(),
         "CreatePermission succeeded"
     );
@@ -1619,7 +1635,7 @@ fn create_401_response(
     debug!(
         %client_addr,
         method = ?msg.header.method,
-        transaction_id = ?msg.header.transaction_id,
+        transaction_id = %hex::encode(msg.header.transaction_id),
         nonce = %nonce,
         reason = ?reason,
         "Creating 401 Unauthorized response"
@@ -1681,7 +1697,10 @@ fn get_lifetime(msg: &Message) -> u32 {
             let mut buf = attr.value.clone();
             buf.get_u32()
         } else {
-            debug!("LIFETIME attribute too short ({} bytes), using default", attr.value.len());
+            debug!(
+                "LIFETIME attribute too short ({} bytes), using default",
+                attr.value.len()
+            );
             600
         }
     } else {
@@ -2391,7 +2410,13 @@ mod tests {
         // Step 3: After successful Allocate, nonce1's created_at should be recent
         // (the fix refreshes it on every successful auth)
         {
-            let nonce1_age = server.nonce_map.read().get(&nonce1).unwrap().created_at.elapsed();
+            let nonce1_age = server
+                .nonce_map
+                .read()
+                .get(&nonce1)
+                .unwrap()
+                .created_at
+                .elapsed();
             assert!(
                 nonce1_age.as_secs() < 5,
                 "nonce1 created_at should be refreshed to recent after successful Allocate, age={}s",
@@ -2460,7 +2485,13 @@ mod tests {
 
         // Step 7: Verify nonce2's created_at was refreshed by the fix
         {
-            let nonce2_age = server.nonce_map.read().get(&nonce2).unwrap().created_at.elapsed();
+            let nonce2_age = server
+                .nonce_map
+                .read()
+                .get(&nonce2)
+                .unwrap()
+                .created_at
+                .elapsed();
             assert!(
                 nonce2_age.as_secs() < 5,
                 "nonce2 created_at should be refreshed after successful Refresh, age={}s",
