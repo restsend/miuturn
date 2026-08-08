@@ -59,6 +59,16 @@ async fn turn_crate_e2e_send_1mb_with_rate_limit_and_loss_check() {
     let relay_conn_a = client_a.allocate().await.expect("allocate client_a");
     let relay_conn_b = client_b.allocate().await.expect("allocate client_b");
     let relay_b_addr = relay_conn_b.local_addr().expect("relay_b local addr");
+    let relay_a_addr = relay_conn_a.local_addr().expect("relay_a local addr");
+
+    // RFC 5766 §10 requires a permission towards the peer before the server
+    // relays peer→client traffic. client_b only receives in this test, so give
+    // it a permission by sending one small packet to relay_a_addr (the turn
+    // crate's send_to installs the permission automatically).
+    relay_conn_b
+        .send_to(b"init", relay_a_addr)
+        .await
+        .expect("install permission for client_b");
 
     let receiver = tokio::spawn(async move {
         let mut buf = vec![0u8; PACKET_SIZE + 64];
@@ -167,7 +177,9 @@ fn pick_free_udp_port() -> u16 {
 }
 
 async fn wait_server_ready(server_addr: SocketAddr) {
-    let probe_socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind probe socket");
+    let probe_socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind probe socket");
     let request: [u8; 20] = [
         0x00, 0x01, 0x00, 0x00, // Binding Request
         0x21, 0x12, 0xA4, 0x42, // Magic cookie
@@ -177,7 +189,9 @@ async fn wait_server_ready(server_addr: SocketAddr) {
     for _ in 0..20 {
         let _ = probe_socket.send_to(&request, server_addr).await;
         let mut buf = [0u8; 1500];
-        let recv = tokio::time::timeout(Duration::from_millis(100), probe_socket.recv_from(&mut buf)).await;
+        let recv =
+            tokio::time::timeout(Duration::from_millis(100), probe_socket.recv_from(&mut buf))
+                .await;
         if let Ok(Ok((n, _))) = recv
             && n >= 20
             && buf[4] == 0x21
@@ -190,7 +204,10 @@ async fn wait_server_ready(server_addr: SocketAddr) {
         sleep(Duration::from_millis(25)).await;
     }
 
-    panic!("server was not ready on {} within startup timeout", server_addr);
+    panic!(
+        "server was not ready on {} within startup timeout",
+        server_addr
+    );
 }
 
 /// Start a TurnServer with auth enabled.
@@ -715,7 +732,11 @@ async fn turn_full_data_relay_raw() {
 
     // Decode Allocate Success: 0x0103
     let resp_type = u16::from_be_bytes([buf[0], buf[1]]);
-    assert_eq!(resp_type, 0x0103, "expected Allocate Success (0x0103), got 0x{:04x}", resp_type);
+    assert_eq!(
+        resp_type, 0x0103,
+        "expected Allocate Success (0x0103), got 0x{:04x}",
+        resp_type
+    );
 
     // Parse XOR-RELAYED-ADDRESS (attr type 0x0016)
     let mut relay_addr: Option<SocketAddr> = None;
@@ -730,7 +751,11 @@ async fn turn_full_data_relay_raw() {
             let ip1 = buf[offset + 9] ^ 0x12;
             let ip2 = buf[offset + 10] ^ 0xA4;
             let ip3 = buf[offset + 11] ^ 0x42;
-            relay_addr = Some(format!("{}.{}.{}.{}:{}", ip0, ip1, ip2, ip3, port).parse().unwrap());
+            relay_addr = Some(
+                format!("{}.{}.{}.{}:{}", ip0, ip1, ip2, ip3, port)
+                    .parse()
+                    .unwrap(),
+            );
             break;
         }
         offset += 4 + a_len;
@@ -743,7 +768,11 @@ async fn turn_full_data_relay_raw() {
     // CreatePermission: method=0x008, class=Request(0) → encoded 0x0008
     let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let peer_addr = peer_socket.local_addr().unwrap();
-    let peer_ip = peer_addr.ip().to_string().parse::<std::net::Ipv4Addr>().unwrap();
+    let peer_ip = peer_addr
+        .ip()
+        .to_string()
+        .parse::<std::net::Ipv4Addr>()
+        .unwrap();
 
     let xor_peer_port = (peer_addr.port() ^ 0x2112).to_be_bytes();
     let xor_peer_ip = [
@@ -788,7 +817,11 @@ async fn turn_full_data_relay_raw() {
 
     // CreatePermission Success: method=0x008, class=Success(2) → 0x0108
     let perm_type = u16::from_be_bytes([buf2[0], buf2[1]]);
-    assert_eq!(perm_type, 0x0108, "expected CreatePermission Success (0x0108), got 0x{:04x}", perm_type);
+    assert_eq!(
+        perm_type, 0x0108,
+        "expected CreatePermission Success (0x0108), got 0x{:04x}",
+        perm_type
+    );
     eprintln!("[TEST] CreatePermission OK");
 
     // === Step 3: ChannelBind (raw) ===
@@ -829,7 +862,11 @@ async fn turn_full_data_relay_raw() {
 
     // ChannelBind Success: method=0x009, class=Success(2) → 0x0109
     let bind_type = u16::from_be_bytes([buf3[0], buf3[1]]);
-    assert_eq!(bind_type, 0x0109, "expected ChannelBind Success (0x0109), got 0x{:04x}", bind_type);
+    assert_eq!(
+        bind_type, 0x0109,
+        "expected ChannelBind Success (0x0109), got 0x{:04x}",
+        bind_type
+    );
     eprintln!("[TEST] ChannelBind OK, channel=0x{:04x}", channel_num);
 
     // === Step 4: Send ChannelData ===
@@ -853,7 +890,11 @@ async fn turn_full_data_relay_raw() {
 
     eprintln!("[TEST] Peer received {} bytes from {}", peer_len, peer_from);
     assert_eq!(&peer_buf[..peer_len], test_data, "data content mismatch");
-    assert_eq!(peer_from, relay_addr, "data should come from relay addr {}, got {}", relay_addr, peer_from);
+    assert_eq!(
+        peer_from, relay_addr,
+        "data should come from relay addr {}, got {}",
+        relay_addr, peer_from
+    );
     eprintln!("[TEST] Full TURN data relay verified!");
 }
 
@@ -892,7 +933,11 @@ async fn turn_peer_to_client_is_data_indication() {
             let ip1 = buf[offset + 9] ^ 0x12;
             let ip2 = buf[offset + 10] ^ 0xA4;
             let ip3 = buf[offset + 11] ^ 0x42;
-            relay_addr = Some(format!("{}.{}.{}.{}:{}", ip0, ip1, ip2, ip3, port).parse().unwrap());
+            relay_addr = Some(
+                format!("{}.{}.{}.{}:{}", ip0, ip1, ip2, ip3, port)
+                    .parse()
+                    .unwrap(),
+            );
             break;
         }
         offset += 4 + a_len;
@@ -900,8 +945,48 @@ async fn turn_peer_to_client_is_data_indication() {
     }
     let relay_addr = relay_addr.expect("no XOR-RELAYED-ADDRESS");
 
+    // RFC 5766 §10: the server must drop peer→client traffic unless a
+    // permission for the peer exists. Install one via a raw CreatePermission
+    // request (method 0x0008) for the peer's IP before relaying.
     let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let peer_addr = peer_socket.local_addr().unwrap();
+
+    let mut create_perm = Vec::new();
+    create_perm.extend_from_slice(&[0x00, 0x08]); // CreatePermission Request
+    create_perm.extend_from_slice(&[0x00, 0x0C]); // message length (12: 1 attr)
+    create_perm.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+    create_perm.extend_from_slice(&[0x22; 12]); // transaction id
+    create_perm.extend_from_slice(&[0x00, 0x12, 0x00, 0x08]); // XOR-PEER-ADDRESS
+    create_perm.extend_from_slice(&[0x00, 0x01]); // family = IPv4
+    let xport = peer_addr.port() ^ 0x2112;
+    create_perm.extend_from_slice(&xport.to_be_bytes());
+    let octets = match peer_addr.ip() {
+        std::net::IpAddr::V4(v4) => v4.octets(),
+        std::net::IpAddr::V6(v6) => {
+            let o = v6.octets();
+            [o[0], o[1], o[2], o[3]]
+        }
+    };
+    create_perm.extend_from_slice(&[
+        octets[0] ^ 0x21,
+        octets[1] ^ 0x12,
+        octets[2] ^ 0xA4,
+        octets[3] ^ 0x42,
+    ]);
+    conn.send_to(&create_perm, server_addr).await.unwrap();
+
+    let mut perm_buf = [0u8; 1500];
+    let (perm_len, _) = tokio::select! {
+        r = conn.recv_from(&mut perm_buf) => r.unwrap(),
+        _ = sleep(Duration::from_secs(2)) => panic!("timeout on CreatePermission"),
+    };
+    assert_eq!(
+        u16::from_be_bytes([perm_buf[0], perm_buf[1]]),
+        0x0108,
+        "expected CreatePermission Success (0x0108), got raw {:?}",
+        &perm_buf[..perm_len.min(24)]
+    );
+
     let payload = b"peer-to-client-via-turn";
     peer_socket.send_to(payload, relay_addr).await.unwrap();
 
@@ -911,9 +996,13 @@ async fn turn_peer_to_client_is_data_indication() {
         _ = sleep(Duration::from_secs(2)) => panic!("timeout waiting for Data Indication"),
     };
 
-    let msg = miuturn::message::Message::parse(&recv[..recv_len]).expect("expected STUN Data Indication");
+    let msg =
+        miuturn::message::Message::parse(&recv[..recv_len]).expect("expected STUN Data Indication");
     assert_eq!(msg.header.method, miuturn::message::Method::Data);
-    assert_eq!(msg.header.event_type, miuturn::message::EventType::Indication);
+    assert_eq!(
+        msg.header.event_type,
+        miuturn::message::EventType::Indication
+    );
 
     let peer_attr = msg
         .get_attribute(miuturn::message::Attribute::PEER_ADDRESS)

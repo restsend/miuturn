@@ -179,7 +179,7 @@ impl std::fmt::Debug for UserBandwidthTracker {
 /// Per-allocation bandwidth tracking
 pub struct AllocationBandwidthTracker {
     /// Relayed address
-    relayed_addr: String,
+    relayed_addr: std::net::SocketAddr,
     /// Bandwidth limiter
     limiter: Arc<BandwidthLimiter>,
     /// Allocation's bandwidth limit
@@ -193,14 +193,14 @@ impl AllocationBandwidthTracker {
         let burst = rate.saturating_mul(10); // 10 second burst
         let limiter = Arc::new(BandwidthLimiter::new(rate, burst));
         Self {
-            relayed_addr: String::new(),
+            relayed_addr: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
             limiter,
             limit_bytes_per_sec,
         }
     }
 
-    pub fn with_relayed_addr(mut self, addr: &str) -> Self {
-        self.relayed_addr = addr.to_string();
+    pub fn with_relayed_addr(mut self, addr: std::net::SocketAddr) -> Self {
+        self.relayed_addr = addr;
         self
     }
 
@@ -216,8 +216,8 @@ impl AllocationBandwidthTracker {
         self.limit_bytes_per_sec
     }
 
-    pub fn relayed_addr(&self) -> &str {
-        &self.relayed_addr
+    pub fn relayed_addr(&self) -> std::net::SocketAddr {
+        self.relayed_addr
     }
 }
 
@@ -233,8 +233,9 @@ impl std::fmt::Debug for AllocationBandwidthTracker {
 /// Global bandwidth manager for tracking all allocations
 pub struct BandwidthManager {
     /// Per-allocation trackers
-    trackers:
-        parking_lot::RwLock<std::collections::HashMap<String, Arc<AllocationBandwidthTracker>>>,
+    trackers: parking_lot::RwLock<
+        std::collections::HashMap<std::net::SocketAddr, Arc<AllocationBandwidthTracker>>,
+    >,
     /// Global bandwidth limiter
     global_limiter: Arc<BandwidthLimiter>,
     /// Total bytes relayed
@@ -258,23 +259,25 @@ impl BandwidthManager {
     }
 
     /// Register a new allocation with bandwidth tracking
-    pub fn register_allocation(&self, relayed_addr: &str, limit_bytes_per_sec: Option<u64>) {
+    pub fn register_allocation(
+        &self,
+        relayed_addr: std::net::SocketAddr,
+        limit_bytes_per_sec: Option<u64>,
+    ) {
         let tracker = Arc::new(
             AllocationBandwidthTracker::new(limit_bytes_per_sec).with_relayed_addr(relayed_addr),
         );
-        self.trackers
-            .write()
-            .insert(relayed_addr.to_string(), tracker);
+        self.trackers.write().insert(relayed_addr, tracker);
     }
 
     /// Unregister an allocation
-    pub fn unregister_allocation(&self, relayed_addr: &str) {
+    pub fn unregister_allocation(&self, relayed_addr: &std::net::SocketAddr) {
         self.trackers.write().remove(relayed_addr);
     }
 
     /// Try to relay data through an allocation
     /// Returns true if allowed, false if bandwidth limit exceeded
-    pub fn try_relay(&self, relayed_addr: &str, size: usize) -> bool {
+    pub fn try_relay(&self, relayed_addr: &std::net::SocketAddr, size: usize) -> bool {
         // Check global limit first
         if self.global_limit.is_some() && self.global_limiter.try_consume(size).is_none() {
             return false;
@@ -422,8 +425,8 @@ mod tests {
     #[test]
     fn test_allocation_bandwidth_tracker() {
         // Create tracker with rate=100, burst=100 (1 second burst)
-        let tracker =
-            AllocationBandwidthTracker::new(Some(100)).with_relayed_addr("10.0.0.1:49152");
+        let tracker = AllocationBandwidthTracker::new(Some(100))
+            .with_relayed_addr("10.0.0.1:49152".parse().unwrap());
 
         // Burst is 1000 (rate * 10), so 500 + 500 = 1000 works
         assert!(tracker.try_relay(500).is_some());
@@ -439,17 +442,19 @@ mod tests {
         let manager = BandwidthManager::new(Some(10000));
 
         // Each allocation has 5KB limit, 50KB burst
-        manager.register_allocation("10.0.0.1:49152", Some(5000));
-        manager.register_allocation("10.0.0.1:49153", Some(5000));
+        let a1: std::net::SocketAddr = "10.0.0.1:49152".parse().unwrap();
+        let a2: std::net::SocketAddr = "10.0.0.1:49153".parse().unwrap();
+        manager.register_allocation(a1, Some(5000));
+        manager.register_allocation(a2, Some(5000));
 
         // Exhaust global burst (100KB) - consume 100KB total
         // First allocation: 50KB
-        assert!(manager.try_relay("10.0.0.1:49152", 50000));
+        assert!(manager.try_relay(&a1, 50000));
         // Second allocation: 50KB
-        assert!(manager.try_relay("10.0.0.1:49153", 50000));
+        assert!(manager.try_relay(&a2, 50000));
 
         // Burst exhausted, should fail
-        assert!(!manager.try_relay("10.0.0.1:49152", 100));
+        assert!(!manager.try_relay(&a1, 100));
 
         assert_eq!(manager.tracked_count(), 2);
         assert_eq!(manager.total_bytes_relayed(), 100000);
@@ -459,10 +464,11 @@ mod tests {
     fn test_bandwidth_manager_unregister() {
         let manager = BandwidthManager::new(Some(10000));
 
-        manager.register_allocation("10.0.0.1:49152", Some(5000));
+        let a1: std::net::SocketAddr = "10.0.0.1:49152".parse().unwrap();
+        manager.register_allocation(a1, Some(5000));
         assert_eq!(manager.tracked_count(), 1);
 
-        manager.unregister_allocation("10.0.0.1:49152");
+        manager.unregister_allocation(&a1);
         assert_eq!(manager.tracked_count(), 0);
     }
 
@@ -471,8 +477,9 @@ mod tests {
         let manager = BandwidthManager::new(Some(10000));
 
         // No tracker registered - should be unlimited
-        assert!(manager.try_relay("10.0.0.1:49152", 10000));
-        assert!(manager.try_relay("10.0.0.1:49152", 10000));
+        let a1: std::net::SocketAddr = "10.0.0.1:49152".parse().unwrap();
+        assert!(manager.try_relay(&a1, 10000));
+        assert!(manager.try_relay(&a1, 10000));
     }
 
     #[test]
@@ -481,14 +488,15 @@ mod tests {
         let manager = BandwidthManager::new(Some(5000));
 
         // Register without specific limit
-        manager.register_allocation("10.0.0.1:49152", None);
+        let a1: std::net::SocketAddr = "10.0.0.1:49152".parse().unwrap();
+        manager.register_allocation(a1, None);
 
         // Should be limited by global burst (50KB)
         // Consume 50KB to exhaust burst
-        assert!(manager.try_relay("10.0.0.1:49152", 50000));
+        assert!(manager.try_relay(&a1, 50000));
 
         // Burst exhausted, should fail
-        assert!(!manager.try_relay("10.0.0.1:49152", 100));
+        assert!(!manager.try_relay(&a1, 100));
     }
 
     #[test]

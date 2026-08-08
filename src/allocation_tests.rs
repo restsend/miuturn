@@ -1,135 +1,137 @@
-    /// Unit tests for critical relay data paths.
-    ///
-    /// These tests validate the core TURN relay functionality:
-    /// - send_to_peer (permission-checked relay)
-    /// - Permission management
-    /// - Channel binding lookup
-    /// - TOCTOU race conditions
-    /// - Silent data-loss paths (bug verification)
-    #[cfg(test)]
-    mod relay_data_path_tests {
-        use crate::allocation::*;
-        use std::net::{Ipv4Addr, SocketAddr};
-        use std::sync::atomic::Ordering;
-        use std::sync::Arc;
-        use std::time::Duration;
-        use tokio::net::UdpSocket;
 
-        // =========================================================================
-        // Source-level bug verification (compile-time checks)
-        // =========================================================================
+/// Unit tests for critical relay data paths.
+///
+/// These tests validate the core TURN relay functionality:
+/// - send_to_peer (permission-checked relay)
+/// - Permission management
+/// - Channel binding lookup
+/// - TOCTOU race conditions
+/// - Silent data-loss paths (bug verification)
+#[cfg(test)]
+mod relay_data_path_tests {
+    use crate::allocation::*;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use tokio::net::UdpSocket;
 
-        /// Verify the `let _ =` silent data-loss pattern has been REMOVED from
-        /// server.rs (both UDP and TCP ChannelData paths). All ChannelData send
-        /// failures are now logged with `warn!`.
-        #[test]
-        fn test_bug_let_underscore_channeldata_send_to_removed() {
-            let crate_root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
-            let server_rs = std::path::Path::new(&crate_root).join("src/server.rs");
-            let source = std::fs::read_to_string(&server_rs)
-                .unwrap_or_else(|_| panic!("cannot read {}", server_rs.display()));
+    // =========================================================================
+    // Source-level bug verification (compile-time checks)
+    // =========================================================================
 
-            // The `let _ =` pattern should NOT exist anymore
-            assert!(
-                !source.contains("let _ = relay_sock.send_to(&payload, &channel.peer_addr).await;"),
-                "FIX CONFIRMED: `let _ =` pattern for ChannelData send failure removed from server.rs"
-            );
+    /// Verify the `let _ =` silent data-loss pattern has been REMOVED from
+    /// server.rs (both UDP and TCP ChannelData paths). All ChannelData send
+    /// failures are now logged with `warn!`.
+    #[test]
+    fn test_bug_let_underscore_channeldata_send_to_removed() {
+        let crate_root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
+        let server_rs = std::path::Path::new(&crate_root).join("src/server.rs");
+        let source = std::fs::read_to_string(&server_rs)
+            .unwrap_or_else(|_| panic!("cannot read {}", server_rs.display()));
 
-            // All ChannelData paths should now use `if let Err(e) = ...` with `warn!`
-            assert!(
-                source.contains("if let Err(e) = relay_sock.send_to(&payload, &channel.peer_addr).await"),
-                "ChannelData send failures should be handled with if let Err"
-            );
-            assert!(
-                source.contains("\"UDP ChannelData send to peer {} failed: {}\""),
-                "UDP ChannelData send failure should be logged with warn!"
-            );
-            assert!(
-                source.contains("\"TCP ChannelData send to peer {} failed: {}\""),
-                "TCP ChannelData send failure should be logged with warn!"
-            );
-        }
+        // The `let _ =` pattern should NOT exist anymore
+        assert!(
+            !source.contains("let _ = relay_sock.send_to(&payload, &channel.peer_addr).await;"),
+            "FIX CONFIRMED: `let _ =` pattern for ChannelData send failure removed from server.rs"
+        );
 
-        /// Verify that `bandwidth_manager.try_relay` is never called in the data
-        /// forwarding paths (server.rs and allocation.rs). The BandwidthManager
-        /// is registered but the enforcement method is dead code in the relay path.
-        #[test]
-        fn test_bug_bandwidth_manager_try_relay_not_called_in_data_path() {
-            let crate_root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
+        // All ChannelData paths should now use `if let Err(e) = ...` with `warn!`
+        assert!(
+            source
+                .contains("if let Err(e) = relay_sock.send_to(&payload, &channel.peer_addr).await"),
+            "ChannelData send failures should be handled with if let Err"
+        );
+        assert!(
+            source.contains("\"UDP ChannelData send to peer {} failed: {}\""),
+            "UDP ChannelData send failure should be logged with warn!"
+        );
+        assert!(
+            source.contains("\"TCP ChannelData send to peer {} failed: {}\""),
+            "TCP ChannelData send failure should be logged with warn!"
+        );
+    }
 
-            for file_name in &["src/server.rs", "src/allocation.rs"] {
-                let path = std::path::Path::new(&crate_root).join(file_name);
-                let source = std::fs::read_to_string(&path)
-                    .unwrap_or_else(|_| format!("// cannot read {}", path.display()));
+    /// Verify that `bandwidth_manager.try_relay` IS called in the data
+    /// forwarding path (fix for the dead-code bug): the relay task checks
+    /// the budget peer→client and `send_to_peer` checks it client→peer.
+    #[test]
+    fn test_bug_bandwidth_manager_try_relay_not_called_in_data_path() {
+        let crate_root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
 
-                // Count occurrences of try_relay (excluding comments and tests)
-                let call_count = source
-                    .lines()
-                    .filter(|line| {
-                        let trimmed = line.trim();
-                        trimmed.contains("try_relay") && !trimmed.starts_with("//")
-                    })
-                    .count();
+        let path = std::path::Path::new(&crate_root).join("src/allocation.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| format!("// cannot read {}", path.display()));
 
-                // try_relay should NOT be called in production data forwarding code.
-                // The only calls are in #[cfg(test)] modules inside bandwidth.rs.
-                // If this assertion fails, it means someone added bandwidth enforcement
-                // BUT may have introduced a new data-loss path.
-                if file_name.contains("allocation.rs") {
-                    assert_eq!(
-                        call_count, 0,
-                        "BUG: try_relay called {} times in {} — verify it's not in data forwarding path",
-                        call_count, file_name
-                    );
-                }
-            }
-        }
+        let call_count = source
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                trimmed.contains("bandwidth_manager.try_relay") && !trimmed.starts_with("//")
+            })
+            .count();
 
-        /// Verify `MAX_CONSECUTIVE_RECV_ERRORS = 100` and the break condition
-        /// exists at allocation.rs:1129-1138.
-        #[test]
-        fn test_bug_consecutive_recv_errors_kill_switch_exists_in_source() {
-            let crate_root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
-            let alloc_rs = std::path::Path::new(&crate_root).join("src/allocation.rs");
-            let source = std::fs::read_to_string(&alloc_rs)
-                .unwrap_or_else(|_| panic!("cannot read {}", alloc_rs.display()));
+        assert!(
+            call_count >= 2,
+            "FIX CONFIRMED EXPECTED: bandwidth_manager.try_relay should be called in both \
+                 relay directions in allocation.rs, found {} call sites",
+            call_count
+        );
+    }
 
-            // Verify the kill switch exists
-            assert!(
-                source.contains("MAX_CONSECUTIVE_RECV_ERRORS"),
-                "BUG SOURCE: MAX_CONSECUTIVE_RECV_ERRORS constant not found in allocation.rs"
-            );
-            assert!(
-                source.contains("consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS"),
-                "BUG SOURCE: consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS check not found"
-            );
+    /// Verify the relay task's recv-error handling: a counter and threshold
+    /// exist, but sustained transient errors cause a back-off + recovery,
+    /// NOT a permanent exit (fix for the kill-switch bug).
+    #[test]
+    fn test_bug_consecutive_recv_errors_kill_switch_exists_in_source() {
+        let crate_root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
+        let alloc_rs = std::path::Path::new(&crate_root).join("src/allocation.rs");
+        let source = std::fs::read_to_string(&alloc_rs)
+            .unwrap_or_else(|_| panic!("cannot read {}", alloc_rs.display()));
 
-            // Verify the break after hitting the limit
-            assert!(
-                source.contains("relay socket too many consecutive recv errors within window"),
-                "BUG SOURCE: relay task exit log message not found — kill switch may be removed"
-            );
+        // Verify the threshold machinery exists
+        assert!(
+            source.contains("MAX_CONSECUTIVE_RECV_ERRORS"),
+            "MAX_CONSECUTIVE_RECV_ERRORS constant not found in allocation.rs"
+        );
+        assert!(
+            source.contains("consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS"),
+            "consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS check not found"
+        );
 
-            // Verify that is_fatal_recv_error only treats PermissionDenied as fatal
-            assert!(
-                source.contains("matches!(kind, io::ErrorKind::PermissionDenied)"),
-                "BUG SOURCE: is_fatal_recv_error should only treat PermissionDenied as fatal"
-            );
-        }
+        // FIX CONFIRMED: on reaching the threshold the task backs off and
+        // continues instead of exiting the relay loop.
+        assert!(
+            source.contains(
+                "relay socket sustained too many recv errors; backing off and continuing"
+            ),
+            "recovery log message not found — relay task may still exit on sustained errors"
+        );
+        assert!(
+            !source.contains("too many consecutive recv errors within window, exiting relay loop"),
+            "BUG REGRESSION: relay task still exits on sustained transient recv errors"
+        );
 
-        /// Verify the dead `relay_to_peer` method has been removed from allocation.rs.
-        #[test]
-        fn test_relay_to_peer_removed() {
-            let crate_root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
-            let alloc_rs = std::path::Path::new(&crate_root).join("src/allocation.rs");
-            let source = std::fs::read_to_string(&alloc_rs)
-                .unwrap_or_else(|_| panic!("cannot read {}", alloc_rs.display()));
+        // Verify that is_fatal_recv_error only treats PermissionDenied as fatal
+        assert!(
+            source.contains("matches!(kind, io::ErrorKind::PermissionDenied)"),
+            "is_fatal_recv_error should only treat PermissionDenied as fatal"
+        );
+    }
 
-            assert!(
-                !source.contains("pub fn relay_to_peer("),
-                "FIX CONFIRMED: relay_to_peer has been removed from allocation.rs"
-            );
-        }
+    /// Verify the dead `relay_to_peer` method has been removed from allocation.rs.
+    #[test]
+    fn test_relay_to_peer_removed() {
+        let crate_root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
+        let alloc_rs = std::path::Path::new(&crate_root).join("src/allocation.rs");
+        let source = std::fs::read_to_string(&alloc_rs)
+            .unwrap_or_else(|_| panic!("cannot read {}", alloc_rs.display()));
+
+        assert!(
+            !source.contains("pub fn relay_to_peer("),
+            "FIX CONFIRMED: relay_to_peer has been removed from allocation.rs"
+        );
+    }
 
     // ---------------------------------------------------------------------------
     // Helpers
@@ -179,10 +181,11 @@
         assert!(table.add_permissions(&client, &[peer_addr]));
 
         // Send data from client to peer via send_to_peer
-        let result = table
-            .send_to_peer(&client, peer_addr, b"hello peer")
-            .await;
-        assert!(result.is_some(), "send_to_peer should succeed with permission");
+        let result = table.send_to_peer(&client, peer_addr, b"hello peer").await;
+        assert!(
+            result.is_some(),
+            "send_to_peer should succeed with permission"
+        );
 
         // Verify peer received the data
         let mut buf = vec![0u8; 1024];
@@ -199,8 +202,14 @@
 
         // Stats should be incremented
         let a = alloc.read();
-        assert!(a.bytes_forwarded.load(Ordering::Relaxed) > 0, "bytes_forwarded incremented");
-        assert!(a.messages_forwarded.load(Ordering::Relaxed) > 0, "messages_forwarded incremented");
+        assert!(
+            a.bytes_forwarded.load(Ordering::Relaxed) > 0,
+            "bytes_forwarded incremented"
+        );
+        assert!(
+            a.messages_forwarded.load(Ordering::Relaxed) > 0,
+            "messages_forwarded incremented"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -221,10 +230,11 @@
 
         // Do NOT add any permissions
 
-        let result = table
-            .send_to_peer(&client, peer, b"hello peer")
-            .await;
-        assert!(result.is_none(), "send_to_peer should fail without permission");
+        let result = table.send_to_peer(&client, peer, b"hello peer").await;
+        assert!(
+            result.is_none(),
+            "send_to_peer should fail without permission"
+        );
 
         // Stats should NOT be incremented
         let a = alloc.read();
@@ -273,7 +283,12 @@
         assert!(table.send_to_peer(&client, peer_addr, b"x").await.is_some());
 
         // peer_blocked should be blocked (has a different IP)
-        assert!(table.send_to_peer(&client, peer_blocked, b"x").await.is_none());
+        assert!(
+            table
+                .send_to_peer(&client, peer_blocked, b"x")
+                .await
+                .is_none()
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -294,13 +309,46 @@
 
         // Add same peer three times
         assert!(table.add_permissions(&client, &[peer]));
-        assert_eq!(table.allocations.read().get(&relayed).unwrap().read().permissions.len(), 1);
+        assert_eq!(
+            table
+                .allocations
+                .read()
+                .get(&relayed)
+                .unwrap()
+                .read()
+                .permissions
+                .read()
+                .len(),
+            1
+        );
 
         assert!(table.add_permissions(&client, &[peer]));
-        assert_eq!(table.allocations.read().get(&relayed).unwrap().read().permissions.len(), 1);
+        assert_eq!(
+            table
+                .allocations
+                .read()
+                .get(&relayed)
+                .unwrap()
+                .read()
+                .permissions
+                .read()
+                .len(),
+            1
+        );
 
         assert!(table.add_permissions(&client, &[peer]));
-        assert_eq!(table.allocations.read().get(&relayed).unwrap().read().permissions.len(), 1);
+        assert_eq!(
+            table
+                .allocations
+                .read()
+                .get(&relayed)
+                .unwrap()
+                .read()
+                .permissions
+                .read()
+                .len(),
+            1
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -395,7 +443,7 @@
         assert_eq!(&buf[..len], b"to c");
 
         // 3 peer IPs (10.0.0.2, 10.0.0.3, 10.0.0.4) + 1 actual socket IP (127.0.0.1) = 4
-        assert_eq!(alloc.read().permissions.len(), 4);
+        assert_eq!(alloc.read().permissions.read().len(), 4);
     }
 
     // ---------------------------------------------------------------------------
@@ -413,9 +461,18 @@
         table.bind(0x4001, peer_y, relayed_a).unwrap();
         table.bind(0x4002, peer_x, relayed_b).unwrap();
 
-        assert_eq!(table.get_by_peer_for_relayed(&relayed_a, &peer_x), Some(0x4000));
-        assert_eq!(table.get_by_peer_for_relayed(&relayed_a, &peer_y), Some(0x4001));
-        assert_eq!(table.get_by_peer_for_relayed(&relayed_b, &peer_x), Some(0x4002));
+        assert_eq!(
+            table.get_by_peer_for_relayed(&relayed_a, &peer_x),
+            Some(0x4000)
+        );
+        assert_eq!(
+            table.get_by_peer_for_relayed(&relayed_a, &peer_y),
+            Some(0x4001)
+        );
+        assert_eq!(
+            table.get_by_peer_for_relayed(&relayed_b, &peer_x),
+            Some(0x4002)
+        );
         assert_eq!(table.get_by_peer_for_relayed(&relayed_b, &peer_y), None);
 
         let unknown: SocketAddr = make_addr("10.99.99.99", 9999);
@@ -485,7 +542,10 @@
 
         // Step 3: send_to_peer — allocation already removed
         let result = table.send_to_peer(&client, peer, b"post-removal").await;
-        assert!(result.is_none(), "send_to_peer should drop when allocation gone");
+        assert!(
+            result.is_none(),
+            "send_to_peer should drop when allocation gone"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -513,9 +573,9 @@
             let c = client;
             let p = peer_addr;
             let data = vec![i; 64];
-            handles.push(tokio::spawn(async move {
-                t.send_to_peer(&c, p, &data).await
-            }));
+            handles.push(tokio::spawn(
+                async move { t.send_to_peer(&c, p, &data).await },
+            ));
         }
 
         let mut success = 0;
@@ -531,7 +591,10 @@
         // Verify data actually arrived at the peer socket
         let mut buf = vec![0u8; 256];
         let (len, _) = peer_sock.recv_from(&mut buf).await.unwrap();
-        assert!(len > 0, "peer socket should receive data from concurrent sends");
+        assert!(
+            len > 0,
+            "peer socket should receive data from concurrent sends"
+        );
     }
 
     // =========================================================================
@@ -571,7 +634,10 @@
             .await;
 
         // BUG CONFIRMED: returns None with no error to caller
-        assert!(result.is_none(), "send_to_peer returns None on send failure — data silently lost");
+        assert!(
+            result.is_none(),
+            "send_to_peer returns None on send failure — data silently lost"
+        );
 
         // Stats are NOT incremented — the data is gone from all accounting
         assert_eq!(
@@ -592,9 +658,10 @@
     }
 
     // ---------------------------------------------------------------------------
-    // BUG: BandwidthManager::try_relay is NEVER called in any data forwarding path.
-    // File: bandwidth.rs:277 (defined) — zero call sites in server.rs/allocation.rs.
-    // This means per-allocation and per-user bandwidth limits are not enforced.
+    // FIX VERIFIED: BandwidthManager::try_relay IS called in the data path.
+    // Previously bandwidth.rs:277 was dead code and configured limits were
+    // silently ignored. Now send_to_peer (client→peer) and the relay task
+    // (peer→client) enforce the token-bucket budget.
     // ---------------------------------------------------------------------------
     #[tokio::test]
     async fn test_bug_bandwidth_manager_not_called() {
@@ -622,22 +689,24 @@
         let peer_addr = peer_sock.local_addr().unwrap();
         assert!(table.add_permissions(&client, &[peer_addr]));
 
-        // Send 1000 bytes — should be BLOCKED by the 1 byte/sec bandwidth limit
-        // if BandwidthManager was actually called
-        let result = table
-            .send_to_peer(&client, peer_addr, &[0u8; 1000])
-            .await;
+        // Send 1000 bytes — must be BLOCKED by the 1 byte/sec bandwidth limit
+        // (burst capacity is only rate * 10 = 10 bytes).
+        let result = table.send_to_peer(&client, peer_addr, &[0u8; 1000]).await;
 
-        // BUG CONFIRMED: send_to_peer succeeds despite bandwidth limit
+        // FIX CONFIRMED: send_to_peer is rejected when over budget
         assert!(
-            result.is_some(),
-            "BUG: send_to_peer succeeds despite 1 byte/sec bandwidth limit — BandwidthManager::try_relay is never called in the data path"
+            result.is_none(),
+            "REGRESSION: send_to_peer succeeded despite 1 byte/sec bandwidth limit"
         );
 
-        // Verify data actually arrived (bandwidth check was skipped)
+        // Verify nothing arrived at the peer
         let mut buf = vec![0u8; 2000];
-        let (len, _) = peer_sock.recv_from(&mut buf).await.unwrap();
-        assert_eq!(len, 1000, "1000 bytes were relayed despite bandwidth limit");
+        let recv =
+            tokio::time::timeout(Duration::from_millis(200), peer_sock.recv_from(&mut buf)).await;
+        assert!(
+            recv.is_err(),
+            "REGRESSION: data was relayed despite bandwidth limit"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -696,16 +765,13 @@
     }
 
     // ---------------------------------------------------------------------------
-    // BUG: relay task dies after 100 consecutive recv errors,
-    // permanently killing peer→client forwarding for an otherwise-live allocation.
-    // File: allocation.rs:1054-1055 (init), 1129-1138 (kill switch)
-    // The counter is only reset on successful recv_from, not on clock time.
-    // Sustained transient errors (ICMP, etc.) with no real data will kill the task.
+    // FIX VERIFIED: relay task survives sustained transient recv errors.
+    // Previously the task exited after 100 consecutive recv errors, permanently
+    // killing peer→client forwarding for an otherwise-live allocation.
+    // Now it backs off (1s) and continues.
     // ---------------------------------------------------------------------------
     #[tokio::test]
     async fn test_bug_consecutive_recv_errors_kill_relay_task() {
-        use std::sync::atomic::AtomicBool;
-
         let table = dummy_table();
         let channel_table = ChannelTable::new();
         let client: SocketAddr = make_addr("192.168.1.1", 50004);
@@ -718,29 +784,23 @@
         let relay_socket = alloc.read().relay.as_ref().unwrap().socket.clone();
 
         // Step 1: Verify relay task is alive by sending real data
+        // (permission required for peer→relay forwarding).
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let _peer_addr = peer.local_addr().unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        assert!(table.add_permissions(&client, &[peer_addr]));
         peer.send_to(b"alive", &relayed_addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let stats_before = table
-            .stats()
-            .total_bytes_relayed
-            .load(Ordering::Relaxed);
-        assert!(stats_before >= 5, "relay task should process peer data initially");
+        let stats_before = table.stats().total_bytes_relayed.load(Ordering::Relaxed);
+        assert!(
+            stats_before >= 5,
+            "relay task should process peer data initially"
+        );
 
         // Step 2: Simulate sustained transient errors by sending from the relay
         // socket to a dead port. Each send triggers an ICMP port-unreachable,
-        // which gets delivered as ECONNREFUSED on the next recv_from.
-        // After ~100 such errors, the relay task's `consecutive_recv_errors`
-        // counter reaches MAX_CONSECUTIVE_RECV_ERRORS and the task dies.
-        //
-        // Important: we send data in BETWEEN ICMP bursts to check if the
-        // relay task survives. The bug is that consecutive errors without
-        // intervening success will kill it.
-        let _was_alive = Arc::new(AtomicBool::new(true));
-
-        // Spawn a task that repeatedly sends to trigger ICMP errors
+        // which gets delivered as ECONNREFUSED on the next recv_from — well over
+        // the 100-error threshold that used to kill the task.
         let relay_sock_for_errs = relay_socket.clone();
         let error_trigger = tokio::spawn(async move {
             // Create a dead peer: bind then immediately drop
@@ -750,41 +810,49 @@
 
             // Send many packets to trigger ICMP errors
             for _ in 0..200 {
-                let _ = relay_sock_for_errs.send_to(b"trigger-icmp", &dead_addr).await;
+                let _ = relay_sock_for_errs
+                    .send_to(b"trigger-icmp", &dead_addr)
+                    .await;
                 tokio::time::sleep(Duration::from_millis(3)).await;
             }
         });
 
         let _ = error_trigger.await;
 
-        // Give the relay task time to process the ICMP errors
+        // Give the relay task time to process the ICMP errors (including its
+        // 1s back-off once the threshold is reached).
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Step 3: Try to send real data via the relay socket after the ICMP storm
+        // Step 3: Send real data via the relay socket after the ICMP storm.
         let peer2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let result = peer2.send_to(b"post-icmp-storm", &relayed_addr).await;
+        let peer2_addr = peer2.local_addr().unwrap();
+        assert!(table.add_permissions(&client, &[peer2_addr]));
+        peer2
+            .send_to(b"post-icmp-storm", &relayed_addr)
+            .await
+            .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let stats_after = table
-            .stats()
-            .total_bytes_relayed
-            .load(Ordering::Relaxed);
-
-        // BUG: If the relay task died from the ICMP storm, stats_after == stats_before
-        // and the "post-icmp-storm" data was never relayed
-        if stats_after == stats_before {
-            // THIS IS THE BUG: the relay task died from 100 consecutive recv errors
-            // with no successful recv in between. The allocation is still alive,
-            // but peer→client forwarding has permanently stopped.
-            assert!(
-                result.is_ok(),
-                "BUG CONFIRMED: relay task died from 100 consecutive transient recv errors.\n\
-                 File: allocation.rs:1129-1138\n\
-                 Peer 'post-icmp-storm' data was sent to the relay socket but never forwarded.\n\
-                 Stats unchanged: before={}, after={}", stats_before, stats_after
-            );
+        // Poll until the packet is relayed (the task may be mid-backoff).
+        let mut stats_after = stats_before;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            stats_after = table.stats().total_bytes_relayed.load(Ordering::Relaxed);
+            if stats_after > stats_before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+
+        // FIX CONFIRMED: the relay task survived the ICMP storm and forwarded
+        // the post-storm data.
+        assert!(
+            stats_after > stats_before,
+            "REGRESSION: relay task died from sustained transient recv errors.\n\
+             Peer 'post-icmp-storm' data was sent to the relay socket but never forwarded.\n\
+             Stats unchanged: before={}, after={}",
+            stats_before,
+            stats_after
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -811,20 +879,23 @@
             .unwrap();
         let relayed_addr = alloc.read().relayed_addr;
 
+        // Bind a real peer socket; permission + channel binding must match
+        // the actual source address or the peer→relay permission check drops it.
+        let peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_sock.local_addr().unwrap();
+
         // Set up channel binding so peer data goes as ChannelData to client
-        let peer: SocketAddr = make_addr("192.168.1.100", 9999);
-        assert!(table.add_permissions(&client, &[peer]));
-        channel_table.bind(0x4000, peer, relayed_addr).unwrap();
+        assert!(table.add_permissions(&client, &[peer_addr]));
+        channel_table.bind(0x4000, peer_addr, relayed_addr).unwrap();
 
         // Step 1: Send data from peer to relay → relay task should forward to client
-        let peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        peer_sock.send_to(b"peer-data", &relayed_addr).await.unwrap();
+        peer_sock
+            .send_to(b"peer-data", &relayed_addr)
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let stats_after = table
-            .stats()
-            .total_bytes_relayed
-            .load(Ordering::Relaxed);
+        let stats_after = table.stats().total_bytes_relayed.load(Ordering::Relaxed);
 
         // The key point: the relay task forwards data using main_socket.send_to(&client_addr).
         // If main_socket is functional and client is reachable, the stats increment.
@@ -865,9 +936,7 @@
         let alloc_bytes_before = alloc.read().bytes_forwarded.load(Ordering::Relaxed);
         let alloc_msgs_before = alloc.read().messages_forwarded.load(Ordering::Relaxed);
 
-        table
-            .send_to_peer(&client, peer_addr, b"12345")
-            .await;
+        table.send_to_peer(&client, peer_addr, b"12345").await;
 
         // All stats should increase
         let a = alloc.read();
@@ -886,6 +955,149 @@
         assert!(
             a.messages_forwarded.load(Ordering::Relaxed) > alloc_msgs_before,
             "allocation messages incremented"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // B1 regression: client index stays consistent across create / rebind /
+    // remove, and lookups are exact.
+    // ---------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_b1_client_index_consistency() {
+        let table = dummy_table();
+        let channel_table = ChannelTable::new();
+        let client: SocketAddr = make_addr("192.168.1.1", 12345);
+
+        let alloc = table
+            .create_allocation(client, Some(600), &channel_table)
+            .await
+            .unwrap();
+        let relayed = alloc.read().relayed_addr;
+
+        assert_eq!(table.find_allocation_by_client(&client), Some(relayed));
+        assert!(table.get_allocation_by_client(&client).is_some());
+
+        // NAT rebind moves the index entry.
+        let new_client: SocketAddr = make_addr("192.168.1.1", 54321);
+        let old = table.move_client_addr(&relayed, new_client);
+        assert_eq!(old, Some(client));
+        assert_eq!(table.find_allocation_by_client(&client), None);
+        assert_eq!(table.find_allocation_by_client(&new_client), Some(relayed));
+        assert_eq!(alloc.read().client_addr, new_client);
+
+        // Removal clears the index.
+        table.remove_allocation(&relayed, Some(&channel_table));
+        drop(alloc);
+        assert_eq!(table.find_allocation_by_client(&new_client), None);
+    }
+
+    // ---------------------------------------------------------------------------
+    // A4 regression: username fallback resolves the single allocation owned by a
+    // user after a NAT rebind.
+    // ---------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_a4_username_fallback_rebind() {
+        let table = dummy_table();
+        let channel_table = ChannelTable::new();
+        let client: SocketAddr = make_addr("192.168.1.1", 12345);
+
+        let alloc = table
+            .create_allocation(client, Some(600), &channel_table)
+            .await
+            .unwrap();
+        alloc.write().username = Some("alice".to_string());
+
+        // Exact address match first.
+        assert_eq!(table.find_allocation_by_client(&client).is_some(), true);
+        // Rebinding to a new address leaves the old lookup empty...
+        let new_client: SocketAddr = make_addr("203.0.113.9", 7777);
+        // Bind the relayed address first so no read guard is held across the
+        // move (which takes the allocation's write lock).
+        let relayed = alloc.read().relayed_addr;
+        assert!(table.move_client_addr(&relayed, new_client).is_some());
+        // ...and the username fallback still resolves it.
+        let found = table
+            .find_single_allocation_by_username("alice")
+            .expect("username fallback should find the allocation");
+        assert_eq!(found.read().relayed_addr, alloc.read().relayed_addr);
+
+        // Multiple allocations for the same username → ambiguous → None.
+        let alloc2 = table
+            .create_allocation(make_addr("192.168.1.9", 4444), Some(600), &channel_table)
+            .await
+            .unwrap();
+        alloc2.write().username = Some("alice".to_string());
+        assert!(
+            table.find_single_allocation_by_username("alice").is_none(),
+            "ambiguous username match should return None"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // A7 regression: peer→relay traffic without a permission is dropped (RFC
+    // 5766 §10), and traffic from a permitted peer is relayed.
+    // ---------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_a7_peer_to_relay_permission_gating() {
+        let table = dummy_table();
+        let channel_table = ChannelTable::new();
+        let client: SocketAddr = make_addr("192.168.1.1", 12345);
+
+        let alloc = table
+            .create_allocation(client, Some(600), &channel_table)
+            .await
+            .unwrap();
+        let relayed_addr = alloc.read().relayed_addr;
+
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        // No permission yet → packet dropped, no stats.
+        let before = table.stats().total_bytes_relayed.load(Ordering::Relaxed);
+        peer.send_to(b"unauthorized", &relayed_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after = table.stats().total_bytes_relayed.load(Ordering::Relaxed);
+        assert_eq!(
+            after, before,
+            "peer packet without permission must be dropped"
+        );
+
+        // Install permission → packet relayed.
+        assert!(table.add_permissions(&client, &[peer_addr]));
+        let before = table.stats().total_bytes_relayed.load(Ordering::Relaxed);
+        peer.send_to(b"authorized", &relayed_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after = table.stats().total_bytes_relayed.load(Ordering::Relaxed);
+        assert!(after > before, "permitted peer packet must be relayed");
+    }
+
+    // ---------------------------------------------------------------------------
+    // C3 regression: per-allocation permission set is capped.
+    // ---------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_c3_permission_cap_enforced() {
+        let table = dummy_table();
+        let channel_table = ChannelTable::new();
+        let client: SocketAddr = make_addr("192.168.1.1", 12345);
+
+        let alloc = table
+            .create_allocation(client, Some(600), &channel_table)
+            .await
+            .unwrap();
+
+        // Attempt to add far more peer IPs than the cap.
+        let peers: Vec<SocketAddr> = (1..=crate::allocation::MAX_PERMISSIONS_PER_ALLOCATION + 50)
+            .map(|i| make_addr(&format!("10.1.{}.{}", i >> 8, i & 0xFF), 5000))
+            .collect();
+        assert!(table.add_permissions(&client, &peers));
+
+        let a = alloc.read();
+        let perms = a.permissions.read();
+        assert!(
+            perms.len() <= crate::allocation::MAX_PERMISSIONS_PER_ALLOCATION,
+            "permission set exceeded cap: {} > {}",
+            perms.len(),
+            crate::allocation::MAX_PERMISSIONS_PER_ALLOCATION
         );
     }
 }

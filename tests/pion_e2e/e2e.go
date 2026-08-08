@@ -868,6 +868,15 @@ func hmacSha1(key, msg []byte) []byte {
 	return h.Sum(nil)
 }
 
+
+// listenPeerUDP binds a peer UDP socket on the loopback interface so its
+// LocalAddr() is a routable destination. Binding to the wildcard (0.0.0.0)
+// makes LocalAddr() return 0.0.0.0:port, which is not a valid send
+// destination on macOS (ENOHOST) and would break the relay round-trip.
+func listenPeerUDP() (*net.UDPConn, error) {
+	return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+}
+
 // ---------------------------------------------------------------------------
 // Test scenarios
 // ---------------------------------------------------------------------------
@@ -879,7 +888,7 @@ func testUDPTurn(serverAddr, realm, username, password string) error {
 	}
 	defer alloc.Close()
 
-	peer, err := net.ListenUDP("udp4", nil)
+	peer, err := listenPeerUDP()
 	if err != nil {
 		return err
 	}
@@ -915,7 +924,7 @@ func testTCPTurn(serverAddr, realm, username, password string) error {
 	}
 	defer alloc.Close()
 
-	peer, err := net.ListenUDP("udp4", nil)
+	peer, err := listenPeerUDP()
 	if err != nil {
 		return err
 	}
@@ -951,7 +960,7 @@ func testSendIndicationAndChannelData(serverAddr, realm, username, password stri
 	}
 	defer alloc.Close()
 
-	peer, err := net.ListenUDP("udp4", nil)
+	peer, err := listenPeerUDP()
 	if err != nil {
 		return err
 	}
@@ -1009,7 +1018,7 @@ func testDataIntegrity(serverAddr, realm, username, password string) error {
 	}
 	defer alloc.Close()
 
-	peer, err := net.ListenUDP("udp4", nil)
+	peer, err := listenPeerUDP()
 	if err != nil {
 		return err
 	}
@@ -1077,7 +1086,7 @@ func testRefresh(serverAddr, realm, username, password string) error {
 	}
 
 	// Verify allocation still works
-	peer, err := net.ListenUDP("udp4", nil)
+	peer, err := listenPeerUDP()
 	if err != nil {
 		return err
 	}
@@ -1125,7 +1134,7 @@ func testReAllocate(serverAddr, realm, username, password string) error {
 	relay2 := alloc2.relay.String()
 
 	// Verify new allocation works
-	peer, err := net.ListenUDP("udp4", nil)
+	peer, err := listenPeerUDP()
 	if err != nil {
 		return err
 	}
@@ -1163,7 +1172,7 @@ func testConcurrentSends(serverAddr, realm, username, password string) error {
 	}
 	defer alloc.Close()
 
-	peer, err := net.ListenUDP("udp4", nil)
+	peer, err := listenPeerUDP()
 	if err != nil {
 		return err
 	}
@@ -1292,7 +1301,7 @@ func runDevice(id int, serverAddr, realm, username, password string, stop chan s
 	defer alloc.Close()
 
 	// Create a single peer socket for the lifetime of this device
-	peer, err := net.ListenUDP("udp4", nil)
+	peer, err := listenPeerUDP()
 	if err != nil {
 		stats.recvFail.Add(1)
 		return

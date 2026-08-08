@@ -78,7 +78,38 @@ pub struct TurnServer {
     stats_dump_interval_secs: u64,
     stats_dump_skip_if_no_change: bool,
     server_name: String,
+    /// Guards so background tasks are spawned at most once even when multiple
+    /// listeners call run_udp/run_tcp (each used to re-spawn everything).
+    bg_tasks: Arc<BackgroundTaskFlags>,
 }
+
+#[derive(Default)]
+struct BackgroundTaskFlags {
+    nonce_cleanup: std::sync::atomic::AtomicBool,
+    channel_cleanup: std::sync::atomic::AtomicBool,
+    allocation_cleanup: std::sync::atomic::AtomicBool,
+    stats_dump: std::sync::atomic::AtomicBool,
+}
+
+impl BackgroundTaskFlags {
+    /// Returns true only for the first caller (per flag).
+    fn claim(flag: &std::sync::atomic::AtomicBool) -> bool {
+        flag.compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
+    }
+}
+
+/// Maximum number of nonces kept in the nonce map. Bounds memory under
+/// unauthenticated-request floods (each 401 inserts a nonce); when the cap is
+/// reached, entries are evicted cheaply (the affected client just retries and
+/// gets a fresh nonce). Expired nonces are swept by the periodic cleanup task.
+const MAX_NONCES: usize = 100_000;
+const NONCE_EXPIRY_SECONDS: u64 = 600;
 
 struct NonceEntry {
     created_at: std::time::Instant,
@@ -166,6 +197,7 @@ impl TurnServer {
             stats_dump_interval_secs: 30,
             stats_dump_skip_if_no_change: true,
             server_name: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+            bg_tasks: Arc::new(BackgroundTaskFlags::default()),
         };
         server.start_nonce_cleanup_task();
         server.start_channel_cleanup_task();
@@ -235,6 +267,7 @@ impl TurnServer {
             stats_dump_interval_secs: 30,
             stats_dump_skip_if_no_change: true,
             server_name: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+            bg_tasks: Arc::new(BackgroundTaskFlags::default()),
         };
         server.start_nonce_cleanup_task();
         server.start_channel_cleanup_task();
@@ -270,6 +303,7 @@ impl TurnServer {
             stats_dump_interval_secs: 30,
             stats_dump_skip_if_no_change: true,
             server_name: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+            bg_tasks: Arc::new(BackgroundTaskFlags::default()),
         };
         server.start_nonce_cleanup_task();
         server.start_channel_cleanup_task();
@@ -326,6 +360,7 @@ impl TurnServer {
             stats_dump_interval_secs: 30,
             stats_dump_skip_if_no_change: true,
             server_name: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+            bg_tasks: Arc::new(BackgroundTaskFlags::default()),
         };
         server.start_nonce_cleanup_task();
         server.start_channel_cleanup_task();
@@ -364,11 +399,15 @@ impl TurnServer {
             return;
         }
 
-        let stats = self.allocation_table.stats();
-
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
+
+        if !BackgroundTaskFlags::claim(&self.bg_tasks.stats_dump) {
+            return;
+        }
+
+        let stats = self.allocation_table.stats();
 
         tokio::spawn(async move {
             let mut interval =
@@ -442,6 +481,10 @@ impl TurnServer {
             return;
         }
 
+        if !BackgroundTaskFlags::claim(&self.bg_tasks.allocation_cleanup) {
+            return;
+        }
+
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(CLEANUP_INTERVAL_SECONDS));
@@ -466,12 +509,15 @@ impl TurnServer {
     /// Start a background task to clean up expired nonces
     pub fn start_nonce_cleanup_task(&self) {
         let nonce_map = self.nonce_map.clone();
-        const NONCE_EXPIRY_SECONDS: u64 = 600;
         const CLEANUP_INTERVAL_SECONDS: u64 = 30;
 
         // Check if we're running in a Tokio runtime context
         if tokio::runtime::Handle::try_current().is_err() {
             // Not in a runtime context, skip spawning (will be called again from run methods)
+            return;
+        }
+
+        if !BackgroundTaskFlags::claim(&self.bg_tasks.nonce_cleanup) {
             return;
         }
 
@@ -508,6 +554,10 @@ impl TurnServer {
             return;
         }
 
+        if !BackgroundTaskFlags::claim(&self.bg_tasks.channel_cleanup) {
+            return;
+        }
+
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(CLEANUP_INTERVAL_SECONDS));
@@ -536,9 +586,15 @@ impl TurnServer {
             let server = self.clone();
             tokio::spawn(async move {
                 let (mut tcp_reader, tcp_writer) = tokio::io::split(socket);
-                // Unbounded channel: both STUN responses AND peer→client relay data
-                // flow through this channel to a single TCP writer task.
-                let (tcp_tx, mut tcp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                // Bounded channel: both STUN responses AND peer→client relay
+                // data flow through this channel to a single TCP writer task.
+                // Sized for real WebRTC loads: audio+video over TCP TURN can
+                // burst several hundred frames/sec, so 4096 (~6 MB of MTU-sized
+                // frames per connection) absorbs multi-second TCP stalls while
+                // still bounding memory from a malicious/slow client.
+                const TCP_CLIENT_QUEUE_SIZE: usize = 4096;
+                let (tcp_tx, mut tcp_rx) =
+                    tokio::sync::mpsc::channel::<Vec<u8>>(TCP_CLIENT_QUEUE_SIZE);
 
                 // Writer task: drain the channel into the TCP socket
                 let wr = tokio::spawn(async move {
@@ -584,8 +640,15 @@ impl TurnServer {
                                     frame.push((rlen >> 8) as u8);
                                     frame.push((rlen & 0xFF) as u8);
                                     frame.extend_from_slice(&response);
-                                    if tcp_tx.send(frame).is_err() {
-                                        break;
+                                    match tcp_tx.try_send(frame) {
+                                        Ok(()) => {}
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                            warn!(
+                                                %peer_addr,
+                                                "TCP client queue full, dropping response frame"
+                                            );
+                                        }
+                                        Err(_) => break,
                                     }
                                 }
 
@@ -653,11 +716,15 @@ impl TurnServer {
         let mut senders: Vec<tokio::sync::mpsc::Sender<(Bytes, SocketAddr)>> =
             Vec::with_capacity(num_workers);
 
+        // Per-worker queue size. Large enough to absorb bursts (ICE consent,
+        // reconnect storms) without dropping; overflow is still logged.
+        const WORKER_QUEUE_SIZE: usize = 4096;
+
         // Spawn worker tasks - each with its own channel
         for _i in 0..num_workers {
             let server = self.clone();
             let socket = socket.clone();
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<(Bytes, SocketAddr)>(1024);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<(Bytes, SocketAddr)>(WORKER_QUEUE_SIZE);
             senders.push(tx);
 
             tokio::spawn(async move {
@@ -759,7 +826,7 @@ async fn handle_tcp_message(
     }
 
     if let Some(msg) = Message::parse(&data[..]) {
-        let response = process_message(msg, server, peer_addr).await;
+        let response = process_message(msg, server, peer_addr, None).await;
         if let Some(r) = response {
             return Some(r);
         }
@@ -768,7 +835,7 @@ async fn handle_tcp_message(
 }
 
 async fn handle_udp_message(
-    _socket: &Arc<UdpSocket>,
+    socket: &Arc<UdpSocket>,
     data: Bytes,
     peer_addr: SocketAddr,
     server: &TurnServer,
@@ -831,7 +898,7 @@ async fn handle_udp_message(
 
     // Try to parse as STUN message
     if let Some(msg) = Message::parse(&data[..]) {
-        let response = process_message(msg, server, peer_addr).await;
+        let response = process_message(msg, server, peer_addr, Some(socket.clone())).await;
         return response;
     }
 
@@ -886,7 +953,7 @@ async fn handle_udp_message(
             }
 
             let msg = Message { header, attributes };
-            return process_message(msg, server, peer_addr).await;
+            return process_message(msg, server, peer_addr, Some(socket.clone())).await;
         }
     }
 
@@ -897,10 +964,11 @@ async fn process_message(
     msg: Message,
     server: &TurnServer,
     client_addr: SocketAddr,
+    recv_socket: Option<Arc<UdpSocket>>,
 ) -> Option<Bytes> {
     match msg.header.method {
         Method::Binding => handle_binding(msg, client_addr).await,
-        Method::Allocate => handle_allocate(msg, server, client_addr).await,
+        Method::Allocate => handle_allocate(msg, server, client_addr, recv_socket).await,
         Method::Refresh => handle_refresh(msg, server, client_addr).await,
         Method::CreatePermission => handle_create_permission(msg, server, client_addr).await,
         Method::ChannelBind => handle_channel_bind(msg, server, client_addr).await,
@@ -1065,8 +1133,8 @@ fn verify_turn_auth(
     let nonce_age = nonce_entry.created_at.elapsed();
     drop(nonce_map);
 
-    // Nonce expires after 600 seconds
-    if nonce_age.as_secs() > 600 {
+    // Nonce expires after NONCE_EXPIRY_SECONDS
+    if nonce_age.as_secs() > NONCE_EXPIRY_SECONDS {
         debug!(
             %client_addr,
             method = ?msg.header.method,
@@ -1137,6 +1205,7 @@ async fn handle_allocate(
     msg: Message,
     server: &TurnServer,
     client_addr: SocketAddr,
+    recv_socket: Option<Arc<UdpSocket>>,
 ) -> Option<Bytes> {
     // Verify auth
     let username = match verify_turn_auth(&msg, server, client_addr) {
@@ -1152,10 +1221,15 @@ async fn handle_allocate(
         "received TURN Allocate request"
     );
 
+    // Clone the (Arc-backed, internally locked) ChannelTable and release the
+    // TokioRwLock guard BEFORE awaiting: holding the read guard across the
+    // allocation create (which binds a socket) would let a pending ChannelBind
+    // write block every ChannelData reader and stall media relay.
+    let ch_table = server.channel_table.read().await.clone();
+
     // Remove any existing allocation for this client before creating a new one.
     // This prevents stale state (channel bindings, permissions) from leaking
     // into the new allocation when the same client rapidly recycles.
-    let ch_table = server.channel_table.read().await;
     if let Some(old_relayed) = server
         .allocation_table
         .find_allocation_by_client(&client_addr)
@@ -1171,7 +1245,7 @@ async fn handle_allocate(
     }
     let allocation = match server
         .allocation_table
-        .create_allocation(client_addr, Some(lifetime), &ch_table)
+        .create_allocation_with_socket(client_addr, Some(lifetime), &ch_table, recv_socket)
         .await
     {
         Ok(a) => a,
@@ -1205,6 +1279,9 @@ async fn handle_allocate(
     };
 
     let relayed_addr = allocation.read().relayed_addr;
+    // Record the owning username so NAT-rebind Refresh requests can be matched
+    // back to this allocation when the client's transport address changes.
+    allocation.write().username = Some(username.clone());
     let granted_lifetime = server
         .allocation_table
         .effective_allocation_lifetime(Some(lifetime));
@@ -1279,10 +1356,63 @@ async fn handle_refresh(
     };
 
     let lifetime = get_lifetime(&msg);
-    if let Some(relayed) = server
+
+    // Resolve the target allocation: exact client-address match first. When
+    // that fails (client NAT rebind), fall back to the single allocation owned
+    // by the authenticated username and atomically move its client address so
+    // subsequent lookups and relayed traffic follow the new transport address.
+    let relayed_opt: Option<SocketAddr> = match server
         .allocation_table
         .find_allocation_by_client(&client_addr)
     {
+        Some(r) => Some(r),
+        None => {
+            let single = server
+                .allocation_table
+                .find_single_allocation_by_username(&username);
+            match single {
+                Some(alloc) => {
+                    let relayed = alloc.read().relayed_addr;
+                    if let Some(old) = server
+                        .allocation_table
+                        .move_client_addr(&relayed, client_addr)
+                    {
+                        tracing::info!(
+                            %client_addr,
+                            old = %old,
+                            relayed = %relayed,
+                            "NAT rebind detected on Refresh; client address moved"
+                        );
+                        // Notify the relay task reliably (bounded wait) so
+                        // peer→client traffic follows the client immediately.
+                        let tx_opt = alloc.read().relay.as_ref().map(|r| r.tx.clone());
+                        if let Some(tx) = tx_opt {
+                            let update = crate::allocation::AllocationMessage::UpdateClientAddr {
+                                client_addr,
+                            };
+                            if tokio::time::timeout(
+                                std::time::Duration::from_millis(200),
+                                tx.send(update),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                warn!(
+                                    %client_addr,
+                                    relayed = %relayed,
+                                    "relay task did not accept UpdateClientAddr in time"
+                                );
+                            }
+                        }
+                    }
+                    Some(relayed)
+                }
+                None => None,
+            }
+        }
+    };
+
+    if let Some(relayed) = relayed_opt {
         if lifetime == 0 {
             // Refresh with lifetime=0 means explicit deletion (RFC 5766 §7).
             // Remove immediately instead of waiting for the cleanup task.
@@ -1296,7 +1426,7 @@ async fn handle_refresh(
                 let messages = a
                     .messages_forwarded
                     .load(std::sync::atomic::Ordering::Relaxed);
-                let permission_count = a.permissions.len();
+                let permission_count = a.permissions.read().len();
                 let lived_secs = a.created_at.elapsed().as_secs();
                 let refresh_age_secs = a.refreshed_at.elapsed().as_secs();
                 tracing::info!(
@@ -1510,6 +1640,12 @@ async fn handle_channel_bind(
                     .bind(channel_num, peer_addr, relayed_addr)
                     .is_ok()
                 {
+                    // RFC 5766 §11: a ChannelBind also installs a permission
+                    // towards the peer, so peer→relay traffic for this peer is
+                    // accepted even without an explicit CreatePermission.
+                    server
+                        .allocation_table
+                        .add_permissions(&client_addr, &[peer_addr]);
                     debug!(
                         %client_addr,
                         %peer_addr,
@@ -1640,12 +1776,7 @@ fn create_401_response(
         reason = ?reason,
         "Creating 401 Unauthorized response"
     );
-    server.nonce_map.write().insert(
-        nonce.clone(),
-        NonceEntry {
-            created_at: std::time::Instant::now(),
-        },
-    );
+    insert_nonce_capped(&server.nonce_map, nonce.clone());
 
     let mut response = crate::message::create_error_response_with_reason(
         &msg.header,
@@ -1665,6 +1796,29 @@ fn create_401_response(
         value: Bytes::from(server.server_name.as_bytes().to_vec()),
     });
     response.encode()
+}
+
+/// Insert a nonce into the map while bounding total memory usage (C2). Under an
+/// unauthenticated-request flood every 401 inserts a nonce; without a cap the
+/// map grows with request rate × nonce lifetime. When the cap is reached we
+/// evict arbitrary entries (O(1)-ish, so the flood path itself is not a CPU
+/// DoS). Evicting a valid nonce is benign: the client simply receives a fresh
+/// 401 + nonce on its next request. Expired nonces are swept by the periodic
+/// cleanup task.
+fn insert_nonce_capped(nonce_map: &RwLock<HashMap<String, NonceEntry>>, nonce: String) {
+    let mut map = nonce_map.write();
+    while map.len() >= MAX_NONCES {
+        let Some(key) = map.keys().next().cloned() else {
+            break;
+        };
+        map.remove(&key);
+    }
+    map.insert(
+        nonce,
+        NonceEntry {
+            created_at: std::time::Instant::now(),
+        },
+    );
 }
 
 fn create_error_response_bytes(msg: &Message, code: ErrorCode, server: &TurnServer) -> Bytes {
@@ -1838,7 +1992,7 @@ mod tests {
 
         // First Allocate without auth to obtain nonce.
         let unauth_msg = build_allocate_request([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-        let nonce_response = process_message(unauth_msg, &server, client_addr)
+        let nonce_response = process_message(unauth_msg, &server, client_addr, None)
             .await
             .unwrap();
         let nonce_msg = Message::parse(&nonce_response).unwrap();
@@ -1860,7 +2014,7 @@ mod tests {
             tid[11] = attempt;
             let auth_msg =
                 build_authenticated_allocate_request(tid, username, &realm, &nonce, password);
-            let response = process_message(auth_msg, &server, client_addr)
+            let response = process_message(auth_msg, &server, client_addr, None)
                 .await
                 .unwrap();
             let parsed = Message::parse(&response).unwrap();
@@ -2046,7 +2200,7 @@ mod tests {
         let client_addr: SocketAddr = "127.0.0.1:50001".parse().unwrap();
 
         let unauth_msg = build_allocate_request([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-        let nonce_response = process_message(unauth_msg, &server, client_addr)
+        let nonce_response = process_message(unauth_msg, &server, client_addr, None)
             .await
             .unwrap();
         let nonce_msg = Message::parse(&nonce_response).unwrap();
@@ -2065,7 +2219,7 @@ mod tests {
             tid[11] = attempt;
             let auth_msg =
                 build_authenticated_allocate_request(tid, username, &realm, &nonce, password);
-            let response = process_message(auth_msg, &server, client_addr)
+            let response = process_message(auth_msg, &server, client_addr, None)
                 .await
                 .unwrap();
             let parsed = Message::parse(&response).unwrap();
@@ -2090,7 +2244,9 @@ mod tests {
             &nonce,
             password,
         );
-        let cp_response = process_message(cp_msg, &server, client_addr).await.unwrap();
+        let cp_response = process_message(cp_msg, &server, client_addr, None)
+            .await
+            .unwrap();
         let cp_parsed = Message::parse(&cp_response).unwrap();
         assert_eq!(cp_parsed.header.event_type, EventType::Success);
         assert!(
@@ -2114,7 +2270,7 @@ mod tests {
         let client_addr: SocketAddr = "127.0.0.1:50002".parse().unwrap();
 
         let unauth_msg = build_allocate_request([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-        let nonce_response = process_message(unauth_msg, &server, client_addr)
+        let nonce_response = process_message(unauth_msg, &server, client_addr, None)
             .await
             .unwrap();
         let nonce_msg = Message::parse(&nonce_response).unwrap();
@@ -2133,7 +2289,7 @@ mod tests {
             tid[11] = attempt;
             let auth_msg =
                 build_authenticated_allocate_request(tid, username, &realm, &nonce, password);
-            let response = process_message(auth_msg, &server, client_addr)
+            let response = process_message(auth_msg, &server, client_addr, None)
                 .await
                 .unwrap();
             let parsed = Message::parse(&response).unwrap();
@@ -2160,7 +2316,9 @@ mod tests {
             &nonce,
             password,
         );
-        let cb_response = process_message(cb_msg, &server, client_addr).await.unwrap();
+        let cb_response = process_message(cb_msg, &server, client_addr, None)
+            .await
+            .unwrap();
         let cb_parsed = Message::parse(&cb_response).unwrap();
         assert_eq!(cb_parsed.header.event_type, EventType::Success);
         assert!(
@@ -2184,7 +2342,7 @@ mod tests {
         let client_addr: SocketAddr = "127.0.0.1:50003".parse().unwrap();
 
         let unauth_msg = build_allocate_request([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-        let nonce_response = process_message(unauth_msg, &server, client_addr)
+        let nonce_response = process_message(unauth_msg, &server, client_addr, None)
             .await
             .unwrap();
         let nonce_msg = Message::parse(&nonce_response).unwrap();
@@ -2202,7 +2360,7 @@ mod tests {
             tid[11] = attempt;
             let auth_msg =
                 build_authenticated_allocate_request(tid, username, &realm, &nonce, password);
-            let response = process_message(auth_msg, &server, client_addr)
+            let response = process_message(auth_msg, &server, client_addr, None)
                 .await
                 .unwrap();
             let parsed = Message::parse(&response).unwrap();
@@ -2222,7 +2380,7 @@ mod tests {
             &nonce,
             password,
         );
-        let refresh_response = process_message(refresh_msg, &server, client_addr)
+        let refresh_response = process_message(refresh_msg, &server, client_addr, None)
             .await
             .unwrap();
         let refresh_parsed = Message::parse(&refresh_response).unwrap();
@@ -2255,7 +2413,7 @@ mod tests {
 
         // Get nonce
         let unauth_msg = build_allocate_request([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-        let nonce_response = process_message(unauth_msg, &server, client_addr)
+        let nonce_response = process_message(unauth_msg, &server, client_addr, None)
             .await
             .unwrap();
         let nonce_msg = Message::parse(&nonce_response).unwrap();
@@ -2274,7 +2432,7 @@ mod tests {
             tid[11] = attempt;
             let auth_msg =
                 build_authenticated_allocate_request(tid, username, &realm, &nonce, password);
-            let response = process_message(auth_msg, &server, client_addr)
+            let response = process_message(auth_msg, &server, client_addr, None)
                 .await
                 .unwrap();
             let parsed = Message::parse(&response).unwrap();
@@ -2318,7 +2476,7 @@ mod tests {
             &nonce,
             password,
         );
-        let refresh_response = process_message(refresh_msg, &server, client_addr)
+        let refresh_response = process_message(refresh_msg, &server, client_addr, None)
             .await
             .unwrap();
         let refresh_parsed = Message::parse(&refresh_response).unwrap();
@@ -2368,7 +2526,7 @@ mod tests {
 
         // Step 1: Get an initial nonce via unauthenticated Allocate
         let unauth_msg = build_allocate_request([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-        let nonce_response = process_message(unauth_msg, &server, client_addr)
+        let nonce_response = process_message(unauth_msg, &server, client_addr, None)
             .await
             .unwrap();
         let nonce_msg = Message::parse(&nonce_response).unwrap();
@@ -2387,7 +2545,7 @@ mod tests {
             tid[11] = attempt;
             let auth_msg =
                 build_authenticated_allocate_request(tid, username, &realm, &nonce1, password);
-            let response = process_message(auth_msg, &server, client_addr)
+            let response = process_message(auth_msg, &server, client_addr, None)
                 .await
                 .unwrap();
             let parsed = Message::parse(&response).unwrap();
@@ -2440,7 +2598,7 @@ mod tests {
             &nonce1,
             password,
         );
-        let refresh_response1 = process_message(refresh_msg1, &server, client_addr)
+        let refresh_response1 = process_message(refresh_msg1, &server, client_addr, None)
             .await
             .unwrap();
         let refresh_parsed1 = Message::parse(&refresh_response1).unwrap();
@@ -2473,7 +2631,7 @@ mod tests {
             &nonce2,
             password,
         );
-        let refresh_response2 = process_message(refresh_msg2, &server, client_addr)
+        let refresh_response2 = process_message(refresh_msg2, &server, client_addr, None)
             .await
             .unwrap();
         let refresh_parsed2 = Message::parse(&refresh_response2).unwrap();
@@ -2515,7 +2673,7 @@ mod tests {
             &nonce2,
             password,
         );
-        let refresh_response3 = process_message(refresh_msg3, &server, client_addr)
+        let refresh_response3 = process_message(refresh_msg3, &server, client_addr, None)
             .await
             .unwrap();
         let refresh_parsed3 = Message::parse(&refresh_response3).unwrap();
@@ -2549,5 +2707,34 @@ mod tests {
                 .is_some(),
             "allocation should persist after successful Refresh"
         );
+    }
+
+    /// C2 regression: the nonce map is capped; flooding 401s cannot grow it
+    /// without bound.
+    #[test]
+    fn test_c2_nonce_cap_enforced() {
+        let server = TurnServer::with_password(
+            Ipv4Addr::new(127, 0, 0, 1),
+            "test-realm".to_string(),
+            "password".to_string(),
+        );
+
+        // Insert well over the cap; the map must stay bounded.
+        for i in 0..(MAX_NONCES as u32 + 1000) {
+            insert_nonce_capped(&server.nonce_map, format!("nonce-{}", i));
+        }
+
+        let len = server.nonce_map.read().len();
+        assert!(
+            len <= MAX_NONCES,
+            "nonce map exceeded cap: {} > {}",
+            len,
+            MAX_NONCES
+        );
+
+        // A freshly inserted nonce is still usable.
+        let fresh = "fresh-nonce";
+        insert_nonce_capped(&server.nonce_map, fresh.to_string());
+        assert!(server.nonce_map.read().contains_key(fresh));
     }
 }

@@ -47,9 +47,11 @@ pub enum AllocationMessage {
     ChannelData { data: Bytes, channel_num: u16 },
     /// Update the client address (for NAT rebind detection)
     UpdateClientAddr { client_addr: SocketAddr },
-    /// Set a channel to forward peer→client data (TCP fallback)
+    /// Set a channel to forward peer→client data (TCP fallback).
+    /// Bounded so a slow/stalled TCP client cannot grow memory without limit;
+    /// frames are dropped when the queue is full.
     SetClientTx {
-        tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     },
     /// Shut down the allocation task
     Shutdown,
@@ -87,13 +89,23 @@ pub struct Allocation {
     pub five_tuple: (SocketAddr, SocketAddr),
     /// Active relay connection (socket + task channel)
     pub relay: Option<AllocationRelay>,
-    /// Permitted peer addresses (IP-only, port is ignored per RFC 5766)
-    pub permissions: std::collections::HashSet<std::net::IpAddr>,
+    /// Permitted peer addresses (IP-only, port is ignored per RFC 5766).
+    /// Shared with the relay task so peer→relay traffic can be checked
+    /// against the live permission set without touching the Allocation lock.
+    pub permissions: Arc<RwLock<std::collections::HashSet<std::net::IpAddr>>>,
     /// Bytes successfully relayed through this allocation
     pub bytes_forwarded: Arc<AtomicU64>,
     /// Messages successfully relayed through this allocation
     pub messages_forwarded: Arc<AtomicU64>,
+    /// Authenticated username that created this allocation (used for the
+    /// NAT-rebind Refresh fallback lookup).
+    pub username: Option<String>,
 }
+
+/// Maximum number of peer IP permissions a single allocation may hold.
+/// RFC 5766 does not mandate a specific value; this bound prevents an
+/// authenticated client from growing the permission set without limit.
+pub const MAX_PERMISSIONS_PER_ALLOCATION: usize = 1024;
 
 impl Allocation {
     pub fn new(
@@ -113,9 +125,10 @@ impl Allocation {
             lifetime,
             five_tuple: (src, dst),
             relay: None,
-            permissions: std::collections::HashSet::new(),
+            permissions: Arc::new(RwLock::new(std::collections::HashSet::new())),
             bytes_forwarded: Arc::new(AtomicU64::new(0)),
             messages_forwarded: Arc::new(AtomicU64::new(0)),
+            username: None,
         }
     }
 
@@ -127,6 +140,7 @@ impl Allocation {
         src: SocketAddr,
         dst: SocketAddr,
         relay: AllocationRelay,
+        permissions: Arc<RwLock<std::collections::HashSet<std::net::IpAddr>>>,
     ) -> Self {
         Allocation {
             id,
@@ -137,9 +151,10 @@ impl Allocation {
             lifetime,
             five_tuple: (src, dst),
             relay: Some(relay),
-            permissions: std::collections::HashSet::new(),
+            permissions,
             bytes_forwarded: Arc::new(AtomicU64::new(0)),
             messages_forwarded: Arc::new(AtomicU64::new(0)),
+            username: None,
         }
     }
 
@@ -340,6 +355,11 @@ impl PortAllocator {
 
 pub struct AllocationTable {
     pub(crate) allocations: RwLock<HashMap<SocketAddr, Arc<RwLock<Allocation>>>>,
+    /// Secondary index: client 5-tuple → allocation, for O(1) lookup on the
+    /// hot path (ChannelData / Send Indication / Refresh / CreatePermission).
+    /// Kept consistent with `allocations` by create/remove/cleanup and by the
+    /// NAT-rebind `move_client_addr` helper.
+    by_client: RwLock<HashMap<SocketAddr, Arc<RwLock<Allocation>>>>,
     port_allocator: PortAllocator,
     bind_addr: Ipv4Addr,
     external_addr: Ipv4Addr,
@@ -439,6 +459,7 @@ impl AllocationTable {
         // Default TURN port range: 49152-65535 (16384 ports)
         AllocationTable {
             allocations: RwLock::new(HashMap::new()),
+            by_client: RwLock::new(HashMap::new()),
             port_allocator: PortAllocator::new(49152, 65535),
             bind_addr,
             external_addr,
@@ -448,7 +469,9 @@ impl AllocationTable {
             max_allocation_duration_secs,
             _current_bandwidth_bytes_per_sec: AtomicUsize::new(0),
             _max_bandwidth_bytes_per_sec: max_bandwidth_bytes_per_sec,
-            bandwidth_manager: Arc::new(crate::bandwidth::BandwidthManager::new(None)),
+            bandwidth_manager: Arc::new(crate::bandwidth::BandwidthManager::new(
+                max_bandwidth_bytes_per_sec.map(|v| v as u64),
+            )),
             main_socket: RwLock::new(None),
         }
     }
@@ -487,6 +510,7 @@ impl AllocationTable {
     ) -> Self {
         AllocationTable {
             allocations: RwLock::new(HashMap::new()),
+            by_client: RwLock::new(HashMap::new()),
             port_allocator: PortAllocator::new(min_port, max_port),
             bind_addr,
             external_addr,
@@ -496,7 +520,9 @@ impl AllocationTable {
             max_allocation_duration_secs,
             _current_bandwidth_bytes_per_sec: AtomicUsize::new(0),
             _max_bandwidth_bytes_per_sec: max_bandwidth_bytes_per_sec,
-            bandwidth_manager: Arc::new(crate::bandwidth::BandwidthManager::new(None)),
+            bandwidth_manager: Arc::new(crate::bandwidth::BandwidthManager::new(
+                max_bandwidth_bytes_per_sec.map(|v| v as u64),
+            )),
             main_socket: RwLock::new(None),
         }
     }
@@ -536,6 +562,21 @@ impl AllocationTable {
         client_addr: SocketAddr,
         requested_lifetime: Option<u32>,
         channel_table: &ChannelTable,
+    ) -> Result<Arc<RwLock<Allocation>>, Error> {
+        self.create_allocation_with_socket(client_addr, requested_lifetime, channel_table, None)
+            .await
+    }
+
+    /// Create an allocation, optionally binding its client-facing send socket
+    /// (used for Data Indication / ChannelData towards the client) to the
+    /// socket on which the Allocate request was received. When `None`, falls
+    /// back to the table's global main socket, then to the relay socket.
+    pub async fn create_allocation_with_socket(
+        &self,
+        client_addr: SocketAddr,
+        requested_lifetime: Option<u32>,
+        channel_table: &ChannelTable,
+        recv_socket: Option<Arc<UdpSocket>>,
     ) -> Result<Arc<RwLock<Allocation>>, Error> {
         if let Some(max) = self.max_concurrent_allocations {
             let current = self.stats.active_allocations.load(Ordering::Relaxed) as usize;
@@ -623,11 +664,17 @@ impl AllocationTable {
         let mut id = [0u8; 12];
         getrandom(&mut id);
 
-        // Spawn the per-allocation task
-        let main_socket = self
-            .main_socket
-            .read()
-            .clone()
+        // Permission set shared between the Allocation record and the relay
+        // task so peer→relay traffic can be validated (RFC 5766 §10) without
+        // locking the Allocation on every packet.
+        let permissions: Arc<RwLock<std::collections::HashSet<std::net::IpAddr>>> =
+            Arc::new(RwLock::new(std::collections::HashSet::new()));
+
+        // Spawn the per-allocation task. Prefer the socket the Allocate request
+        // arrived on so Data Indications leave from the address the client
+        // expects; fall back to the global main socket, then the relay socket.
+        let main_socket = recv_socket
+            .or_else(|| self.main_socket.read().clone())
             .unwrap_or_else(|| relay_socket.clone());
         let relay = spawn_allocation_task(
             relay_socket.clone(),
@@ -637,6 +684,8 @@ impl AllocationTable {
             relayed_addr,
             self.stats.clone(),
             channel_table.clone(),
+            permissions.clone(),
+            self.bandwidth_manager.clone(),
         )
         .await;
 
@@ -648,10 +697,17 @@ impl AllocationTable {
             client_addr,
             relayed_addr,
             relay,
+            permissions,
         )));
 
+        // Insert into both maps. Lock order is always `allocations` then
+        // `by_client` to avoid deadlocks.
         let mut allocations = self.allocations.write();
         allocations.insert(relayed_addr, allocation.clone());
+        drop(allocations);
+        self.by_client
+            .write()
+            .insert(client_addr, allocation.clone());
         self.stats.total_allocations.fetch_add(1, Ordering::Relaxed);
         self.stats
             .active_allocations
@@ -659,7 +715,7 @@ impl AllocationTable {
 
         // Register with bandwidth manager for tracking
         self.bandwidth_manager
-            .register_allocation(&relayed_addr.to_string(), None);
+            .register_allocation(relayed_addr, None);
 
         trace!(
             %client_addr,
@@ -685,7 +741,12 @@ impl AllocationTable {
     ) -> Option<Arc<RwLock<Allocation>>> {
         let mut allocations = self.allocations.write();
         let result = allocations.remove(relayed_addr);
+        drop(allocations);
         if let Some(ref alloc) = result {
+            // Drop the client index entry first (keyed by the current, possibly
+            // rebind-updated, client address).
+            let client_addr = alloc.read().client_addr;
+            self.by_client.write().remove(&client_addr);
             // Clean up channel bindings FIRST, before releasing the port,
             // to prevent a re-allocate on the same port from inheriting
             // stale bindings or having its fresh bindings incorrectly removed.
@@ -702,8 +763,7 @@ impl AllocationTable {
                 .active_allocations
                 .fetch_sub(1, Ordering::Relaxed);
             // Unregister from bandwidth manager to prevent memory leak
-            self.bandwidth_manager
-                .unregister_allocation(&relayed_addr.to_string());
+            self.bandwidth_manager.unregister_allocation(relayed_addr);
         }
         result
     }
@@ -726,14 +786,10 @@ impl AllocationTable {
     }
 
     pub fn find_allocation_by_client(&self, client_addr: &SocketAddr) -> Option<SocketAddr> {
-        let allocations = self.allocations.read();
-        for alloc in allocations.values() {
-            let a = alloc.read();
-            if a.client_addr == *client_addr {
-                return Some(a.relayed_addr);
-            }
-        }
-        None
+        self.by_client
+            .read()
+            .get(client_addr)
+            .map(|a| a.read().relayed_addr)
     }
 
     /// Get the allocation for a client, returning the Arc for direct access
@@ -741,58 +797,125 @@ impl AllocationTable {
         &self,
         client_addr: &SocketAddr,
     ) -> Option<Arc<RwLock<Allocation>>> {
-        let allocations = self.allocations.read();
-        for alloc in allocations.values() {
-            let a = alloc.read();
-            if a.client_addr == *client_addr {
-                return Some(alloc.clone());
-            }
-        }
-        None
+        self.by_client.read().get(client_addr).cloned()
     }
 
-    /// Add permissions for peer addresses on a client's allocation
-    pub fn add_permissions(&self, client_addr: &SocketAddr, peers: &[SocketAddr]) -> bool {
+    /// Find the single allocation owned by `username`, if exactly one exists.
+    /// Used as the NAT-rebind fallback for Refresh requests arriving from a
+    /// changed client transport address.
+    pub fn find_single_allocation_by_username(
+        &self,
+        username: &str,
+    ) -> Option<Arc<RwLock<Allocation>>> {
         let allocations = self.allocations.read();
+        let mut found: Option<Arc<RwLock<Allocation>>> = None;
         for alloc in allocations.values() {
-            let mut a = alloc.write();
-            if a.client_addr == *client_addr {
-                let before = a.permissions.len();
-                for peer in peers {
-                    a.permissions.insert(peer.ip());
+            if alloc.read().username.as_deref() == Some(username) {
+                if found.is_some() {
+                    return None;
                 }
-                let after = a.permissions.len();
-                info!(
-                    %client_addr,
-                    relayed_addr = %a.relayed_addr,
-                    permission_before = before,
-                    permission_after = after,
-                    requested_peer_count = peers.len(),
-                    peers = ?peers,
-                    "updated TURN permissions for allocation"
-                );
-                return true;
+                found = Some(alloc.clone());
             }
         }
-        debug!(
+        found
+    }
+
+    /// Atomically move an allocation's client-index entry from its current
+    /// client address to `new_client_addr` (NAT rebind). Returns the previous
+    /// client address, or `None` if it was already `new_client_addr`.
+    ///
+    /// Lock order is `by_client` then the per-allocation lock, matching
+    /// `send_to_peer` / `add_permissions` / `cleanup_expired` to avoid a
+    /// lock-order inversion.
+    pub fn move_client_addr(
+        &self,
+        relayed_addr: &SocketAddr,
+        new_client_addr: SocketAddr,
+    ) -> Option<SocketAddr> {
+        let alloc = self.get_allocation(relayed_addr)?;
+        let old = alloc.read().client_addr;
+        if old == new_client_addr {
+            return None;
+        }
+        let mut by_client = self.by_client.write();
+        match by_client.remove(&old) {
+            Some(entry) if entry.read().relayed_addr == *relayed_addr => {
+                // Same allocation: move the index entry and update its address
+                // while holding the index lock (no other thread can observe a
+                // torn key↔field pair).
+                let mut a = entry.write();
+                a.client_addr = new_client_addr;
+                a.five_tuple.0 = new_client_addr;
+                drop(a);
+                by_client.insert(new_client_addr, entry);
+            }
+            other => {
+                // The old address is either absent or now owned by a different
+                // allocation (address reuse): leave that entry alone.
+                if let Some(other_entry) = other {
+                    by_client.insert(old, other_entry);
+                }
+                let mut a = alloc.write();
+                a.client_addr = new_client_addr;
+                a.five_tuple.0 = new_client_addr;
+                drop(a);
+                by_client.insert(new_client_addr, alloc);
+            }
+        }
+        Some(old)
+    }
+
+    /// Add permissions for peer addresses on a client's allocation.
+    /// The per-allocation permission set is capped at
+    /// `MAX_PERMISSIONS_PER_ALLOCATION` to bound memory usage.
+    pub fn add_permissions(&self, client_addr: &SocketAddr, peers: &[SocketAddr]) -> bool {
+        let alloc = match self.by_client.read().get(client_addr) {
+            Some(a) => a.clone(),
+            None => {
+                debug!(
+                    %client_addr,
+                    requested_peer_count = peers.len(),
+                    peers = ?peers,
+                    "failed to update TURN permissions because allocation was not found"
+                );
+                return false;
+            }
+        };
+        let a = alloc.read();
+        let mut perms = a.permissions.write();
+        let before = perms.len();
+        for peer in peers {
+            if perms.len() >= MAX_PERMISSIONS_PER_ALLOCATION && !perms.contains(&peer.ip()) {
+                warn!(
+                    %client_addr,
+                    relayed_addr = %a.relayed_addr,
+                    max = MAX_PERMISSIONS_PER_ALLOCATION,
+                    "permission set full, ignoring further CreatePermission peers"
+                );
+                break;
+            }
+            perms.insert(peer.ip());
+        }
+        let after = perms.len();
+        drop(perms);
+        info!(
             %client_addr,
+            relayed_addr = %a.relayed_addr,
+            permission_before = before,
+            permission_after = after,
             requested_peer_count = peers.len(),
             peers = ?peers,
-            "failed to update TURN permissions because allocation was not found"
+            "updated TURN permissions for allocation"
         );
-        false
+        true
     }
 
     /// Check if a peer address is permitted for a client's allocation
     pub fn check_permission(&self, client_addr: &SocketAddr, peer: &SocketAddr) -> bool {
-        let allocations = self.allocations.read();
-        for alloc in allocations.values() {
-            let a = alloc.read();
-            if a.client_addr == *client_addr {
-                return a.permissions.contains(&peer.ip());
-            }
+        match self.by_client.read().get(client_addr) {
+            Some(a) => a.read().permissions.read().contains(&peer.ip()),
+            None => false,
         }
-        false
     }
 
     /// Send data from a client's allocation relay to a peer
@@ -810,58 +933,67 @@ impl AllocationTable {
             Arc<AtomicU64>,
             Arc<AtomicU64>,
         )> = {
-            let allocations = self.allocations.read();
-            let mut found: Option<(
-                Arc<UdpSocket>,
-                SocketAddr,
-                usize,
-                Arc<AtomicU64>,
-                Arc<AtomicU64>,
-            )> = None;
-            for alloc in allocations.values() {
-                let a = alloc.read();
-                if a.client_addr == *client_addr {
-                    let permission_count = a.permissions.len();
-                    // Check permission
-                    if !a.permissions.contains(&peer.ip()) {
-                        debug!(
-                            %client_addr,
-                            %peer,
-                            relayed_addr = %a.relayed_addr,
-                            permission_count,
-                            permissions = ?a.permissions,
-                            payload_len = data.len(),
-                            "dropping relay packet because peer is not in permission list"
-                        );
-                        return None;
-                    }
-                    // Clone the socket Arc so we can send after releasing the lock.
-                    if let Some(ref relay) = a.relay {
-                        found = Some((
-                            relay.socket.clone(),
-                            a.relayed_addr,
-                            permission_count,
-                            a.bytes_forwarded.clone(),
-                            a.messages_forwarded.clone(),
-                        ));
-                    } else {
-                        debug!(
-                            %client_addr,
-                            %peer,
-                            relayed_addr = %a.relayed_addr,
-                            permission_count,
-                            payload_len = data.len(),
-                            "dropping relay packet because allocation has no active relay socket"
-                        );
-                        return None;
-                    }
-                    break;
+            let alloc = match self.by_client.read().get(client_addr) {
+                Some(a) => a.clone(),
+                None => {
+                    debug!(
+                        %client_addr,
+                        %peer,
+                        payload_len = data.len(),
+                        "dropping relay packet because allocation was not found for client"
+                    );
+                    return None;
+                }
+            };
+            let a = alloc.read();
+            let permission_count = a.permissions.read().len();
+            // Check permission
+            if !a.permissions.read().contains(&peer.ip()) {
+                debug!(
+                    %client_addr,
+                    %peer,
+                    relayed_addr = %a.relayed_addr,
+                    permission_count,
+                    payload_len = data.len(),
+                    "dropping relay packet because peer is not in permission list"
+                );
+                return None;
+            }
+            // Clone the socket Arc so we can send after releasing the lock.
+            match a.relay {
+                Some(ref relay) => Some((
+                    relay.socket.clone(),
+                    a.relayed_addr,
+                    permission_count,
+                    a.bytes_forwarded.clone(),
+                    a.messages_forwarded.clone(),
+                )),
+                None => {
+                    debug!(
+                        %client_addr,
+                        %peer,
+                        relayed_addr = %a.relayed_addr,
+                        permission_count,
+                        payload_len = data.len(),
+                        "dropping relay packet because allocation has no active relay socket"
+                    );
+                    None
                 }
             }
-            found
         };
         if let Some((socket, relayed_addr, permission_count, bytes_fwd, messages_fwd)) = relay_state
         {
+            // Enforce the (global) bandwidth budget before sending.
+            if !self.bandwidth_manager.try_relay(&relayed_addr, data.len()) {
+                debug!(
+                    %client_addr,
+                    %peer,
+                    %relayed_addr,
+                    payload_len = data.len(),
+                    "dropping relay packet because bandwidth limit is exceeded"
+                );
+                return None;
+            }
             if let Err(err) = socket.send_to(data, &peer).await {
                 warn!(
                     %client_addr,
@@ -921,51 +1053,75 @@ impl AllocationTable {
 
     /// Clean up expired allocations and their channel bindings
     pub fn cleanup_expired(&self, channel_table: Option<&ChannelTable>) -> usize {
-        let mut count = 0;
-        let mut allocations = self.allocations.write();
+        // Phase 1: under the map write lock, detach expired entries only.
+        // Expensive per-entry work (logging, task abort, channel cleanup)
+        // happens after the lock is released so the hot path is not stalled.
+        let expired: Vec<(SocketAddr, Arc<RwLock<Allocation>>)> = {
+            let mut allocations = self.allocations.write();
+            let expired_addrs: Vec<SocketAddr> = allocations
+                .iter()
+                .filter(|(_, alloc)| alloc.read().is_expired())
+                .map(|(addr, _)| *addr)
+                .collect();
 
-        // Find expired allocations
-        let expired: Vec<SocketAddr> = allocations
-            .iter()
-            .filter(|(_, alloc)| alloc.read().is_expired())
-            .map(|(addr, _)| *addr)
-            .collect();
-
-        for addr in expired {
-            if let Some(alloc) = allocations.remove(&addr) {
-                {
-                    let a = alloc.read();
-                    let bytes = a.bytes_forwarded.load(Ordering::Relaxed);
-                    let messages = a.messages_forwarded.load(Ordering::Relaxed);
-                    let permission_count = a.permissions.len();
-                    let lived_secs = a.created_at.elapsed().as_secs();
-                    let refresh_age_secs = a.refreshed_at.elapsed().as_secs();
-                    tracing::info!(
-                        relayed_addr = %addr,
-                        client_addr = %a.client_addr,
-                        lived_secs,
-                        refresh_age_secs,
-                        bytes_forwarded = bytes,
-                        messages_forwarded = messages,
-                        permission_count,
-                        "allocation expired and removed"
-                    );
+            let mut removed = Vec::with_capacity(expired_addrs.len());
+            for addr in expired_addrs {
+                if let Some(alloc) = allocations.remove(&addr) {
+                    removed.push((addr, alloc));
                 }
-                // Abort the allocation task
-                if let Some(ref relay) = alloc.read().relay {
-                    relay.task_handle.abort();
-                }
-                // Release port back to allocator
-                self.port_allocator.release(addr.port());
-                // Unregister from bandwidth manager to prevent memory leak
-                self.bandwidth_manager
-                    .unregister_allocation(&addr.to_string());
-                // Clean up channel bindings for this relayed address
-                if let Some(ch_table) = channel_table {
-                    ch_table.remove_for_relayed(&addr);
-                }
-                count += 1;
             }
+            drop(allocations);
+
+            if !removed.is_empty() {
+                let mut by_client = self.by_client.write();
+                for (addr, alloc) in &removed {
+                    let client_addr = alloc.read().client_addr;
+                    if let Some(entry) = by_client.remove(&client_addr)
+                        && entry.read().relayed_addr != *addr
+                    {
+                        // The index entry belongs to a newer allocation that
+                        // reused this client address; put it back.
+                        by_client.insert(client_addr, entry);
+                    }
+                }
+            }
+            removed
+        };
+
+        // Phase 2: per-entry teardown without holding the table lock.
+        let mut count = 0;
+        for (addr, alloc) in expired {
+            {
+                let a = alloc.read();
+                let bytes = a.bytes_forwarded.load(Ordering::Relaxed);
+                let messages = a.messages_forwarded.load(Ordering::Relaxed);
+                let permission_count = a.permissions.read().len();
+                let lived_secs = a.created_at.elapsed().as_secs();
+                let refresh_age_secs = a.refreshed_at.elapsed().as_secs();
+                tracing::info!(
+                    relayed_addr = %addr,
+                    client_addr = %a.client_addr,
+                    lived_secs,
+                    refresh_age_secs,
+                    bytes_forwarded = bytes,
+                    messages_forwarded = messages,
+                    permission_count,
+                    "allocation expired and removed"
+                );
+            }
+            // Abort the allocation task
+            if let Some(ref relay) = alloc.read().relay {
+                relay.task_handle.abort();
+            }
+            // Release port back to allocator
+            self.port_allocator.release(addr.port());
+            // Unregister from bandwidth manager to prevent memory leak
+            self.bandwidth_manager.unregister_allocation(&addr);
+            // Clean up channel bindings for this relayed address
+            if let Some(ch_table) = channel_table {
+                ch_table.remove_for_relayed(&addr);
+            }
+            count += 1;
         }
 
         if count > 0 {
@@ -991,30 +1147,62 @@ fn getrandom(buf: &mut [u8]) {
 }
 
 fn build_data_indication(peer_addr: SocketAddr, payload: &[u8]) -> Bytes {
+    use bytes::BufMut;
+
+    const MAGIC: u32 = 0x2112A442;
     let mut transaction_id = [0u8; 12];
     getrandom(&mut transaction_id);
 
-    let mut msg = crate::message::Message {
-        header: crate::message::MessageHeader {
-            method: crate::message::Method::Data,
-            event_type: crate::message::EventType::Indication,
-            message_length: 0,
-            magic_cookie: 0x2112A442,
-            transaction_id,
-        },
-        attributes: Vec::new(),
+    let peer_len: usize = match peer_addr {
+        SocketAddr::V4(_) => 8,
+        SocketAddr::V6(_) => 20,
     };
+    let data_pad = (4 - (payload.len() % 4)) % 4;
+    let msg_len = (4 + peer_len) + (4 + payload.len() + data_pad);
 
-    msg.attributes.push(crate::message::Attribute {
-        attr_type: crate::message::Attribute::PEER_ADDRESS,
-        value: crate::message::encode_xor_address(peer_addr, 0x2112A442, &transaction_id),
-    });
-    msg.attributes.push(crate::message::Attribute {
-        attr_type: crate::message::Attribute::DATA,
-        value: Bytes::copy_from_slice(payload),
-    });
+    // Single allocation, single pass: header + XOR-PEER-ADDRESS + DATA.
+    let mut buf = bytes::BytesMut::with_capacity(20 + msg_len);
+    // Data(0x007) Indication(class 1) → 0x0017 per RFC 5389 type encoding.
+    buf.put_u16(0x0017);
+    buf.put_u16(msg_len as u16);
+    buf.put_u32(MAGIC);
+    buf.put_slice(&transaction_id);
 
-    msg.encode()
+    buf.put_u16(crate::message::Attribute::PEER_ADDRESS);
+    buf.put_u16(peer_len as u16);
+    match peer_addr {
+        SocketAddr::V4(v4) => {
+            buf.put_u8(0);
+            buf.put_u8(0x01);
+            buf.put_u16(v4.port() ^ (MAGIC >> 16) as u16);
+            let ip = v4.ip().octets();
+            buf.put_u8(ip[0] ^ (MAGIC >> 24) as u8);
+            buf.put_u8(ip[1] ^ (MAGIC >> 16) as u8);
+            buf.put_u8(ip[2] ^ (MAGIC >> 8) as u8);
+            buf.put_u8(ip[3] ^ MAGIC as u8);
+        }
+        SocketAddr::V6(v6) => {
+            buf.put_u8(0);
+            buf.put_u8(0x02);
+            buf.put_u16(v6.port() ^ (MAGIC >> 16) as u16);
+            let octets = v6.ip().octets();
+            for (i, shift) in (0..4usize).zip([24u32, 16, 8, 0]) {
+                buf.put_u8(octets[i] ^ (MAGIC >> shift) as u8);
+            }
+            for i in 0..12 {
+                buf.put_u8(octets[4 + i] ^ transaction_id[i]);
+            }
+        }
+    }
+
+    buf.put_u16(crate::message::Attribute::DATA);
+    buf.put_u16(payload.len() as u16);
+    buf.put_slice(payload);
+    for _ in 0..data_pad {
+        buf.put_u8(0);
+    }
+
+    buf.freeze()
 }
 
 fn normalize_peer_addr_for_client(
@@ -1052,6 +1240,8 @@ async fn spawn_allocation_task(
     relayed_addr: SocketAddr,
     stats: Arc<ServerStats>,
     channel_table: ChannelTable,
+    permissions: Arc<RwLock<std::collections::HashSet<std::net::IpAddr>>>,
+    bandwidth_manager: Arc<crate::bandwidth::BandwidthManager>,
 ) -> AllocationRelay {
     let (tx, mut rx) = mpsc::channel::<AllocationMessage>(1024);
 
@@ -1060,6 +1250,9 @@ async fn spawn_allocation_task(
 
     let task_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
+        // Reusable scratch buffer for building ChannelData frames (B3: avoids
+        // one heap allocation per relayed packet; grows to max seen size).
+        let mut channel_scratch = bytes::BytesMut::with_capacity(2048);
         let mut consecutive_recv_errors: u32 = 0;
         let mut last_recv_error_at: Option<Instant> = None;
         const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 100;
@@ -1067,7 +1260,7 @@ async fn spawn_allocation_task(
         // Optional TCP client channel: if set, peer→client data goes via
         // this channel (framed with RFC 6062 2-byte length prefix) instead
         // of the UDP main_socket.
-        let mut tcp_client_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>> = None;
+        let mut tcp_client_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>> = None;
 
         loop {
             tokio::select! {
@@ -1078,6 +1271,32 @@ async fn spawn_allocation_task(
                             // Reset error counter on success
                             consecutive_recv_errors = 0;
                             last_recv_error_at = None;
+
+                            // RFC 5766 §10: only relay traffic from peers for
+                            // which a permission exists (ChannelBind installs
+                            // one implicitly). Without this check any host that
+                            // learns the relay port could inject/amplify traffic.
+                            if !permissions.read().contains(&peer_addr.ip()) {
+                                trace!(
+                                    %client_addr,
+                                    peer = %peer_addr,
+                                    payload_len = len,
+                                    "dropping peer packet without permission"
+                                );
+                                continue;
+                            }
+
+                            // Enforce the bandwidth budget on the peer→client
+                            // direction as well.
+                            if !bandwidth_manager.try_relay(&relayed_addr, len) {
+                                trace!(
+                                    %client_addr,
+                                    peer = %peer_addr,
+                                    payload_len = len,
+                                    "dropping peer packet because bandwidth limit is exceeded"
+                                );
+                                continue;
+                            }
 
                             // Update stats using atomics - no lock contention
                             stats.total_bytes_relayed.fetch_add(len as u64, Ordering::Relaxed);
@@ -1096,24 +1315,20 @@ async fn spawn_allocation_task(
                             let channel_num = channel_table.get_by_peer_for_relayed(&relayed_addr, &effective_peer);
 
                             if let Some(ch_num) = channel_num {
-                                // Send as ChannelData
-                                let data_len = len as u16;
-                                let mut channel_data = vec![0u8; 4 + len];
-                                channel_data[0] = (ch_num >> 8) as u8;
-                                channel_data[1] = (ch_num & 0xFF) as u8;
-                                channel_data[2] = (data_len >> 8) as u8;
-                                channel_data[3] = (data_len & 0xFF) as u8;
-                                channel_data[4..].copy_from_slice(&buf[..len]);
+                                // Send as ChannelData (single scratch buffer, no per-packet alloc)
+                                use bytes::BufMut;
+                                channel_scratch.clear();
+                                channel_scratch.reserve(4 + len);
+                                channel_scratch.put_u16(ch_num);
+                                channel_scratch.put_u16(len as u16);
+                                channel_scratch.put_slice(&buf[..len]);
 
                                 if let Some(ref tx) = tcp_client_tx {
-                                    let mut framed = vec![0u8; 2 + channel_data.len()];
-                                    framed[0] = (channel_data.len() >> 8) as u8;
-                                    framed[1] = (channel_data.len() & 0xFF) as u8;
-                                    framed[2..].copy_from_slice(&channel_data);
-                                    if let Err(e) = tx.send(framed) {
+                                    let framed = frame_for_tcp(&channel_scratch);
+                                    if let Err(e) = tx.try_send(framed) {
                                         warn!(%client_addr, "TCP forward to client failed: {}", e);
                                     }
-                                } else if let Err(e) = main_socket_clone.send_to(&channel_data, &client_addr).await {
+                                } else if let Err(e) = main_socket_clone.send_to(&channel_scratch, &client_addr).await {
                                     warn!(
                                         %client_addr,
                                         peer = %effective_peer,
@@ -1127,11 +1342,8 @@ async fn spawn_allocation_task(
                                 // Send as Data Indication
                                 let indication = build_data_indication(effective_peer, &buf[..len]);
                                 if let Some(ref tx) = tcp_client_tx {
-                                    let mut framed = vec![0u8; 2 + indication.len()];
-                                    framed[0] = (indication.len() >> 8) as u8;
-                                    framed[1] = (indication.len() & 0xFF) as u8;
-                                    framed[2..].copy_from_slice(&indication);
-                                    if let Err(e) = tx.send(framed) {
+                                    let framed = frame_for_tcp(&indication);
+                                    if let Err(e) = tx.try_send(framed) {
                                         warn!(%client_addr, "TCP Data Indication forward failed: {}", e);
                                     }
                                 } else if let Err(e) = main_socket_clone.send_to(&indication, &client_addr).await {
@@ -1168,15 +1380,21 @@ async fn spawn_allocation_task(
                             }
 
                             if consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                                // Sustained transient errors (e.g. ICMP storms) must not
+                                // permanently kill peer→client forwarding for a live
+                                // allocation. Back off, reset the counter and continue.
                                 warn!(
                                     %client_addr,
                                     consecutive_errors = consecutive_recv_errors,
                                     max_consecutive = MAX_CONSECUTIVE_RECV_ERRORS,
                                     window_secs = RECV_ERROR_WINDOW_SECS,
                                     error = %e,
-                                    "relay socket too many consecutive recv errors within window, exiting relay loop"
+                                    "relay socket sustained too many recv errors; backing off and continuing"
                                 );
-                                break;
+                                consecutive_recv_errors = 0;
+                                last_recv_error_at = None;
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                continue;
                             }
 
                             warn!(
@@ -1251,9 +1469,23 @@ async fn spawn_allocation_task(
     }
 }
 
+/// Frame a STUN/ChannelData message with the RFC 6062 2-byte length prefix
+/// used on TURN-over-TCP connections.
+fn frame_for_tcp(message: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(2 + message.len());
+    framed.push((message.len() >> 8) as u8);
+    framed.push((message.len() & 0xFF) as u8);
+    framed.extend_from_slice(message);
+    framed
+}
+
 #[derive(Clone)]
 pub struct ChannelTable {
     channels: Arc<RwLock<HashMap<(SocketAddr, u16), ChannelBinding>>>,
+    /// Secondary index: (relayed_addr, peer_addr) → channel binding, for O(1)
+    /// lookup on the per-packet peer→client relay path. Kept consistent with
+    /// `channels` by bind/unbind/remove_for_relayed/cleanup_expired.
+    by_peer: Arc<RwLock<HashMap<(SocketAddr, SocketAddr), ChannelBinding>>>,
     next_channel: Arc<std::sync::atomic::AtomicU16>,
     default_lifetime: Duration,
 }
@@ -1285,6 +1517,7 @@ impl ChannelTable {
     pub fn new() -> Self {
         ChannelTable {
             channels: Arc::new(RwLock::new(HashMap::new())),
+            by_peer: Arc::new(RwLock::new(HashMap::new())),
             next_channel: Arc::new(std::sync::atomic::AtomicU16::new(0x4000)),
             default_lifetime: Duration::from_secs(600),
         }
@@ -1297,6 +1530,7 @@ impl ChannelTable {
     pub fn with_lifetime(default_lifetime: Duration) -> Self {
         ChannelTable {
             channels: Arc::new(RwLock::new(HashMap::new())),
+            by_peer: Arc::new(RwLock::new(HashMap::new())),
             next_channel: Arc::new(std::sync::atomic::AtomicU16::new(0x4000)),
             default_lifetime,
         }
@@ -1308,25 +1542,39 @@ impl ChannelTable {
         peer_addr: SocketAddr,
         relayed_addr: SocketAddr,
     ) -> Result<(), Error> {
-        let mut channels = self.channels.write();
         let key = (relayed_addr, channel_id);
+        let binding = ChannelBinding {
+            channel_id,
+            peer_addr,
+            relayed_addr,
+            created_at: Instant::now(),
+            lifetime: self.default_lifetime,
+        };
+
+        // Lock order is always `channels` then `by_peer`.
+        let mut channels = self.channels.write();
+        let mut by_peer = self.by_peer.write();
+
         if let Some(existing) = channels.get_mut(&key) {
             if existing.peer_addr == peer_addr {
                 existing.created_at = Instant::now();
+                // Keep the secondary index in sync with the refreshed binding.
+                by_peer.insert((relayed_addr, peer_addr), existing.clone());
                 return Ok(());
             }
             return Err(Error::AlreadyExists);
         }
-        channels.insert(
-            key,
-            ChannelBinding {
-                channel_id,
-                peer_addr,
-                relayed_addr,
-                created_at: Instant::now(),
-                lifetime: self.default_lifetime,
-            },
-        );
+
+        // RFC 5766 §11: a peer may be bound to at most one channel per
+        // allocation. Reject binding the same peer to a second channel.
+        if let Some(existing) = by_peer.get(&(relayed_addr, peer_addr))
+            && existing.channel_id != channel_id
+        {
+            return Err(Error::AlreadyExists);
+        }
+
+        channels.insert(key, binding.clone());
+        by_peer.insert((relayed_addr, peer_addr), binding);
         Ok(())
     }
 
@@ -1356,13 +1604,10 @@ impl ChannelTable {
         relayed_addr: &SocketAddr,
         peer_addr: &SocketAddr,
     ) -> Option<u16> {
-        let channels = self.channels.read();
-        for ((ra, channel_id), ch) in channels.iter() {
-            if ra == relayed_addr && ch.peer_addr == *peer_addr {
-                return Some(*channel_id);
-            }
-        }
-        None
+        self.by_peer
+            .read()
+            .get(&(*relayed_addr, *peer_addr))
+            .map(|b| b.channel_id)
     }
 
     pub fn get_relayed_by_peer(&self, peer_addr: &SocketAddr) -> Option<SocketAddr> {
@@ -1377,7 +1622,12 @@ impl ChannelTable {
 
     pub fn unbind(&self, relayed_addr: SocketAddr, channel_id: u16) -> Option<ChannelBinding> {
         let mut channels = self.channels.write();
-        channels.remove(&(relayed_addr, channel_id))
+        let mut by_peer = self.by_peer.write();
+        let removed = channels.remove(&(relayed_addr, channel_id));
+        if let Some(ref binding) = removed {
+            by_peer.remove(&(binding.relayed_addr, binding.peer_addr));
+        }
+        removed
     }
 
     pub fn next_id(&self) -> u16 {
@@ -1405,8 +1655,10 @@ impl ChannelTable {
     /// leaking into a new allocation that reuses the same port.
     pub fn remove_for_relayed(&self, relayed_addr: &SocketAddr) -> usize {
         let mut channels = self.channels.write();
+        let mut by_peer = self.by_peer.write();
         let before = channels.len();
         channels.retain(|(ra, _), _| ra != relayed_addr);
+        by_peer.retain(|(ra, _), _| ra != relayed_addr);
         before.saturating_sub(channels.len())
     }
 
@@ -1414,8 +1666,10 @@ impl ChannelTable {
     /// Returns the number of expired channels removed
     pub fn cleanup_expired(&self) -> usize {
         let mut channels = self.channels.write();
+        let mut by_peer = self.by_peer.write();
         let initial_count = channels.len();
         channels.retain(|_, binding| !binding.is_expired());
+        by_peer.retain(|_, binding| !binding.is_expired());
         initial_count.saturating_sub(channels.len())
     }
 
@@ -2206,7 +2460,10 @@ mod tests {
         let relay_socket = alloc.read().relay.as_ref().unwrap().socket.clone();
 
         // Step 1: Send data from a peer → relay task should process it
+        // (permission required for peer→relay forwarding).
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        assert!(table.add_permissions(&client, &[peer_addr]));
         peer.send_to(b"hello", &relayed_addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 

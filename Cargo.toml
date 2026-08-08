@@ -1,6 +1,6 @@
 [package]
 name = "miuturn"
-version = "0.1.8"
+version = "0.2.0"
 edition = "2024"
 description = "A high-performance TURN server implemented in Rust, designed for WebRTC applications."
 authors = ["jinti<shenjindi@fourz.cn>"]
@@ -56,7 +56,7 @@ tower = "0.5"
 anyhow = "1"
 webrtc-util = "0.17.1"
 futures = "0.3"
-rustrtc = "0.3"
+rustrtc = "0.3.113"
 
 [[test]]
 name = "integration_tests"
