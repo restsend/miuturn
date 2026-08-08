@@ -1,4 +1,3 @@
-
 /// Unit tests for critical relay data paths.
 ///
 /// These tests validate the core TURN relay functionality:
@@ -1034,11 +1033,18 @@ mod relay_data_path_tests {
     }
 
     // ---------------------------------------------------------------------------
-    // A7 regression: peer→relay traffic without a permission is dropped (RFC
-    // 5766 §10), and traffic from a permitted peer is relayed.
+    // Peer→relay permission gating (RFC 5766 §10) is opt-in. By default the
+    // server is lenient (pre-0.2.0 behavior): peer→client traffic is relayed
+    // without a source-IP permission check. With enforcement enabled, packets
+    // from an unpermitted peer IP are dropped.
     // ---------------------------------------------------------------------------
+
+    fn peer_to_relay_stats(table: &AllocationTable) -> u64 {
+        table.stats().total_bytes_relayed.load(Ordering::Relaxed)
+    }
+
     #[tokio::test]
-    async fn test_a7_peer_to_relay_permission_gating() {
+    async fn test_default_lenient_relays_peer_without_permission() {
         let table = dummy_table();
         let channel_table = ChannelTable::new();
         let client: SocketAddr = make_addr("192.168.1.1", 12345);
@@ -1052,23 +1058,89 @@ mod relay_data_path_tests {
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let peer_addr = peer.local_addr().unwrap();
 
-        // No permission yet → packet dropped, no stats.
-        let before = table.stats().total_bytes_relayed.load(Ordering::Relaxed);
+        // No permission at all → still relayed (lenient default).
+        let before = peer_to_relay_stats(&table);
+        peer.send_to(b"no-permission", &relayed_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after = peer_to_relay_stats(&table);
+        assert!(
+            after > before,
+            "lenient default must relay peer packet without a permission"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lenient_relays_peer_not_in_permission_set() {
+        // Production incident scenario: the client creates permissions for the
+        // peer's private/host address, but the peer's traffic arrives from a
+        // different (public) address. Lenient mode must still relay it.
+        let table = dummy_table();
+        let channel_table = ChannelTable::new();
+        let client: SocketAddr = make_addr("192.168.1.1", 12345);
+
+        let alloc = table
+            .create_allocation(client, Some(600), &channel_table)
+            .await
+            .unwrap();
+        let relayed_addr = alloc.read().relayed_addr;
+
+        // Permission exists for the peer's "private" address...
+        let private: SocketAddr = make_addr("192.168.3.227", 61026);
+        assert!(table.add_permissions(&client, &[private]));
+
+        // ...but traffic arrives from the peer's "public" address (a different
+        // source IP, so it can never match the permission set).
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let public = peer.local_addr().unwrap();
+        assert_ne!(private.ip(), public.ip());
+
+        let before = peer_to_relay_stats(&table);
+        peer.send_to(b"public-src", &relayed_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after = peer_to_relay_stats(&table);
+        assert!(
+            after > before,
+            "lenient mode must relay packets from a source IP that is not in \
+             the permission set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_strict_drops_peer_without_permission() {
+        let table = dummy_table();
+        table.set_enforce_peer_permissions(true);
+        let channel_table = ChannelTable::new();
+        let client: SocketAddr = make_addr("192.168.1.1", 12345);
+
+        let alloc = table
+            .create_allocation(client, Some(600), &channel_table)
+            .await
+            .unwrap();
+        let relayed_addr = alloc.read().relayed_addr;
+
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        // No permission → dropped, no stats.
+        let before = peer_to_relay_stats(&table);
         peer.send_to(b"unauthorized", &relayed_addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let after = table.stats().total_bytes_relayed.load(Ordering::Relaxed);
+        let after = peer_to_relay_stats(&table);
         assert_eq!(
             after, before,
-            "peer packet without permission must be dropped"
+            "strict mode must drop peer packet without a permission"
         );
 
         // Install permission → packet relayed.
         assert!(table.add_permissions(&client, &[peer_addr]));
-        let before = table.stats().total_bytes_relayed.load(Ordering::Relaxed);
+        let before = peer_to_relay_stats(&table);
         peer.send_to(b"authorized", &relayed_addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let after = table.stats().total_bytes_relayed.load(Ordering::Relaxed);
-        assert!(after > before, "permitted peer packet must be relayed");
+        let after = peer_to_relay_stats(&table);
+        assert!(
+            after > before,
+            "strict mode must relay permitted peer packet"
+        );
     }
 
     // ---------------------------------------------------------------------------

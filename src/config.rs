@@ -31,6 +31,14 @@ pub struct ServerConfig {
     pub stats_dump_skip_if_no_change: bool,
     #[serde(default = "ServerConfig::default_server_name")]
     pub server_name: String,
+    /// When `true`, enforce RFC 5766 §10 permission checks on the peer→relay
+    /// direction: packets from an IP that has no TURN permission are dropped.
+    /// When `false` (default, matches the pre-0.2.0 behavior), peer→client
+    /// traffic is relayed without a source-IP permission check so clients that
+    /// only create permissions for private/host peer addresses still receive
+    /// media arriving from the peer's public address.
+    #[serde(default)]
+    pub relay_enforce_peer_permissions: bool,
 }
 
 impl ServerConfig {
@@ -188,6 +196,7 @@ impl Default for Config {
                 stats_dump_interval_secs: 30,
                 stats_dump_skip_if_no_change: true,
                 server_name: ServerConfig::default_server_name(),
+                relay_enforce_peer_permissions: false,
             },
             http: None,
             log: LogConfig::default(),
@@ -428,5 +437,54 @@ ip_whitelist = []
 "#;
         let user: UserConfig = toml::from_str(toml_content).unwrap();
         assert_eq!(user.ip_whitelist.as_ref().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_server_config_relay_enforce_peer_permissions_default_false() {
+        // The field is optional: absent → default false (lenient).
+        let config: Config = toml::from_str(
+            r#"
+[server]
+realm = "r"
+external_ip = "127.0.0.1"
+start_port = 49152
+end_port = 65535
+
+[[server.listening]]
+protocol = "udp"
+address = "0.0.0.0:3478"
+
+[auth]
+users = []
+"#,
+        )
+        .unwrap();
+        assert!(!config.server.relay_enforce_peer_permissions);
+    }
+
+    #[test]
+    fn test_server_config_relay_enforce_peer_permissions_parse() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+realm = "r"
+external_ip = "127.0.0.1"
+start_port = 49152
+end_port = 65535
+relay_enforce_peer_permissions = true
+
+[[server.listening]]
+protocol = "udp"
+address = "0.0.0.0:3478"
+
+[auth]
+users = []
+"#,
+        )
+        .unwrap();
+        assert!(config.server.relay_enforce_peer_permissions);
+
+        let default = Config::default();
+        assert!(!default.server.relay_enforce_peer_permissions);
     }
 }

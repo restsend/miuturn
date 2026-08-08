@@ -102,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     server.set_stats_dump_interval(config.server.stats_dump_interval_secs);
     server.set_stats_dump_skip_if_no_change(config.server.stats_dump_skip_if_no_change);
     server.set_server_name(config.server.server_name.clone());
+    server.set_enforce_peer_permissions(config.server.relay_enforce_peer_permissions);
 
     info!(
         external_ip = %relay_addr,
@@ -109,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         stats_dump_interval = config.server.stats_dump_interval_secs,
         stats_dump_skip_if_no_change = config.server.stats_dump_skip_if_no_change,
         server_name = %config.server.server_name,
+        relay_enforce_peer_permissions = config.server.relay_enforce_peer_permissions,
         "configured relay addressing"
     );
 

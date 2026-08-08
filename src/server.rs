@@ -146,6 +146,12 @@ impl TurnServer {
         self.server_name = server_name;
     }
 
+    /// Enable or disable RFC 5766 §10 permission enforcement on the peer→relay
+    /// direction. Disabled by default (lenient, pre-0.2.0 behavior).
+    pub fn set_enforce_peer_permissions(&self, enforce: bool) {
+        self.allocation_table.set_enforce_peer_permissions(enforce);
+    }
+
     pub fn with_password(relay_addr: Ipv4Addr, realm: String, password: String) -> Self {
         Self::with_limits_and_password(relay_addr, realm, None, None, None, password, false)
     }

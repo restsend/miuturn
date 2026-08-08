@@ -14,6 +14,11 @@ stats_dump_interval_secs = 30
 stats_dump_skip_if_no_change = true
 # Server name for SOFTWARE attribute in TURN responses (default: miuturn/0.1.2)
 server_name = "miuturn/0.1.2"
+# Enforce RFC 5766 §10 source-IP permission checks on peer→client relay traffic
+# (default: false). Keep false for compatibility with clients that only create
+# permissions for private/host peer addresses while media arrives from the
+# peer's public address. Set true for strict RFC 5766 §10 gating.
+#relay_enforce_peer_permissions = false
 
 [[server.listening]]
 protocol = "udp"

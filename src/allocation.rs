@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Fast xorshift64 PRNG for port randomization.
@@ -374,6 +374,11 @@ pub struct AllocationTable {
     /// Optional Prometheus metrics collector (recorded at low-frequency points:
     /// allocation create/remove and channel bind/unbind — never per packet).
     metrics: parking_lot::RwLock<Option<crate::metrics::Metrics>>,
+    /// When `true`, enforce RFC 5766 §10 permission checks on the peer→relay
+    /// direction (packets from an IP without a TURN permission are dropped).
+    /// When `false` (default, matching pre-0.2.0 behavior), peer→client traffic
+    /// is relayed without a source-IP permission check.
+    enforce_peer_permissions: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -477,6 +482,7 @@ impl AllocationTable {
             )),
             main_socket: RwLock::new(None),
             metrics: parking_lot::RwLock::new(None),
+            enforce_peer_permissions: AtomicBool::new(false),
         }
     }
 
@@ -529,11 +535,20 @@ impl AllocationTable {
             )),
             main_socket: RwLock::new(None),
             metrics: parking_lot::RwLock::new(None),
+            enforce_peer_permissions: AtomicBool::new(false),
         }
     }
 
     pub fn set_main_socket(&self, socket: Arc<tokio::net::UdpSocket>) {
         *self.main_socket.write() = Some(socket);
+    }
+
+    /// Enable or disable RFC 5766 §10 permission enforcement on the peer→relay
+    /// direction. Disabled by default (lenient, pre-0.2.0 behavior); set to
+    /// `true` for strict source-IP permission gating.
+    pub fn set_enforce_peer_permissions(&self, enforce: bool) {
+        self.enforce_peer_permissions
+            .store(enforce, Ordering::Relaxed);
     }
 
     /// Attach (or detach) the metrics collector used at allocation/channel
@@ -702,6 +717,7 @@ impl AllocationTable {
             channel_table.clone(),
             permissions.clone(),
             self.bandwidth_manager.clone(),
+            self.enforce_peer_permissions.load(Ordering::Relaxed),
         )
         .await;
 
@@ -1273,6 +1289,7 @@ async fn spawn_allocation_task(
     channel_table: ChannelTable,
     permissions: Arc<RwLock<std::collections::HashSet<std::net::IpAddr>>>,
     bandwidth_manager: Arc<crate::bandwidth::BandwidthManager>,
+    enforce_peer_permissions: bool,
 ) -> AllocationRelay {
     let (tx, mut rx) = mpsc::channel::<AllocationMessage>(1024);
 
@@ -1307,7 +1324,13 @@ async fn spawn_allocation_task(
                             // which a permission exists (ChannelBind installs
                             // one implicitly). Without this check any host that
                             // learns the relay port could inject/amplify traffic.
-                            if !permissions.read().contains(&peer_addr.ip()) {
+                            // Enforcement is opt-in (default off) for backwards
+                            // compatibility with clients that only create
+                            // permissions for private/host peer addresses while
+                            // media arrives from the peer's public address.
+                            if enforce_peer_permissions
+                                && !permissions.read().contains(&peer_addr.ip())
+                            {
                                 trace!(
                                     %client_addr,
                                     peer = %peer_addr,

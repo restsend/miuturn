@@ -42,7 +42,10 @@ async fn wait_server_ready(server_addr: SocketAddr) {
         sleep(Duration::from_millis(25)).await;
     }
 
-    panic!("server was not ready on {} within startup timeout", server_addr);
+    panic!(
+        "server was not ready on {} within startup timeout",
+        server_addr
+    );
 }
 
 static RELAY_BASE: AtomicU16 = AtomicU16::new(25000);
@@ -81,14 +84,13 @@ fn turn_config(turn_addr: SocketAddr) -> RtcConfiguration {
 }
 
 /// Exchange SDP between two rustrtc PeerConnections.
-async fn exchange_sdp(
-    offerer: &PeerConnection,
-    answerer: &PeerConnection,
-) -> anyhow::Result<()> {
+async fn exchange_sdp(offerer: &PeerConnection, answerer: &PeerConnection) -> anyhow::Result<()> {
     // Offerer
     let _ = offerer.create_offer().await?;
     loop {
-        if offerer.ice_transport().gather_state() == rustrtc::transports::ice::IceGathererState::Complete {
+        if offerer.ice_transport().gather_state()
+            == rustrtc::transports::ice::IceGathererState::Complete
+        {
             break;
         }
         sleep(Duration::from_millis(50)).await;
@@ -100,7 +102,9 @@ async fn exchange_sdp(
     answerer.set_remote_description(offer).await?;
     let _ = answerer.create_answer().await?;
     loop {
-        if answerer.ice_transport().gather_state() == rustrtc::transports::ice::IceGathererState::Complete {
+        if answerer.ice_transport().gather_state()
+            == rustrtc::transports::ice::IceGathererState::Complete
+        {
             break;
         }
         sleep(Duration::from_millis(50)).await;
@@ -162,12 +166,16 @@ async fn rustrtc_turn_relay_data_channel() -> anyhow::Result<()> {
     let pair_b = pair_b.expect("pc_b should have a selected ICE pair");
 
     assert_eq!(
-        pair_a.local.typ, IceCandidateType::Relay,
-        "pc_a local candidate should be relay, got {:?}", pair_a.local.typ
+        pair_a.local.typ,
+        IceCandidateType::Relay,
+        "pc_a local candidate should be relay, got {:?}",
+        pair_a.local.typ
     );
     assert_eq!(
-        pair_b.local.typ, IceCandidateType::Relay,
-        "pc_b local candidate should be relay, got {:?}", pair_b.local.typ
+        pair_b.local.typ,
+        IceCandidateType::Relay,
+        "pc_b local candidate should be relay, got {:?}",
+        pair_b.local.typ
     );
 
     // Allow DTLS/SCTP handshake to settle.

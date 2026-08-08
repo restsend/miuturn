@@ -651,7 +651,9 @@ async fn test_alloc_performance_direct() {
 
     for i in 0..NUM_ALLOCS {
         let client: SocketAddr = format!("192.168.1.{}:12345", i % 255).parse().unwrap();
-        let _ = server.allocation_table.create_allocation(client, Some(600), &channel_table);
+        let _ = server
+            .allocation_table
+            .create_allocation(client, Some(600), &channel_table);
     }
 
     let elapsed = start.elapsed().as_secs_f64();
@@ -695,7 +697,10 @@ async fn test_alloc_performance_concurrent_direct() {
             for i in 0..ALLOCS_PER_TASK {
                 let client: SocketAddr =
                     format!("192.168.{}.{}:12345", t, i % 255).parse().unwrap();
-                let _ = server.allocation_table.create_allocation(client, Some(600), &channel_table);
+                let _ =
+                    server
+                        .allocation_table
+                        .create_allocation(client, Some(600), &channel_table);
             }
         });
         handles.push(handle);
