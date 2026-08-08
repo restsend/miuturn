@@ -371,6 +371,9 @@ pub struct AllocationTable {
     _max_bandwidth_bytes_per_sec: Option<usize>,
     bandwidth_manager: Arc<crate::bandwidth::BandwidthManager>,
     main_socket: RwLock<Option<std::sync::Arc<tokio::net::UdpSocket>>>,
+    /// Optional Prometheus metrics collector (recorded at low-frequency points:
+    /// allocation create/remove and channel bind/unbind — never per packet).
+    metrics: parking_lot::RwLock<Option<crate::metrics::Metrics>>,
 }
 
 #[derive(Debug)]
@@ -473,6 +476,7 @@ impl AllocationTable {
                 max_bandwidth_bytes_per_sec.map(|v| v as u64),
             )),
             main_socket: RwLock::new(None),
+            metrics: parking_lot::RwLock::new(None),
         }
     }
 
@@ -524,11 +528,23 @@ impl AllocationTable {
                 max_bandwidth_bytes_per_sec.map(|v| v as u64),
             )),
             main_socket: RwLock::new(None),
+            metrics: parking_lot::RwLock::new(None),
         }
     }
 
     pub fn set_main_socket(&self, socket: Arc<tokio::net::UdpSocket>) {
         *self.main_socket.write() = Some(socket);
+    }
+
+    /// Attach (or detach) the metrics collector used at allocation/channel
+    /// lifecycle points. Metrics recording is optional and low-frequency.
+    pub fn set_metrics(&self, metrics: Option<crate::metrics::Metrics>) {
+        *self.metrics.write() = metrics;
+    }
+
+    /// Clone of the configured metrics collector, if any.
+    pub(crate) fn metrics(&self) -> Option<crate::metrics::Metrics> {
+        self.metrics.read().clone()
     }
 
     pub fn stats(&self) -> Arc<ServerStats> {
@@ -712,6 +728,9 @@ impl AllocationTable {
         self.stats
             .active_allocations
             .fetch_add(1, Ordering::Relaxed);
+        if let Some(metrics) = self.metrics() {
+            metrics.record_allocation();
+        }
 
         // Register with bandwidth manager for tracking
         self.bandwidth_manager
@@ -751,7 +770,10 @@ impl AllocationTable {
             // to prevent a re-allocate on the same port from inheriting
             // stale bindings or having its fresh bindings incorrectly removed.
             if let Some(ch_table) = channel_table {
-                ch_table.remove_for_relayed(relayed_addr);
+                let removed_channels = ch_table.remove_for_relayed(relayed_addr);
+                if let Some(metrics) = self.metrics() {
+                    metrics.record_channels_unbound(removed_channels);
+                }
             }
             // Abort the allocation task to release the socket
             if let Some(ref relay) = alloc.read().relay {
@@ -762,6 +784,9 @@ impl AllocationTable {
             self.stats
                 .active_allocations
                 .fetch_sub(1, Ordering::Relaxed);
+            if let Some(metrics) = self.metrics() {
+                metrics.record_allocation_dropped();
+            }
             // Unregister from bandwidth manager to prevent memory leak
             self.bandwidth_manager.unregister_allocation(relayed_addr);
         }
@@ -1119,7 +1144,10 @@ impl AllocationTable {
             self.bandwidth_manager.unregister_allocation(&addr);
             // Clean up channel bindings for this relayed address
             if let Some(ch_table) = channel_table {
-                ch_table.remove_for_relayed(&addr);
+                let removed_channels = ch_table.remove_for_relayed(&addr);
+                if let Some(metrics) = self.metrics() {
+                    metrics.record_channels_unbound(removed_channels);
+                }
             }
             count += 1;
         }
@@ -1128,6 +1156,9 @@ impl AllocationTable {
             self.stats
                 .active_allocations
                 .fetch_sub(count as u64, Ordering::Relaxed);
+            if let Some(metrics) = self.metrics() {
+                metrics.record_allocation_dropped();
+            }
         }
 
         count

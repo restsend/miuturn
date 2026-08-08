@@ -106,6 +106,13 @@ impl Metrics {
         }
     }
 
+    /// Record `n` channels unbound (used when an allocation is removed or the
+    /// periodic cleanup expires several channel bindings at once).
+    pub fn record_channels_unbound(&self, n: usize) {
+        let mut inner = self.inner.write();
+        inner.active_channels = inner.active_channels.saturating_sub(n as u64);
+    }
+
     /// Get current metrics snapshot
     pub fn snapshot(&self) -> MetricsSnapshot {
         let inner = self.inner.read();
@@ -127,35 +134,37 @@ impl Metrics {
         }
     }
 
-    /// Export metrics in Prometheus format
+    /// Export metrics in Prometheus format.
+    ///
+    /// The four core counters (allocations, bytes, messages) come from the
+    /// live allocation stats so they reflect the real server state even if the
+    /// in-band `record_*` calls are not wired into the data path.
+    pub fn export_prometheus_with_stats(
+        &self,
+        stats: &crate::allocation::ServerStatsSnapshot,
+    ) -> String {
+        let mut output = export_core_metrics(stats);
+        self.push_extended_metrics(&mut output);
+        output
+    }
+
+    /// Export metrics in Prometheus format using this collector's own counters.
+    /// Retained for tests; production should use `export_prometheus_with_stats`.
     pub fn export_prometheus(&self) -> String {
         let snap = self.snapshot();
-        let mut output = String::new();
+        let stats = crate::allocation::ServerStatsSnapshot {
+            total_allocations: snap.total_allocations,
+            active_allocations: snap.active_allocations,
+            total_bytes_relayed: snap.total_bytes_relayed,
+            total_messages: snap.total_messages,
+        };
+        let mut output = export_core_metrics(&stats);
+        self.push_extended_metrics(&mut output);
+        output
+    }
 
-        output.push_str("# HELP turn_total_allocations Total number of allocations created\n");
-        output.push_str("# TYPE turn_total_allocations counter\n");
-        output.push_str(&format!(
-            "turn_total_allocations {}\n",
-            snap.total_allocations
-        ));
-
-        output.push_str("# HELP turn_active_allocations Current number of active allocations\n");
-        output.push_str("# TYPE turn_active_allocations gauge\n");
-        output.push_str(&format!(
-            "turn_active_allocations {}\n",
-            snap.active_allocations
-        ));
-
-        output.push_str("# HELP turn_total_bytes_relayed Total bytes relayed\n");
-        output.push_str("# TYPE turn_total_bytes_relayed counter\n");
-        output.push_str(&format!(
-            "turn_total_bytes_relayed {}\n",
-            snap.total_bytes_relayed
-        ));
-
-        output.push_str("# HELP turn_total_messages Total messages relayed\n");
-        output.push_str("# TYPE turn_total_messages counter\n");
-        output.push_str(&format!("turn_total_messages {}\n", snap.total_messages));
+    fn push_extended_metrics(&self, output: &mut String) {
+        let snap = self.snapshot();
 
         output.push_str("# HELP turn_total_requests Total TURN requests received\n");
         output.push_str("# TYPE turn_total_requests counter\n");
@@ -197,9 +206,37 @@ impl Metrics {
         output.push_str("# HELP turn_uptime_seconds Server uptime\n");
         output.push_str("# TYPE turn_uptime_seconds gauge\n");
         output.push_str(&format!("turn_uptime_seconds {}\n", snap.uptime_secs));
-
-        output
     }
+}
+
+/// Export the four core server counters from the live allocation stats.
+pub fn export_core_metrics(stats: &crate::allocation::ServerStatsSnapshot) -> String {
+    let mut output = String::new();
+    output.push_str("# HELP turn_total_allocations Total number of allocations created\n");
+    output.push_str("# TYPE turn_total_allocations counter\n");
+    output.push_str(&format!(
+        "turn_total_allocations {}\n",
+        stats.total_allocations
+    ));
+
+    output.push_str("# HELP turn_active_allocations Current number of active allocations\n");
+    output.push_str("# TYPE turn_active_allocations gauge\n");
+    output.push_str(&format!(
+        "turn_active_allocations {}\n",
+        stats.active_allocations
+    ));
+
+    output.push_str("# HELP turn_total_bytes_relayed Total bytes relayed\n");
+    output.push_str("# TYPE turn_total_bytes_relayed counter\n");
+    output.push_str(&format!(
+        "turn_total_bytes_relayed {}\n",
+        stats.total_bytes_relayed
+    ));
+
+    output.push_str("# HELP turn_total_messages Total messages relayed\n");
+    output.push_str("# TYPE turn_total_messages counter\n");
+    output.push_str(&format!("turn_total_messages {}\n", stats.total_messages));
+    output
 }
 
 impl Default for Metrics {
@@ -364,5 +401,30 @@ mod tests {
         assert_eq!(snap.total_bytes_relayed, 0);
         assert_eq!(snap.total_messages, 0);
         assert_eq!(snap.total_requests, 0);
+    }
+
+    /// /metrics must export the authoritative live allocation counters even if
+    /// the in-band collector was not fed data (the pre-fix "all zeros" bug).
+    #[test]
+    fn test_export_prometheus_with_stats_uses_live_stats() {
+        use crate::allocation::ServerStatsSnapshot;
+        let metrics = Metrics::new();
+        metrics.record_request(true, Duration::from_millis(5), false);
+
+        let stats = ServerStatsSnapshot {
+            total_allocations: 42,
+            active_allocations: 7,
+            total_bytes_relayed: 123456,
+            total_messages: 999,
+        };
+        let output = metrics.export_prometheus_with_stats(&stats);
+
+        assert!(output.contains("turn_total_allocations 42"));
+        assert!(output.contains("turn_active_allocations 7"));
+        assert!(output.contains("turn_total_bytes_relayed 123456"));
+        assert!(output.contains("turn_total_messages 999"));
+        // Extended counters come from the collector.
+        assert!(output.contains("turn_total_requests 1"));
+        assert!(output.contains("turn_successful_requests 1"));
     }
 }

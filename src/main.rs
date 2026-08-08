@@ -24,17 +24,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log.log_level));
 
-    if let Some(ref log_file) = config.log.log_file {
-        println!("Logging to file: {}", log_file);
-        let file_appender = tracing_appender::rolling::never(".", log_file);
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_writer(file_appender)
-            .with_ansi(false)
-            .init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
-    }
+    // Build the subscriber with a reloadable EnvFilter so the log level can be
+    // changed at runtime via the admin /api/v1/reload endpoint. The writer is
+    // boxed so the subscriber type is identical for the file and console cases.
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let writer: tracing_subscriber::fmt::writer::BoxMakeWriter =
+        if let Some(ref log_file) = config.log.log_file {
+            println!("Logging to file: {}", log_file);
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(tracing_appender::rolling::never(
+                ".", log_file,
+            ))
+        } else {
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
+        };
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_ansi(config.log.log_file.is_none())
+        .with_filter(env_filter);
+
+    let (fmt_layer, log_reload) = tracing_subscriber::reload::Layer::new(fmt_layer);
+
+    tracing_subscriber::Registry::default()
+        .with(fmt_layer)
+        .init();
+
+    let log_reload: Option<Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>> =
+        Some(Arc::new(move |level: &str| {
+            log_reload
+                .modify(|layer| {
+                    *layer.filter_mut() = EnvFilter::new(level);
+                })
+                .map_err(|e| e.to_string())
+        }));
     println!("Starting miuturn TURN server");
     println!("Realm: {}", config.server.realm);
     println!("External IP: {}", config.server.external_ip);
@@ -188,6 +213,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let turn_rest_default_lifetime = http.turn_rest_default_lifetime.unwrap_or(3600);
 
         let metrics = Metrics::new();
+        // Feed real allocation/channel/request data into the collector exposed
+        // at /metrics (recorded at low-frequency lifecycle points).
+        server.allocation_table.set_metrics(Some(metrics.clone()));
 
         let config_path = std::env::var("CONFIG")
             .map(std::path::PathBuf::from)
@@ -198,6 +226,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let admin_acl = http.admin_acl.clone();
         let trust_proxy = http.trust_proxy.unwrap_or(false);
+
+        let log_reload = log_reload.clone();
 
         tokio::spawn(async move {
             if let Err(e) = miuturn::create_admin_routes(
@@ -215,6 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 listen_configs,
                 admin_acl,
                 trust_proxy,
+                log_reload,
             )
             .await
             {

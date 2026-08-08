@@ -35,18 +35,52 @@ pub struct TurnRestState {
     pub credential_manager: Option<ShortTermCredentialManager>,
 }
 
+/// Build the TURN REST credential state from an HTTP config section.
+fn build_turn_rest_state(config: &Config) -> TurnRestState {
+    let enabled = config
+        .http
+        .as_ref()
+        .and_then(|h| h.turn_rest_enabled)
+        .unwrap_or(false);
+    if enabled {
+        let secret = config
+            .http
+            .as_ref()
+            .and_then(|h| h.turn_rest_secret.clone())
+            .unwrap_or_else(|| "default-secret-key".to_string());
+        let lifetime = config
+            .http
+            .as_ref()
+            .and_then(|h| h.turn_rest_default_lifetime)
+            .unwrap_or(3600);
+        let manager = ShortTermCredentialManager::new(secret).with_lifetime(lifetime);
+        TurnRestState {
+            enabled: true,
+            credential_manager: Some(manager),
+        }
+    } else {
+        TurnRestState {
+            enabled: false,
+            credential_manager: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     admin: AdminState,
     health: HealthState,
     auth: SharedAuthManager,
-    turn_rest: TurnRestState,
+    /// Shared so the reload endpoint can swap TURN REST credentials live.
+    turn_rest: Arc<parking_lot::RwLock<TurnRestState>>,
     metrics: Option<Metrics>,
     config_path: Option<PathBuf>,
     external_ip: String,
     listen_configs: Vec<ListenConfig>,
     admin_acl: Vec<String>,
     trust_proxy: bool,
+    /// Erased handle used to hot-reload the tracing log level.
+    log_reload: Option<Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>>,
 }
 
 const SESSION_COOKIE: &str = "admin_session";
@@ -179,21 +213,19 @@ pub async fn create_admin_routes(
     listen_configs: Vec<ListenConfig>,
     admin_acl: Vec<String>,
     trust_proxy: bool,
+    log_reload: Option<Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let turn_rest_state = if turn_rest_enabled {
-        let secret = turn_rest_secret.unwrap_or_else(|| "default-secret-key".to_string());
-        let manager =
-            ShortTermCredentialManager::new(secret).with_lifetime(turn_rest_default_lifetime);
-        TurnRestState {
-            enabled: true,
-            credential_manager: Some(manager),
-        }
-    } else {
-        TurnRestState {
-            enabled: false,
-            credential_manager: None,
-        }
-    };
+    let turn_rest_state = Arc::new(parking_lot::RwLock::new(TurnRestState {
+        enabled: turn_rest_enabled,
+        credential_manager: if turn_rest_enabled {
+            let secret = turn_rest_secret.unwrap_or_else(|| "default-secret-key".to_string());
+            let manager =
+                ShortTermCredentialManager::new(secret).with_lifetime(turn_rest_default_lifetime);
+            Some(manager)
+        } else {
+            None
+        },
+    }));
 
     let state = AppState {
         admin: AdminState {
@@ -209,6 +241,7 @@ pub async fn create_admin_routes(
         listen_configs,
         admin_acl,
         trust_proxy,
+        log_reload,
     };
 
     let cors = CorsLayer::new()
@@ -247,7 +280,10 @@ pub async fn create_admin_routes(
         )
         .route("/logout", post(logout_handler))
         .route("/metrics", get(prometheus_metrics_handler))
-        .layer(middleware::from_fn_with_state(state.clone(), admin_acl_middleware));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admin_acl_middleware,
+        ));
 
     let app = public_routes
         .merge(admin_routes)
@@ -436,10 +472,120 @@ async fn reload_handler(jar: CookieJar, State(state): State<AppState>) -> Json<s
         }));
     }
 
+    let config_path = match &state.config_path {
+        Some(p) => p.clone(),
+        None => {
+            return Json(serde_json::json!({
+                "success": false,
+                "error": "No config file configured (start miuturn with CONFIG=/path/to/miuturn.toml)",
+            }));
+        }
+    };
+
+    // Parse first; on failure leave the running state untouched.
+    let config = match Config::load(config_path.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                "Config reload failed to parse {}: {}",
+                config_path.display(),
+                e
+            );
+            return Json(serde_json::json!({
+                "success": false,
+                "error": format!("Failed to parse config: {}", e),
+            }));
+        }
+    };
+
+    let mut applied: Vec<String> = Vec::new();
+
+    // 1. Auth: users + api_keys (as ApiKey users) + ACL rules.
+    let mut users: Vec<User> = config
+        .auth
+        .users
+        .iter()
+        .map(|u| User {
+            username: u.username.clone(),
+            password: u.password.clone(),
+            user_type: match u.user_type.as_str() {
+                "temporary" => UserType::Temporary,
+                "api_key" => UserType::ApiKey,
+                _ => UserType::Fixed,
+            },
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            expires_at: u.expires_at,
+            max_allocations: u.max_allocations.unwrap_or(10),
+            bandwidth_limit: u.bandwidth_limit,
+            ip_whitelist: u.ip_whitelist.clone(),
+            max_allocation_duration_secs: u.max_allocation_duration_secs,
+        })
+        .collect();
+    for username in config.auth.api_keys.values() {
+        users.push(User {
+            username: username.clone(),
+            password: String::new(),
+            user_type: UserType::ApiKey,
+            created_at: 0,
+            expires_at: None,
+            max_allocations: 100,
+            bandwidth_limit: None,
+            ip_whitelist: None,
+            max_allocation_duration_secs: None,
+        });
+    }
+    let acl_rules: Vec<AclRule> = config
+        .auth
+        .acl_rules
+        .iter()
+        .map(|r| AclRule {
+            ip_range: r.ip_range.clone(),
+            action: if r.action.eq_ignore_ascii_case("allow") {
+                AclAction::Allow
+            } else {
+                AclAction::Deny
+            },
+            priority: r.priority.unwrap_or(0),
+        })
+        .collect();
+
+    state
+        .auth
+        .reload_config(users, config.auth.api_keys.clone(), acl_rules);
+    applied.push("auth".to_string());
+
+    // 2. TURN REST credentials.
+    let new_turn_rest = build_turn_rest_state(&config);
+    *state.turn_rest.write() = new_turn_rest;
+    applied.push("turn_rest".to_string());
+
+    // 3. Log level (when the subscriber exposes a reload handle).
+    if let Some(reload) = &state.log_reload {
+        match reload(&config.log.log_level) {
+            Ok(()) => applied.push("log_level".to_string()),
+            Err(e) => tracing::warn!("Log level reload failed: {}", e),
+        }
+    }
+
     let stats = (state.health.stats_fn)();
     Json(serde_json::json!({
         "success": true,
         "message": "Configuration reloaded",
+        "applied": applied,
+        "restart_required": [
+            "server.realm",
+            "server.external_ip",
+            "server.relay_bind_ip",
+            "server.start_port",
+            "server.end_port",
+            "server.listening",
+            "server.max_bandwidth_bytes_per_sec",
+        ],
+        "user_count": state.auth.list_users().len(),
+        "acl_rule_count": state.auth.list_acl_rules().len(),
         "stats": {
             "total_allocations": stats.total_allocations,
             "active_allocations": stats.active_allocations,
@@ -772,11 +918,12 @@ async fn ice_servers_handler(
     State(state): State<AppState>,
     axum::extract::Query(req): axum::extract::Query<IceServersQuery>,
 ) -> Json<serde_json::Value> {
-    if !state.turn_rest.enabled {
+    let turn_rest = state.turn_rest.read();
+    if !turn_rest.enabled {
         return Json(serde_json::json!([]));
     }
 
-    let manager = match &state.turn_rest.credential_manager {
+    let manager = match &turn_rest.credential_manager {
         Some(m) => m,
         None => {
             return Json(serde_json::json!([]));
@@ -820,14 +967,15 @@ async fn turn_credentials_handler(
     State(state): State<AppState>,
     Json(req): Json<TurnCredentialsRequest>,
 ) -> Json<serde_json::Value> {
-    if !state.turn_rest.enabled {
+    let turn_rest = state.turn_rest.read();
+    if !turn_rest.enabled {
         return Json(serde_json::json!({
             "error": "TURN REST API is not enabled",
             "success": false,
         }));
     }
 
-    let manager = match &state.turn_rest.credential_manager {
+    let manager = match &turn_rest.credential_manager {
         Some(m) => m,
         None => {
             return Json(serde_json::json!({
@@ -850,35 +998,21 @@ async fn turn_credentials_handler(
 async fn prometheus_metrics_handler(
     State(state): State<AppState>,
 ) -> impl axum::response::IntoResponse {
-    if let Some(metrics) = &state.metrics {
-        metrics.export_prometheus()
-    } else {
-        // Fallback: generate basic metrics from stats
-        let stats = (state.health.stats_fn)();
-        let mut output = String::new();
-        output.push_str("# HELP turn_total_allocations Total number of allocations created\n");
-        output.push_str("# TYPE turn_total_allocations counter\n");
-        output.push_str(&format!(
-            "turn_total_allocations {}\n",
-            stats.total_allocations
-        ));
-        output.push_str("# HELP turn_active_allocations Current number of active allocations\n");
-        output.push_str("# TYPE turn_active_allocations gauge\n");
-        output.push_str(&format!(
-            "turn_active_allocations {}\n",
-            stats.active_allocations
-        ));
-        output.push_str("# HELP turn_total_bytes_relayed Total bytes relayed\n");
-        output.push_str("# TYPE turn_total_bytes_relayed counter\n");
-        output.push_str(&format!(
-            "turn_total_bytes_relayed {}\n",
-            stats.total_bytes_relayed
-        ));
-        output.push_str("# HELP turn_total_messages Total messages relayed\n");
-        output.push_str("# TYPE turn_total_messages counter\n");
-        output.push_str(&format!("turn_total_messages {}\n", stats.total_messages));
-        output
-    }
+    // Core counters always come from the live allocation stats (authoritative);
+    // extended request/channel counters come from the in-band Metrics collector
+    // when one is configured.
+    let stats = (state.health.stats_fn)();
+    let body = match &state.metrics {
+        Some(metrics) => metrics.export_prometheus_with_stats(&stats),
+        None => crate::metrics::export_core_metrics(&stats),
+    };
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
 }
 
 pub async fn create_health_routes(
@@ -1022,10 +1156,10 @@ mod tests {
                 }),
             },
             auth: Arc::new(AuthManager::new("test".to_string())),
-            turn_rest: TurnRestState {
+            turn_rest: Arc::new(parking_lot::RwLock::new(TurnRestState {
                 enabled: true,
                 credential_manager: Some(manager),
-            },
+            })),
             metrics: None,
             config_path: None,
             external_ip: "192.168.1.1".to_string(),
@@ -1041,6 +1175,7 @@ mod tests {
             ],
             admin_acl: vec!["127.0.0.1".to_string()],
             trust_proxy: false,
+            log_reload: None,
         };
 
         let query = IceServersQuery {
@@ -1078,16 +1213,17 @@ mod tests {
                 }),
             },
             auth: Arc::new(AuthManager::new("test".to_string())),
-            turn_rest: TurnRestState {
+            turn_rest: Arc::new(parking_lot::RwLock::new(TurnRestState {
                 enabled: false,
                 credential_manager: None,
-            },
+            })),
             metrics: None,
             config_path: None,
             external_ip: "192.168.1.1".to_string(),
             listen_configs: vec![],
             admin_acl: vec!["127.0.0.1".to_string()],
             trust_proxy: false,
+            log_reload: None,
         };
 
         let query = IceServersQuery {
@@ -1098,5 +1234,242 @@ mod tests {
         let json = response.0;
 
         assert!(json.as_array().unwrap().is_empty());
+    }
+
+    // ── Config reload tests ──────────────────────────────────────────────────
+
+    fn test_stats_fn() -> Arc<dyn Fn() -> ServerStatsSnapshot + Send + Sync> {
+        Arc::new(|| ServerStatsSnapshot {
+            total_allocations: 0,
+            active_allocations: 0,
+            total_bytes_relayed: 0,
+            total_messages: 0,
+        })
+    }
+
+    /// Build an AppState for reload tests.
+    fn test_app_state(
+        auth: SharedAuthManager,
+        config_path: Option<PathBuf>,
+        turn_rest_enabled: bool,
+        log_reload: Option<Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>>,
+    ) -> AppState {
+        AppState {
+            admin: AdminState {
+                admin_username: None,
+                admin_password: None,
+            },
+            health: HealthState {
+                stats_fn: test_stats_fn(),
+            },
+            auth,
+            turn_rest: Arc::new(parking_lot::RwLock::new(TurnRestState {
+                enabled: turn_rest_enabled,
+                credential_manager: None,
+            })),
+            metrics: None,
+            config_path,
+            external_ip: "192.168.1.1".to_string(),
+            listen_configs: vec![],
+            admin_acl: vec!["127.0.0.1".to_string()],
+            trust_proxy: false,
+            log_reload,
+        }
+    }
+
+    fn write_temp_config(name: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("miuturn-test-{}-{}.toml", name, std::process::id()));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn test_reload_applies_auth_users_and_acl() {
+        let auth = Arc::new(AuthManager::new("test".to_string()));
+        auth.add_user(User {
+            username: "olduser".to_string(),
+            password: "oldpass".to_string(),
+            user_type: UserType::Fixed,
+            created_at: 0,
+            expires_at: None,
+            max_allocations: 5,
+            bandwidth_limit: None,
+            ip_whitelist: None,
+            max_allocation_duration_secs: None,
+        });
+
+        let config_path = write_temp_config(
+            "reload-auth",
+            r#"
+[server]
+realm = "test"
+external_ip = "127.0.0.1"
+start_port = 49152
+end_port = 65535
+
+[[server.listening]]
+protocol = "udp"
+address = "0.0.0.0:3478"
+
+[[auth.users]]
+username = "alice"
+password = "secret"
+user_type = "fixed"
+max_allocations = 3
+
+[[auth.acl_rules]]
+ip_range = "10.0.0.0/8"
+action = "Allow"
+priority = 5
+"#,
+        );
+
+        let state = test_app_state(auth.clone(), Some(config_path), false, None);
+        let response = reload_handler(CookieJar::default(), State(state)).await;
+        let json = response.0;
+
+        assert_eq!(json["success"], true, "reload should succeed: {}", json);
+        assert!(
+            json["applied"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "auth"),
+            "applied should include auth: {}",
+            json
+        );
+
+        // Old user replaced, new user from file present.
+        assert!(auth.get_user_password("alice").is_some());
+        assert!(auth.get_user_password("olduser").is_none());
+        assert_eq!(json["user_count"], 1);
+        assert_eq!(json["acl_rule_count"], 1);
+        let acl = auth.list_acl_rules();
+        assert_eq!(acl.len(), 1);
+        assert_eq!(acl[0].ip_range, "10.0.0.0/8");
+    }
+
+    #[tokio::test]
+    async fn test_reload_updates_turn_rest() {
+        let auth = Arc::new(AuthManager::new("test".to_string()));
+        let config_path = write_temp_config(
+            "reload-rest",
+            r#"
+[server]
+realm = "test"
+external_ip = "127.0.0.1"
+start_port = 49152
+end_port = 65535
+
+[[server.listening]]
+protocol = "udp"
+address = "0.0.0.0:3478"
+
+[http]
+address = "0.0.0.0:8080"
+turn_rest_enabled = true
+turn_rest_secret = "new-secret"
+turn_rest_default_lifetime = 7200
+
+[auth]
+users = []
+"#,
+        );
+
+        let state = test_app_state(auth, Some(config_path), false, None);
+        let response = reload_handler(CookieJar::default(), State(state.clone())).await;
+        let json = response.0;
+        assert_eq!(json["success"], true, "reload failed: {}", json);
+
+        let turn_rest = state.turn_rest.read();
+        assert!(turn_rest.enabled);
+        assert!(turn_rest.credential_manager.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_reload_applies_log_level() {
+        use std::sync::Mutex;
+
+        let auth = Arc::new(AuthManager::new("test".to_string()));
+        let applied: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let applied2 = applied.clone();
+        let log_reload: Option<Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>> =
+            Some(Arc::new(move |level: &str| {
+                applied2.lock().unwrap().push(level.to_string());
+                Ok(())
+            }));
+
+        let config_path = write_temp_config(
+            "reload-log",
+            r#"
+[server]
+realm = "test"
+external_ip = "127.0.0.1"
+start_port = 49152
+end_port = 65535
+
+[[server.listening]]
+protocol = "udp"
+address = "0.0.0.0:3478"
+
+[log]
+log_level = "debug"
+
+[auth]
+users = []
+"#,
+        );
+
+        let state = test_app_state(auth, Some(config_path), false, log_reload);
+        let response = reload_handler(CookieJar::default(), State(state)).await;
+        let json = response.0;
+        assert_eq!(json["success"], true, "reload failed: {}", json);
+        assert!(
+            json["applied"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "log_level"),
+            "applied should include log_level: {}",
+            json
+        );
+        assert_eq!(*applied.lock().unwrap(), vec!["debug".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_reload_no_config_path_fails() {
+        let auth = Arc::new(AuthManager::new("test".to_string()));
+        let state = test_app_state(auth, None, false, None);
+        let response = reload_handler(CookieJar::default(), State(state)).await;
+        let json = response.0;
+        assert_eq!(json["success"], false);
+    }
+
+    #[tokio::test]
+    async fn test_reload_bad_config_file_fails_without_touching_state() {
+        let auth = Arc::new(AuthManager::new("test".to_string()));
+        auth.add_user(User {
+            username: "keepme".to_string(),
+            password: "pass".to_string(),
+            user_type: UserType::Fixed,
+            created_at: 0,
+            expires_at: None,
+            max_allocations: 1,
+            bandwidth_limit: None,
+            ip_whitelist: None,
+            max_allocation_duration_secs: None,
+        });
+
+        let path =
+            std::env::temp_dir().join(format!("miuturn-test-bad-{}.toml", std::process::id()));
+        std::fs::write(&path, "this is not [valid toml = ").unwrap();
+
+        let state = test_app_state(auth.clone(), Some(path), false, None);
+        let response = reload_handler(CookieJar::default(), State(state)).await;
+        let json = response.0;
+        assert_eq!(json["success"], false);
+        // Running state untouched.
+        assert!(auth.get_user_password("keepme").is_some());
     }
 }

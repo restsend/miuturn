@@ -373,6 +373,12 @@ impl TurnServer {
         self.auth_manager = Some(auth_manager);
     }
 
+    /// Attach the metrics collector to the allocation table (recorded at
+    /// allocation/channel lifecycle points and per handled request).
+    pub fn set_metrics(&mut self, metrics: Option<crate::metrics::Metrics>) {
+        self.allocation_table.set_metrics(metrics);
+    }
+
     /// Look up password for a given username.
     /// First tries auth_manager, then falls back to the global password.
     fn get_password_for_user(&self, username: &str) -> Option<String> {
@@ -546,6 +552,7 @@ impl TurnServer {
     /// Start a background task to clean up expired channel bindings
     pub fn start_channel_cleanup_task(&self) {
         let channel_table = self.channel_table.clone();
+        let allocation_table = self.allocation_table.clone();
         const CLEANUP_INTERVAL_SECONDS: u64 = 60; // Check every minute
 
         // Check if we're running in a Tokio runtime context
@@ -569,6 +576,9 @@ impl TurnServer {
                 drop(channel_table);
 
                 if removed_count > 0 {
+                    if let Some(metrics) = allocation_table.metrics() {
+                        metrics.record_channels_unbound(removed_count);
+                    }
                     tracing::info!("Cleaned up {} expired channel bindings", removed_count);
                 }
             }
@@ -825,8 +835,10 @@ async fn handle_tcp_message(
         }
     }
 
+    let start = std::time::Instant::now();
     if let Some(msg) = Message::parse(&data[..]) {
         let response = process_message(msg, server, peer_addr, None).await;
+        record_request_metrics(server, &response, start);
         if let Some(r) = response {
             return Some(r);
         }
@@ -897,8 +909,10 @@ async fn handle_udp_message(
     }
 
     // Try to parse as STUN message
+    let start = std::time::Instant::now();
     if let Some(msg) = Message::parse(&data[..]) {
         let response = process_message(msg, server, peer_addr, Some(socket.clone())).await;
+        record_request_metrics(server, &response, start);
         return response;
     }
 
@@ -953,11 +967,67 @@ async fn handle_udp_message(
             }
 
             let msg = Message { header, attributes };
-            return process_message(msg, server, peer_addr, Some(socket.clone())).await;
+            let response = process_message(msg, server, peer_addr, Some(socket.clone())).await;
+            record_request_metrics(server, &response, start);
+            return response;
         }
     }
 
     None
+}
+
+/// Record a handled STUN request in the metrics collector (when configured).
+/// Called once per request (never per relayed packet), so the cost is bounded.
+fn record_request_metrics(
+    server: &TurnServer,
+    response: &Option<Bytes>,
+    start: std::time::Instant,
+) {
+    if let Some(metrics) = server.allocation_table.metrics() {
+        let (success, auth_failed) = match response {
+            Some(r) => {
+                // Classify by STUN response type: class 2 = Success, class 3 = Error.
+                let msg_type = if r.len() >= 2 {
+                    u16::from_be_bytes([r[0], r[1]])
+                } else {
+                    0
+                };
+                let class = ((msg_type & 0x0100) >> 7) | ((msg_type & 0x0010) >> 4);
+                (class == 2, is_error_401(r))
+            }
+            None => (false, false),
+        };
+        metrics.record_request(success, start.elapsed(), auth_failed);
+    }
+}
+
+/// True when `response` is a STUN error response carrying ERROR-CODE 401.
+fn is_error_401(response: &[u8]) -> bool {
+    if response.len() < 20 {
+        return false;
+    }
+    let msg_type = u16::from_be_bytes([response[0], response[1]]);
+    let class = ((msg_type & 0x0100) >> 7) | ((msg_type & 0x0010) >> 4);
+    if class != 3 {
+        return false;
+    }
+    let msg_len = u16::from_be_bytes([response[2], response[3]]) as usize;
+    let end = (20 + msg_len).min(response.len());
+    let mut off = 20usize;
+    while off + 4 <= end {
+        let a_type = u16::from_be_bytes([response[off], response[off + 1]]);
+        let a_len = u16::from_be_bytes([response[off + 2], response[off + 3]]) as usize;
+        if a_type == 0x0009 && off + 4 + a_len <= response.len() {
+            let val = &response[off + 4..off + 4 + a_len];
+            if val.len() >= 4 {
+                let code = (val[2] as u16) * 100 + val[3] as u16;
+                return code == 401;
+            }
+            return false;
+        }
+        off += 4 + a_len + ((4 - (a_len % 4)) % 4);
+    }
+    false
 }
 
 async fn process_message(
@@ -1646,6 +1716,9 @@ async fn handle_channel_bind(
                     server
                         .allocation_table
                         .add_permissions(&client_addr, &[peer_addr]);
+                    if let Some(metrics) = server.allocation_table.metrics() {
+                        metrics.record_channel_bind();
+                    }
                     debug!(
                         %client_addr,
                         %peer_addr,

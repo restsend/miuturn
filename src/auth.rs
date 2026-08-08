@@ -76,6 +76,21 @@ impl AuthManager {
         *acl_guard = acl_rules;
     }
 
+    /// Replace the full user/API-key/ACL configuration, as loaded from a
+    /// reloaded config file. Unlike `load_from_config` (which merges users),
+    /// this removes users that are no longer configured so deleted accounts
+    /// take effect without a restart.
+    pub fn reload_config(
+        &self,
+        users: Vec<User>,
+        api_keys: HashMap<String, String>,
+        acl_rules: Vec<AclRule>,
+    ) {
+        *self.users.write() = users.into_iter().map(|u| (u.username.clone(), u)).collect();
+        *self.api_keys.write() = api_keys;
+        *self.acl_rules.write() = acl_rules;
+    }
+
     pub fn authenticate(&self, username: &str, password: &str) -> Option<User> {
         let users = self.users.read();
         if let Some(user) = users.get(username)
