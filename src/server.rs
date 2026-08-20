@@ -1,8 +1,10 @@
 use crate::allocation::{AllocationTable, ChannelTable, ServerStatsSnapshot};
-use crate::auth::AuthManager;
+use crate::auth::{AuthManager, User, UserType};
+use crate::config::ExpiredTokenPolicy;
 use crate::message::{
     Attribute, ErrorCode, EventType, Message, MessageHeader, Method, encode_xor_address,
 };
+use crate::short_term::ShortTermCredentialManager;
 use bytes::{Buf, Bytes, BytesMut};
 use hmac::{Hmac, KeyInit, Mac};
 use parking_lot::RwLock;
@@ -72,9 +74,12 @@ pub struct TurnServer {
     /// lifetime so relay channels do not expire before their allocation.
     pub max_allocation_duration_secs: Option<u32>,
     nonce_map: Arc<RwLock<HashMap<String, NonceEntry>>>,
-    password: String,
     auth_disabled: bool,
     auth_manager: Option<Arc<AuthManager>>,
+    /// Validates/derives ephemeral REST API credentials (`expiry:user`
+    /// usernames signed with the shared secret).
+    short_term: Option<ShortTermCredentialManager>,
+    expired_token_policy: ExpiredTokenPolicy,
     stats_dump_interval_secs: u64,
     stats_dump_skip_if_no_change: bool,
     server_name: String,
@@ -121,17 +126,49 @@ fn channel_binding_lifetime(max_allocation_duration_secs: Option<u32>) -> std::t
     std::time::Duration::from_secs(max_allocation_duration_secs.unwrap_or(600) as u64)
 }
 
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// A resolved credential for a TURN username.
+enum Credential {
+    /// Static password from a configured user in the AuthManager.
+    Static(String),
+    /// Ephemeral REST API credential derived from the shared secret.
+    Ephemeral { password: String, expires_at: u64 },
+}
+
+impl Credential {
+    fn password(&self) -> &str {
+        match self {
+            Credential::Static(pw) => pw,
+            Credential::Ephemeral { password, .. } => password,
+        }
+    }
+
+    /// Token expiry (unix seconds), present only for ephemeral credentials.
+    fn token_expires_at(&self) -> Option<u64> {
+        match self {
+            Credential::Static(_) => None,
+            Credential::Ephemeral { expires_at, .. } => Some(*expires_at),
+        }
+    }
+}
+
+/// Result of successful TURN long-term credential verification.
+struct AuthInfo {
+    username: String,
+    /// Expiry of the ephemeral token (unix seconds) if the request was
+    /// authenticated with an ephemeral credential.
+    token_expires_at: Option<u64>,
+}
+
 impl TurnServer {
     pub fn new(relay_addr: Ipv4Addr, realm: String) -> Self {
-        Self::with_limits_and_password(
-            relay_addr,
-            realm,
-            None,
-            None,
-            None,
-            "password".to_string(),
-            false,
-        )
+        Self::with_limits(relay_addr, realm, None, None, None)
     }
 
     pub fn set_stats_dump_interval(&mut self, interval_secs: u64) {
@@ -152,12 +189,47 @@ impl TurnServer {
         self.allocation_table.set_enforce_peer_permissions(enforce);
     }
 
+    /// Convenience constructor that registers a single static user
+    /// (`admin`/`password`) via the AuthManager. The password only applies to
+    /// that exact username; there is no global-password fallback.
     pub fn with_password(relay_addr: Ipv4Addr, realm: String, password: String) -> Self {
-        Self::with_limits_and_password(relay_addr, realm, None, None, None, password, false)
+        let mut server = Self::with_limits(relay_addr, realm.clone(), None, None, None);
+        server.auth_manager = Some(Self::single_user_auth_manager("admin", password, realm));
+        server
     }
 
     pub fn with_auth_disabled(relay_addr: Ipv4Addr, realm: String) -> Self {
-        Self::with_limits_and_password(relay_addr, realm, None, None, None, String::new(), true)
+        let mut server = Self::with_limits(relay_addr, realm, None, None, None);
+        server.auth_disabled = true;
+        server
+    }
+
+    fn single_user_auth_manager(username: &str, password: String, realm: String) -> Arc<AuthManager> {
+        let auth_manager = Arc::new(AuthManager::new(realm));
+        auth_manager.add_user(User {
+            username: username.to_string(),
+            password,
+            user_type: UserType::Fixed,
+            created_at: unix_now_secs(),
+            expires_at: None,
+            max_allocations: 1000,
+            bandwidth_limit: None,
+            ip_whitelist: None,
+            max_allocation_duration_secs: None,
+        });
+        auth_manager
+    }
+
+    /// Set the shared-secret manager that derives and validates ephemeral
+    /// REST API credentials (`expiry:user` usernames).
+    pub fn set_short_term_manager(&mut self, manager: ShortTermCredentialManager) {
+        self.short_term = Some(manager);
+    }
+
+    /// Set the policy applied when an established allocation's ephemeral
+    /// token has expired.
+    pub fn set_expired_token_policy(&mut self, policy: ExpiredTokenPolicy) {
+        self.expired_token_policy = policy;
     }
 
     pub fn with_port_range_and_password(
@@ -167,18 +239,27 @@ impl TurnServer {
         max_port: u16,
         password: String,
     ) -> Self {
-        Self::with_port_range_and_bind_address_and_password(
-            relay_addr, relay_addr, realm, min_port, max_port, password,
-        )
+        let mut server =
+            Self::with_port_range(relay_addr, realm.clone(), min_port, max_port);
+        server.auth_manager = Some(Self::single_user_auth_manager("admin", password, realm));
+        server
     }
 
-    pub fn with_port_range_and_bind_address_and_password(
+    pub fn with_port_range(
+        relay_addr: Ipv4Addr,
+        realm: String,
+        min_port: u16,
+        max_port: u16,
+    ) -> Self {
+        Self::with_port_range_and_bind_address(relay_addr, relay_addr, realm, min_port, max_port)
+    }
+
+    pub fn with_port_range_and_bind_address(
         relay_addr: Ipv4Addr,
         relay_bind_addr: Ipv4Addr,
         realm: String,
         min_port: u16,
         max_port: u16,
-        password: String,
     ) -> Self {
         let server = TurnServer {
             allocation_table: Arc::new(AllocationTable::with_port_range_and_bind_addr(
@@ -197,9 +278,10 @@ impl TurnServer {
             realm,
             max_allocation_duration_secs: None,
             nonce_map: Arc::new(RwLock::new(HashMap::new())),
-            password,
             auth_disabled: false,
             auth_manager: None,
+            short_term: None,
+            expired_token_policy: ExpiredTokenPolicy::default(),
             stats_dump_interval_secs: 30,
             stats_dump_skip_if_no_change: true,
             server_name: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
@@ -211,7 +293,7 @@ impl TurnServer {
         server
     }
 
-    pub fn with_port_range_limits_and_password(
+    pub fn with_port_range_limits(
         relay_addr: Ipv4Addr,
         realm: String,
         min_port: u16,
@@ -219,10 +301,8 @@ impl TurnServer {
         max_concurrent_allocations: Option<usize>,
         max_allocation_duration_secs: Option<u32>,
         max_bandwidth_bytes_per_sec: Option<usize>,
-        password: String,
-        auth_disabled: bool,
     ) -> Self {
-        Self::with_port_range_limits_bind_address_and_password(
+        Self::with_port_range_limits_bind_address(
             relay_addr,
             relay_addr,
             realm,
@@ -231,12 +311,11 @@ impl TurnServer {
             max_concurrent_allocations,
             max_allocation_duration_secs,
             max_bandwidth_bytes_per_sec,
-            password,
-            auth_disabled,
+            false,
         )
     }
 
-    pub fn with_port_range_limits_bind_address_and_password(
+    pub fn with_port_range_limits_bind_address(
         relay_addr: Ipv4Addr,
         relay_bind_addr: Ipv4Addr,
         realm: String,
@@ -245,7 +324,6 @@ impl TurnServer {
         max_concurrent_allocations: Option<usize>,
         max_allocation_duration_secs: Option<u32>,
         max_bandwidth_bytes_per_sec: Option<usize>,
-        password: String,
         auth_disabled: bool,
     ) -> Self {
         let server = TurnServer {
@@ -267,9 +345,10 @@ impl TurnServer {
             realm,
             max_allocation_duration_secs,
             nonce_map: Arc::new(RwLock::new(HashMap::new())),
-            password,
             auth_disabled,
             auth_manager: None,
+            short_term: None,
+            expired_token_policy: ExpiredTokenPolicy::default(),
             stats_dump_interval_secs: 30,
             stats_dump_skip_if_no_change: true,
             server_name: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
@@ -303,9 +382,10 @@ impl TurnServer {
             realm,
             max_allocation_duration_secs: None,
             nonce_map: Arc::new(RwLock::new(HashMap::new())),
-            password: String::new(),
             auth_disabled: true,
             auth_manager: None,
+            short_term: None,
+            expired_token_policy: ExpiredTokenPolicy::default(),
             stats_dump_interval_secs: 30,
             stats_dump_skip_if_no_change: true,
             server_name: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
@@ -324,26 +404,6 @@ impl TurnServer {
         max_allocation_duration_secs: Option<u32>,
         max_bandwidth_bytes_per_sec: Option<usize>,
     ) -> Self {
-        Self::with_limits_and_password(
-            relay_addr,
-            realm,
-            max_concurrent_allocations,
-            max_allocation_duration_secs,
-            max_bandwidth_bytes_per_sec,
-            "password".to_string(),
-            false,
-        )
-    }
-
-    pub fn with_limits_and_password(
-        relay_addr: Ipv4Addr,
-        realm: String,
-        max_concurrent_allocations: Option<usize>,
-        max_allocation_duration_secs: Option<u32>,
-        max_bandwidth_bytes_per_sec: Option<usize>,
-        password: String,
-        auth_disabled: bool,
-    ) -> Self {
         let server = TurnServer {
             allocation_table: Arc::new(AllocationTable::with_limits(
                 relay_addr,
@@ -360,9 +420,10 @@ impl TurnServer {
             realm,
             max_allocation_duration_secs,
             nonce_map: Arc::new(RwLock::new(HashMap::new())),
-            password,
-            auth_disabled,
+            auth_disabled: false,
             auth_manager: None,
+            short_term: None,
+            expired_token_policy: ExpiredTokenPolicy::default(),
             stats_dump_interval_secs: 30,
             stats_dump_skip_if_no_change: true,
             server_name: format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
@@ -385,20 +446,31 @@ impl TurnServer {
         self.allocation_table.set_metrics(metrics);
     }
 
-    /// Look up password for a given username.
-    /// First tries auth_manager, then falls back to the global password.
-    fn get_password_for_user(&self, username: &str) -> Option<String> {
+    /// Resolve the credential for a username: static user password first,
+    /// then an ephemeral REST API credential derived from the shared secret.
+    /// There is no global-password fallback.
+    fn resolve_credential(&self, username: &str) -> Option<Credential> {
         if let Some(ref am) = self.auth_manager {
-            if let Some(pw) = am.get_user_password(username) {
-                return Some(pw);
+            if let Some(password) = am.get_user_password(username) {
+                return Some(Credential::Static(password));
             }
         }
-        // Fallback to global password if non-empty
-        if !self.password.is_empty() {
-            Some(self.password.clone())
-        } else {
-            None
+        if let Some(ref stm) = self.short_term {
+            if let Some((expires_at, _user_id)) = stm.parse_username(username) {
+                return Some(Credential::Ephemeral {
+                    password: stm.compute_password(username),
+                    expires_at,
+                });
+            }
         }
+        None
+    }
+
+    /// Look up the password for a given username (static user or ephemeral
+    /// HMAC derivation). Used for signing success responses.
+    fn get_password_for_user(&self, username: &str) -> Option<String> {
+        self.resolve_credential(username)
+            .map(|cred| cred.password().to_string())
     }
 
     pub fn stats(&self) -> ServerStatsSnapshot {
@@ -812,17 +884,19 @@ async fn handle_tcp_message(
 
             let allocation = server.allocation_table.get_allocation_by_client(&peer_addr);
             let relayed_addr = allocation.as_ref().map(|alloc| alloc.read().relayed_addr);
+            let table = server.channel_table.read().await;
             let channel_binding = if let Some(relayed_addr) = relayed_addr {
-                server
-                    .channel_table
-                    .read()
-                    .await
-                    .get_by_channel(relayed_addr, channel_num)
+                table.get_by_channel(relayed_addr, channel_num)
             } else {
                 None
             };
 
             if let Some(channel) = channel_binding {
+                // Keep the binding alive: client traffic on a bound channel
+                // refreshes its activity timestamp (same behavior as coturn).
+                if let Some(relayed_addr) = relayed_addr {
+                    table.refresh_binding(relayed_addr, channel_num);
+                }
                 let relay_socket = allocation.as_ref().and_then(|alloc| {
                     let a = alloc.read();
                     a.relay.as_ref().map(|r| r.socket.clone())
@@ -879,17 +953,19 @@ async fn handle_udp_message(
         let allocation = server.allocation_table.get_allocation_by_client(&peer_addr);
         let has_allocation = allocation.is_some();
         let relayed_addr = allocation.as_ref().map(|alloc| alloc.read().relayed_addr);
+        let table = server.channel_table.read().await;
         let channel_binding = if let Some(relayed_addr) = relayed_addr {
-            server
-                .channel_table
-                .read()
-                .await
-                .get_by_channel(relayed_addr, channel_num)
+            table.get_by_channel(relayed_addr, channel_num)
         } else {
             None
         };
 
         if let Some(channel) = channel_binding {
+            // Keep the binding alive: client traffic on a bound channel
+            // refreshes its activity timestamp (same behavior as coturn).
+            if let Some(relayed_addr) = relayed_addr {
+                table.refresh_binding(relayed_addr, channel_num);
+            }
             // Get the relay socket from the allocation (must release lock before await)
             let relay_socket = allocation.as_ref().and_then(|alloc| {
                 let a = alloc.read();
@@ -1147,18 +1223,28 @@ fn add_response_message_integrity(response: &mut Message, key: &[u8]) {
 }
 
 /// Verify TURN long-term credential auth (nonce + username + MESSAGE-INTEGRITY).
-/// Returns Ok(username) on success, or a 401 response bytes on failure.
+/// Returns Ok(AuthInfo) on success, or an error response on failure.
+///
+/// Stale/unknown/expired nonces yield 438 (Stale Nonce) per RFC 5389 §10.2.3
+/// so clients transparently retry with the fresh nonce included in the
+/// response; credential problems yield 401.
 fn verify_turn_auth(
     msg: &Message,
     server: &TurnServer,
     client_addr: SocketAddr,
-) -> Result<String, Bytes> {
+) -> Result<AuthInfo, Bytes> {
     if server.auth_disabled {
         // Return username from attribute if present, or empty string
         if let Some(username_attr) = msg.get_attribute(Attribute::USERNAME) {
-            return Ok(String::from_utf8_lossy(&username_attr.value).to_string());
+            return Ok(AuthInfo {
+                username: String::from_utf8_lossy(&username_attr.value).to_string(),
+                token_expires_at: None,
+            });
         }
-        return Ok(String::new());
+        return Ok(AuthInfo {
+            username: String::new(),
+            token_expires_at: None,
+        });
     }
 
     if let Some(ref am) = server.auth_manager {
@@ -1196,14 +1282,9 @@ fn verify_turn_auth(
             method = ?msg.header.method,
             %username,
             %nonce,
-            "Returning 401: invalid nonce"
+            "Returning 438: invalid nonce"
         );
-        return Err(create_401_response(
-            msg,
-            server,
-            client_addr,
-            Some("Invalid nonce".to_string()),
-        ));
+        return Err(create_stale_nonce_response(msg, server, client_addr));
     }
     let nonce_entry = nonce_map.get(&nonce).unwrap();
     let nonce_age = nonce_entry.created_at.elapsed();
@@ -1217,19 +1298,14 @@ fn verify_turn_auth(
             %username,
             %nonce,
             nonce_age_secs = nonce_age.as_secs(),
-            "Returning 401: nonce expired"
+            "Returning 438: nonce expired"
         );
-        return Err(create_401_response(
-            msg,
-            server,
-            client_addr,
-            Some("Nonce expired".to_string()),
-        ));
+        return Err(create_stale_nonce_response(msg, server, client_addr));
     }
 
-    // Look up password for this user (from AuthManager or global password)
-    let password = match server.get_password_for_user(&username) {
-        Some(pw) => pw,
+    // Resolve the credential (static user password or ephemeral HMAC).
+    let credential = match server.resolve_credential(&username) {
+        Some(cred) => cred,
         None => {
             debug!(
                 %client_addr,
@@ -1246,7 +1322,39 @@ fn verify_turn_auth(
         }
     };
 
-    let key = compute_message_integrity_key(&username, &server.realm, &password);
+    let token_expires_at = credential.token_expires_at();
+
+    // Apply the expired-token policy:
+    // - renew: only Allocate checks expiry (token gates admission)
+    // - strict: every request checks expiry (coturn behavior)
+    // - cap: only Allocate checks expiry; granted lifetime is clamped by the
+    //   handlers to the token's remaining validity
+    let enforce_expiry = match server.expired_token_policy {
+        ExpiredTokenPolicy::Strict => true,
+        ExpiredTokenPolicy::Renew | ExpiredTokenPolicy::Cap => {
+            msg.header.method == Method::Allocate
+        }
+    };
+    if enforce_expiry
+        && let Some(expires_at) = token_expires_at
+        && expires_at < unix_now_secs()
+    {
+        debug!(
+            %client_addr,
+            method = ?msg.header.method,
+            %username,
+            expires_at,
+            "Returning 401: ephemeral credentials expired"
+        );
+        return Err(create_401_response(
+            msg,
+            server,
+            client_addr,
+            Some("Credentials expired".to_string()),
+        ));
+    }
+
+    let key = compute_message_integrity_key(&username, &server.realm, credential.password());
 
     if !verify_message_integrity(msg, &key) {
         debug!(
@@ -1274,7 +1382,10 @@ fn verify_turn_auth(
         entry.created_at = std::time::Instant::now();
     }
 
-    Ok(username)
+    Ok(AuthInfo {
+        username,
+        token_expires_at,
+    })
 }
 
 async fn handle_allocate(
@@ -1284,10 +1395,11 @@ async fn handle_allocate(
     recv_socket: Option<Arc<UdpSocket>>,
 ) -> Option<Bytes> {
     // Verify auth
-    let username = match verify_turn_auth(&msg, server, client_addr) {
-        Ok(username) => username,
+    let auth_info = match verify_turn_auth(&msg, server, client_addr) {
+        Ok(info) => info,
         Err(resp) => return Some(resp),
     };
+    let username = auth_info.username.as_str();
 
     let lifetime = get_lifetime(&msg);
     trace!(
@@ -1357,10 +1469,23 @@ async fn handle_allocate(
     let relayed_addr = allocation.read().relayed_addr;
     // Record the owning username so NAT-rebind Refresh requests can be matched
     // back to this allocation when the client's transport address changes.
-    allocation.write().username = Some(username.clone());
-    let granted_lifetime = server
+    allocation.write().username = Some(username.to_string());
+    let mut granted_lifetime = server
         .allocation_table
         .effective_allocation_lifetime(Some(lifetime));
+    // `cap` policy: clamp the granted lifetime to the token's remaining
+    // validity so the allocation cannot outlive the token.
+    if server.expired_token_policy == ExpiredTokenPolicy::Cap
+        && let Some(expires_at) = auth_info.token_expires_at
+    {
+        let remaining = expires_at.saturating_sub(unix_now_secs()).max(1) as u32;
+        if remaining < granted_lifetime {
+            let _ = server
+                .allocation_table
+                .set_allocation_lifetime_exact(&relayed_addr, remaining);
+            granted_lifetime = remaining;
+        }
+    }
     let magic = 0x2112A442;
 
     let mut response = Message {
@@ -1396,8 +1521,8 @@ async fn handle_allocate(
     });
 
     if !server.auth_disabled {
-        if let Some(password) = server.get_password_for_user(&username) {
-            let key = compute_message_integrity_key(&username, &server.realm, &password);
+        if let Some(password) = server.get_password_for_user(username) {
+            let key = compute_message_integrity_key(username, &server.realm, &password);
             add_response_message_integrity(&mut response, &key);
         } else {
             warn!(
@@ -1426,10 +1551,11 @@ async fn handle_refresh(
     client_addr: SocketAddr,
 ) -> Option<Bytes> {
     // Verify auth
-    let username = match verify_turn_auth(&msg, server, client_addr) {
-        Ok(u) => u,
+    let auth_info = match verify_turn_auth(&msg, server, client_addr) {
+        Ok(info) => info,
         Err(resp) => return Some(resp),
     };
+    let username = auth_info.username.as_str();
 
     let lifetime = get_lifetime(&msg);
 
@@ -1488,6 +1614,7 @@ async fn handle_refresh(
         }
     };
 
+    let mut granted_lifetime: u32 = 0;
     if let Some(relayed) = relayed_opt {
         if lifetime == 0 {
             // Refresh with lifetime=0 means explicit deletion (RFC 5766 §7).
@@ -1516,17 +1643,30 @@ async fn handle_refresh(
                     "TURN Refresh lifetime=0: allocation removed"
                 );
             }
-        } else if server
-            .allocation_table
-            .refresh_allocation(&relayed, lifetime)
-            .is_err()
-        {
-            return Some(create_error_response_bytes(
-                &msg,
-                ErrorCode::AllocationMismatch,
-                server,
-            ));
         } else {
+            // Compute the lifetime to grant. The `cap` policy clamps the
+            // granted lifetime to the token's remaining validity (never 0,
+            // which would delete the allocation).
+            let mut granted = server
+                .allocation_table
+                .effective_allocation_lifetime(Some(lifetime));
+            if server.expired_token_policy == ExpiredTokenPolicy::Cap
+                && let Some(expires_at) = auth_info.token_expires_at
+            {
+                let remaining = expires_at.saturating_sub(unix_now_secs()).max(1) as u32;
+                granted = granted.min(remaining);
+            }
+            if server
+                .allocation_table
+                .set_allocation_lifetime_exact(&relayed, granted)
+                .is_err()
+            {
+                return Some(create_error_response_bytes(
+                    &msg,
+                    ErrorCode::AllocationMismatch,
+                    server,
+                ));
+            }
             // Update client address in the relay task (handles NAT rebind)
             if let Some(alloc) = server.allocation_table.get_allocation(&relayed) {
                 if let Some(ref relay) = alloc.read().relay {
@@ -1542,24 +1682,20 @@ async fn handle_refresh(
                 %client_addr,
                 relayed = %relayed,
                 requested_lifetime = lifetime,
-                granted_lifetime = server
-                    .allocation_table
-                    .effective_allocation_lifetime(Some(lifetime)),
+                granted_lifetime = granted,
                 "TURN Refresh succeeded"
             );
+            granted_lifetime = granted;
         }
-        // Return Refresh Success with LIFETIME
-        let granted_lifetime = server
-            .allocation_table
-            .effective_allocation_lifetime(Some(lifetime));
+        // Return Refresh Success with LIFETIME (0 when the allocation was deleted)
         let mut response = crate::message::create_success_response(&msg.header);
         response.attributes.push(Attribute {
             attr_type: Attribute::LIFETIME,
             value: Bytes::from(granted_lifetime.to_be_bytes().to_vec()),
         });
         if !server.auth_disabled {
-            if let Some(password) = server.get_password_for_user(&username) {
-                let key = compute_message_integrity_key(&username, &server.realm, &password);
+            if let Some(password) = server.get_password_for_user(username) {
+                let key = compute_message_integrity_key(username, &server.realm, &password);
                 add_response_message_integrity(&mut response, &key);
             }
         }
@@ -1581,7 +1717,7 @@ async fn handle_create_permission(
 ) -> Option<Bytes> {
     // Verify auth
     let username = match verify_turn_auth(&msg, server, client_addr) {
-        Ok(u) => u,
+        Ok(info) => info.username,
         Err(resp) => return Some(resp),
     };
 
@@ -1677,7 +1813,7 @@ async fn handle_channel_bind(
 ) -> Option<Bytes> {
     // Verify auth
     let username = match verify_turn_auth(&msg, server, client_addr) {
-        Ok(u) => u,
+        Ok(info) => info.username,
         Err(resp) => return Some(resp),
     };
 
@@ -1846,6 +1982,42 @@ fn create_401_response(
     client_addr: SocketAddr,
     reason: Option<String>,
 ) -> Bytes {
+    create_nonce_challenge_response(
+        msg,
+        server,
+        client_addr,
+        ErrorCode::Unauthorized,
+        reason,
+        "Creating 401 Unauthorized response",
+    )
+}
+
+/// Build a 438 (Stale Nonce) response with a fresh nonce so clients can
+/// transparently retry. Used when the presented nonce is unknown or expired
+/// (RFC 5389 §10.2.3).
+fn create_stale_nonce_response(
+    msg: &Message,
+    server: &TurnServer,
+    client_addr: SocketAddr,
+) -> Bytes {
+    create_nonce_challenge_response(
+        msg,
+        server,
+        client_addr,
+        ErrorCode::StaleCredentials,
+        Some("Stale Nonce".to_string()),
+        "Creating 438 Stale Nonce response",
+    )
+}
+
+fn create_nonce_challenge_response(
+    msg: &Message,
+    server: &TurnServer,
+    client_addr: SocketAddr,
+    code: ErrorCode,
+    reason: Option<String>,
+    log_msg: &str,
+) -> Bytes {
     let nonce = generate_nonce();
     debug!(
         %client_addr,
@@ -1853,13 +2025,14 @@ fn create_401_response(
         transaction_id = %hex::encode(msg.header.transaction_id),
         nonce = %nonce,
         reason = ?reason,
-        "Creating 401 Unauthorized response"
+        "{}",
+        log_msg
     );
     insert_nonce_capped(&server.nonce_map, nonce.clone());
 
     let mut response = crate::message::create_error_response_with_reason(
         &msg.header,
-        ErrorCode::Unauthorized,
+        code,
         reason.as_deref(),
     );
     response.attributes.push(Attribute {
@@ -2668,7 +2841,7 @@ mod tests {
             entry.created_at = std::time::Instant::now() - std::time::Duration::from_secs(601);
         }
 
-        // Step 5: Refresh with expired nonce1 → must fail with 401 "Nonce expired"
+        // Step 5: Refresh with expired nonce1 → must fail with 438 Stale Nonce
         let refresh_msg1 = build_authenticated_refresh_request(
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
             600,
@@ -2686,8 +2859,14 @@ mod tests {
             EventType::Error,
             "expired nonce should be rejected"
         );
+        assert_eq!(
+            error_code_of(&refresh_parsed1),
+            Some(438),
+            "expired nonce must yield 438 Stale Nonce, got {:?}",
+            error_code_of(&refresh_parsed1)
+        );
 
-        // Extract new nonce from 401
+        // Extract new nonce from the 438 response
         let nonce2 = String::from_utf8(
             refresh_parsed1
                 .get_attribute(Attribute::NONCE)
@@ -2815,5 +2994,315 @@ mod tests {
         let fresh = "fresh-nonce";
         insert_nonce_capped(&server.nonce_map, fresh.to_string());
         assert!(server.nonce_map.read().contains_key(fresh));
+    }
+
+    /// Extract the numeric error code from a parsed STUN error response.
+    fn error_code_of(msg: &Message) -> Option<u32> {
+        let attr = msg.get_attribute(Attribute::ERROR_CODE)?;
+        if attr.value.len() < 4 {
+            return None;
+        }
+        let raw = u32::from_be_bytes([
+            attr.value[0],
+            attr.value[1],
+            attr.value[2],
+            attr.value[3],
+        ]);
+        Some(((raw >> 8) & 0x7) * 100 + (raw & 0xff))
+    }
+
+    /// Extract the LIFETIME attribute from a success response.
+    fn lifetime_of(msg: &Message) -> Option<u32> {
+        let attr = msg.get_attribute(Attribute::LIFETIME)?;
+        if attr.value.len() < 4 {
+            return None;
+        }
+        Some(u32::from_be_bytes([
+            attr.value[0],
+            attr.value[1],
+            attr.value[2],
+            attr.value[3],
+        ]))
+    }
+
+    /// Perform the initial unauthenticated Allocate to obtain a nonce.
+    async fn obtain_nonce(server: &TurnServer, client_addr: SocketAddr) -> String {
+        let unauth_msg = build_allocate_request([9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]);
+        let response = process_message(unauth_msg, server, client_addr, None)
+            .await
+            .unwrap();
+        let parsed = Message::parse(&response).unwrap();
+        assert_eq!(parsed.header.event_type, EventType::Error);
+        String::from_utf8(
+            parsed
+                .get_attribute(Attribute::NONCE)
+                .unwrap()
+                .value
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    /// Send an authenticated Allocate, retrying transient relay-port failures.
+    async fn allocate_with_retries(
+        server: &TurnServer,
+        client_addr: SocketAddr,
+        nonce: &str,
+        username: &str,
+        realm: &str,
+        password: &str,
+    ) -> Message {
+        for attempt in 0..5u8 {
+            let mut tid = [0u8; 12];
+            tid[11] = attempt;
+            let msg =
+                build_authenticated_allocate_request(tid, username, realm, nonce, password);
+            let response = process_message(msg, server, client_addr, None).await.unwrap();
+            let parsed = Message::parse(&response).unwrap();
+            if parsed.header.event_type == EventType::Success {
+                return parsed;
+            }
+            let code = error_code_of(&parsed).unwrap_or(0);
+            assert!(
+                code == 486 || code == 508,
+                "unexpected Allocate error in auth test: {} ({:?})",
+                code,
+                parsed
+            );
+        }
+        panic!("authenticated Allocate should eventually succeed");
+    }
+
+    /// A TurnServer with only ephemeral (shared-secret) credentials enabled.
+    fn ephemeral_server(realm: &str, policy: ExpiredTokenPolicy) -> (TurnServer, ShortTermCredentialManager) {
+        let mut server = TurnServer::new(Ipv4Addr::new(127, 0, 0, 1), realm.to_string());
+        let manager = ShortTermCredentialManager::new("test-shared-secret".to_string());
+        server.set_short_term_manager(manager.clone());
+        server.set_expired_token_policy(policy);
+        (server, manager)
+    }
+
+    #[tokio::test]
+    async fn test_ephemeral_credential_allocate_succeeds() {
+        let realm = "test-realm".to_string();
+        let (server, manager) = ephemeral_server(&realm, ExpiredTokenPolicy::Renew);
+        let client_addr: SocketAddr = "127.0.0.1:51001".parse().unwrap();
+        let (username, password, _) = manager.generate("alice", Some(3600));
+
+        let nonce = obtain_nonce(&server, client_addr).await;
+        let parsed =
+            allocate_with_retries(&server, client_addr, &nonce, &username, &realm, &password).await;
+
+        assert_eq!(parsed.header.method, Method::Allocate);
+        assert!(
+            parsed.get_attribute(Attribute::MESSAGE_INTEGRITY).is_some(),
+            "Allocate success must be signed with the HMAC-derived key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_expired_ephemeral_credential_allocate_rejected() {
+        let realm = "test-realm".to_string();
+        let (server, manager) = ephemeral_server(&realm, ExpiredTokenPolicy::Renew);
+        let client_addr: SocketAddr = "127.0.0.1:51002".parse().unwrap();
+
+        // Token that expired in the past.
+        let username = format!("{}:alice", unix_now_secs() - 3600);
+        let password = manager.compute_password(&username);
+
+        let nonce = obtain_nonce(&server, client_addr).await;
+        let msg =
+            build_authenticated_allocate_request([1; 12], &username, &realm, &nonce, &password);
+        let response = process_message(msg, &server, client_addr, None).await.unwrap();
+        let parsed = Message::parse(&response).unwrap();
+        assert_eq!(parsed.header.event_type, EventType::Error);
+        assert_eq!(error_code_of(&parsed), Some(401));
+    }
+
+    #[tokio::test]
+    async fn test_ephemeral_credential_wrong_hmac_rejected() {
+        let realm = "test-realm".to_string();
+        let (server, _manager) = ephemeral_server(&realm, ExpiredTokenPolicy::Renew);
+        let client_addr: SocketAddr = "127.0.0.1:51003".parse().unwrap();
+
+        let future = format!("{}:alice", unix_now_secs() + 3600);
+        let wrong_password = "definitely-not-the-hmac";
+
+        let nonce = obtain_nonce(&server, client_addr).await;
+        let msg =
+            build_authenticated_allocate_request([1; 12], &future, &realm, &nonce, wrong_password);
+        let response = process_message(msg, &server, client_addr, None).await.unwrap();
+        let parsed = Message::parse(&response).unwrap();
+        assert_eq!(parsed.header.event_type, EventType::Error);
+        assert_eq!(error_code_of(&parsed), Some(401));
+    }
+
+    /// renew: an expired token can still Refresh an established session.
+    #[tokio::test]
+    async fn test_expired_token_refresh_succeeds_under_renew_policy() {
+        let realm = "test-realm".to_string();
+        let (server, manager) = ephemeral_server(&realm, ExpiredTokenPolicy::Renew);
+        let client_addr: SocketAddr = "127.0.0.1:51004".parse().unwrap();
+        let (username, password, _) = manager.generate("alice", Some(3600));
+
+        let nonce = obtain_nonce(&server, client_addr).await;
+        let _ = allocate_with_retries(&server, client_addr, &nonce, &username, &realm, &password)
+            .await;
+
+        // Refresh signed with an already-expired token: HMAC valid, time out.
+        let expired_username = format!("{}:alice", unix_now_secs() - 1);
+        let expired_password = manager.compute_password(&expired_username);
+        let refresh = build_authenticated_refresh_request(
+            [7; 12],
+            600,
+            &expired_username,
+            &realm,
+            &nonce,
+            &expired_password,
+        );
+        let response = process_message(refresh, &server, client_addr, None).await.unwrap();
+        let parsed = Message::parse(&response).unwrap();
+        assert_eq!(
+            parsed.header.event_type,
+            EventType::Success,
+            "renew policy must keep established sessions refreshable after token expiry"
+        );
+        assert_eq!(lifetime_of(&parsed), Some(600));
+    }
+
+    /// strict: an expired token is rejected on Refresh (coturn behavior).
+    #[tokio::test]
+    async fn test_expired_token_refresh_rejected_under_strict_policy() {
+        let realm = "test-realm".to_string();
+        let (server, manager) = ephemeral_server(&realm, ExpiredTokenPolicy::Strict);
+        let client_addr: SocketAddr = "127.0.0.1:51005".parse().unwrap();
+        let (username, password, _) = manager.generate("alice", Some(3600));
+
+        let nonce = obtain_nonce(&server, client_addr).await;
+        let _ = allocate_with_retries(&server, client_addr, &nonce, &username, &realm, &password)
+            .await;
+
+        let expired_username = format!("{}:alice", unix_now_secs() - 1);
+        let expired_password = manager.compute_password(&expired_username);
+        let refresh = build_authenticated_refresh_request(
+            [7; 12],
+            600,
+            &expired_username,
+            &realm,
+            &nonce,
+            &expired_password,
+        );
+        let response = process_message(refresh, &server, client_addr, None).await.unwrap();
+        let parsed = Message::parse(&response).unwrap();
+        assert_eq!(parsed.header.event_type, EventType::Error);
+        assert_eq!(
+            error_code_of(&parsed),
+            Some(401),
+            "strict policy must reject Refresh with an expired token"
+        );
+    }
+
+    /// cap: granted lifetimes are clamped to the token's remaining validity.
+    #[tokio::test]
+    async fn test_cap_policy_clamps_lifetime_to_token_expiry() {
+        let realm = "test-realm".to_string();
+        let (server, manager) = ephemeral_server(&realm, ExpiredTokenPolicy::Cap);
+        let client_addr: SocketAddr = "127.0.0.1:51006".parse().unwrap();
+        let (username, password, _) = manager.generate("alice", Some(3));
+
+        let nonce = obtain_nonce(&server, client_addr).await;
+        let allocated =
+            allocate_with_retries(&server, client_addr, &nonce, &username, &realm, &password).await;
+        let granted = lifetime_of(&allocated).expect("Allocate success carries LIFETIME");
+        assert!(
+            granted >= 1 && granted <= 3,
+            "cap policy must clamp granted lifetime to token validity, got {}",
+            granted
+        );
+
+        // Refresh also clamps, even when the request asks for more.
+        let refresh = build_authenticated_refresh_request(
+            [7; 12],
+            600,
+            &username,
+            &realm,
+            &nonce,
+            &password,
+        );
+        let response = process_message(refresh, &server, client_addr, None).await.unwrap();
+        let parsed = Message::parse(&response).unwrap();
+        assert_eq!(parsed.header.event_type, EventType::Success);
+        let granted = lifetime_of(&parsed).expect("Refresh success carries LIFETIME");
+        assert!(
+            granted >= 1 && granted <= 3,
+            "cap policy must clamp Refresh lifetime to token validity, got {}",
+            granted
+        );
+    }
+
+    /// An unknown/invalid nonce yields 438 Stale Nonce with a fresh nonce.
+    #[tokio::test]
+    async fn test_invalid_nonce_returns_438_with_fresh_nonce() {
+        let realm = "test-realm".to_string();
+        let (server, manager) = ephemeral_server(&realm, ExpiredTokenPolicy::Renew);
+        let client_addr: SocketAddr = "127.0.0.1:51007".parse().unwrap();
+        let (username, password, _) = manager.generate("alice", Some(3600));
+
+        let msg = build_authenticated_allocate_request(
+            [3; 12],
+            &username,
+            &realm,
+            "f00dbabe-f00dbabe-f00dbabe-f00dbabe",
+            &password,
+        );
+        let response = process_message(msg, &server, client_addr, None).await.unwrap();
+        let parsed = Message::parse(&response).unwrap();
+        assert_eq!(parsed.header.event_type, EventType::Error);
+        assert_eq!(error_code_of(&parsed), Some(438));
+        assert!(
+            parsed.get_attribute(Attribute::NONCE).is_some(),
+            "438 response must carry a fresh nonce for transparent retry"
+        );
+    }
+
+    /// Static (auth.users) and ephemeral credentials can coexist; the static
+    /// exact-match user takes precedence.
+    #[tokio::test]
+    async fn test_static_user_coexists_with_ephemeral_credentials() {
+        let realm = "test-realm".to_string();
+        let (mut server, _manager) = ephemeral_server(&realm, ExpiredTokenPolicy::Renew);
+        let auth_manager = Arc::new(AuthManager::new(realm.clone()));
+        auth_manager.add_user(User {
+            username: "bob".to_string(),
+            password: "bob-password".to_string(),
+            user_type: UserType::Fixed,
+            created_at: 0,
+            expires_at: None,
+            max_allocations: 10,
+            bandwidth_limit: None,
+            ip_whitelist: None,
+            max_allocation_duration_secs: None,
+        });
+        server.set_auth_manager(auth_manager);
+        let client_addr: SocketAddr = "127.0.0.1:51008".parse().unwrap();
+
+        let nonce = obtain_nonce(&server, client_addr).await;
+        let parsed =
+            allocate_with_retries(&server, client_addr, &nonce, "bob", &realm, "bob-password")
+                .await;
+        assert_eq!(parsed.header.event_type, EventType::Success);
+
+        // Unknown static users must NOT fall through to any global password.
+        let unknown = build_authenticated_allocate_request(
+            [4; 12],
+            "mallory",
+            &realm,
+            &nonce,
+            "password", // the removed hardcoded global password
+        );
+        let response = process_message(unknown, &server, client_addr, None).await.unwrap();
+        let parsed = Message::parse(&response).unwrap();
+        assert_eq!(parsed.header.event_type, EventType::Error);
+        assert_eq!(error_code_of(&parsed), Some(401));
     }
 }

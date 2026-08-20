@@ -35,34 +35,67 @@ pub struct TurnRestState {
     pub credential_manager: Option<ShortTermCredentialManager>,
 }
 
-/// Build the TURN REST credential state from an HTTP config section.
-fn build_turn_rest_state(config: &Config) -> TurnRestState {
+/// Build the TURN REST credential state from the config.
+/// Fails when the REST API is enabled but no shared secret is configured
+/// (`auth.shared_secret` or the legacy `http.turn_rest_secret`).
+fn build_turn_rest_state(config: &Config) -> Result<TurnRestState, String> {
     let enabled = config
         .http
         .as_ref()
         .and_then(|h| h.turn_rest_enabled)
         .unwrap_or(false);
     if enabled {
-        let secret = config
-            .http
-            .as_ref()
-            .and_then(|h| h.turn_rest_secret.clone())
-            .unwrap_or_else(|| "default-secret-key".to_string());
+        let Some(secret) = config.auth.resolve_shared_secret(config.http.as_ref()) else {
+            return Err(
+                "turn_rest_enabled = true but no shared secret is configured \
+                 (set auth.shared_secret or the legacy http.turn_rest_secret)"
+                    .to_string(),
+            );
+        };
         let lifetime = config
             .http
             .as_ref()
             .and_then(|h| h.turn_rest_default_lifetime)
             .unwrap_or(3600);
         let manager = ShortTermCredentialManager::new(secret).with_lifetime(lifetime);
-        TurnRestState {
+        Ok(TurnRestState {
             enabled: true,
             credential_manager: Some(manager),
-        }
+        })
     } else {
-        TurnRestState {
+        Ok(TurnRestState {
             enabled: false,
             credential_manager: None,
-        }
+        })
+    }
+}
+
+/// Build the initial TURN REST state from the resolved parts passed by the
+/// caller (main.rs resolves `auth.shared_secret` over the legacy key).
+fn build_turn_rest_state_from_parts(
+    turn_rest_enabled: bool,
+    turn_rest_secret: Option<String>,
+    turn_rest_default_lifetime: u64,
+) -> Result<TurnRestState, Box<dyn std::error::Error + Send + Sync>> {
+    if turn_rest_enabled {
+        let Some(secret) = turn_rest_secret else {
+            return Err(
+                "TURN REST API is enabled but no shared secret is configured \
+                 (set auth.shared_secret or the legacy http.turn_rest_secret)"
+                    .into(),
+            );
+        };
+        let manager =
+            ShortTermCredentialManager::new(secret).with_lifetime(turn_rest_default_lifetime);
+        Ok(TurnRestState {
+            enabled: true,
+            credential_manager: Some(manager),
+        })
+    } else {
+        Ok(TurnRestState {
+            enabled: false,
+            credential_manager: None,
+        })
     }
 }
 
@@ -215,17 +248,13 @@ pub async fn create_admin_routes(
     trust_proxy: bool,
     log_reload: Option<Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let turn_rest_state = Arc::new(parking_lot::RwLock::new(TurnRestState {
-        enabled: turn_rest_enabled,
-        credential_manager: if turn_rest_enabled {
-            let secret = turn_rest_secret.unwrap_or_else(|| "default-secret-key".to_string());
-            let manager =
-                ShortTermCredentialManager::new(secret).with_lifetime(turn_rest_default_lifetime);
-            Some(manager)
-        } else {
-            None
-        },
-    }));
+    let turn_rest_state = Arc::new(parking_lot::RwLock::new(
+        build_turn_rest_state_from_parts(
+            turn_rest_enabled,
+            turn_rest_secret,
+            turn_rest_default_lifetime,
+        )?,
+    ));
 
     let state = AppState {
         admin: AdminState {
@@ -499,6 +528,7 @@ async fn reload_handler(jar: CookieJar, State(state): State<AppState>) -> Json<s
     };
 
     let mut applied: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
 
     // 1. Auth: users + api_keys (as ApiKey users) + ACL rules.
     let mut users: Vec<User> = config
@@ -557,10 +587,18 @@ async fn reload_handler(jar: CookieJar, State(state): State<AppState>) -> Json<s
         .reload_config(users, config.auth.api_keys.clone(), acl_rules);
     applied.push("auth".to_string());
 
-    // 2. TURN REST credentials.
-    let new_turn_rest = build_turn_rest_state(&config);
-    *state.turn_rest.write() = new_turn_rest;
-    applied.push("turn_rest".to_string());
+    // 2. TURN REST credentials. A config that enables the REST API without a
+    // shared secret is invalid: keep the previous state and report it.
+    match build_turn_rest_state(&config) {
+        Ok(new_turn_rest) => {
+            *state.turn_rest.write() = new_turn_rest;
+            applied.push("turn_rest".to_string());
+        }
+        Err(e) => {
+            tracing::warn!("TURN REST reload skipped: {}", e);
+            skipped.push("turn_rest".to_string());
+        }
+    }
 
     // 3. Log level (when the subscriber exposes a reload handle).
     if let Some(reload) = &state.log_reload {
@@ -575,6 +613,7 @@ async fn reload_handler(jar: CookieJar, State(state): State<AppState>) -> Json<s
         "success": true,
         "message": "Configuration reloaded",
         "applied": applied,
+        "skipped": skipped,
         "restart_required": [
             "server.realm",
             "server.external_ip",
