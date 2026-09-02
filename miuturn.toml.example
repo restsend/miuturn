@@ -34,3 +34,14 @@ address = "0.0.0.0:3478"
 use_auth_secret = true
 secret = "local-test-secret"
 lifetime = 3600
+
+[[auth.users]]
+username = "miuturn.admin"
+password = "miuturn.pwd.changeme"
+user_type = "fixed"
+max_allocations = 10
+
+[[auth.acl_rules]]
+ip_range = "0.0.0.0/0"
+action = "allow"
+priority = 0
