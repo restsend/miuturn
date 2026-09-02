@@ -122,6 +122,15 @@ impl Default for LogConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AuthConfig {
+    /// Select shared-secret TURN authentication instead of stored passwords; startup only.
+    #[serde(default)]
+    pub use_auth_secret: bool,
+    /// Shared secret required when use_auth_secret is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    /// Default credential generation lifetime in seconds; defaults to 3600.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<u64>,
     #[serde(default)]
     pub users: Vec<UserConfig>,
     #[serde(default)]
@@ -192,6 +201,9 @@ impl Default for Config {
             http: None,
             log: LogConfig::default(),
             auth: AuthConfig {
+                use_auth_secret: false,
+                secret: None,
+                lifetime: None,
                 users: vec![],
                 api_keys: HashMap::new(),
                 acl_rules: vec![AclRuleConfig {
@@ -241,6 +253,31 @@ mod tests {
         let deserialized: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(deserialized.server.realm, config.server.realm);
         assert_eq!(deserialized.server.external_ip, config.server.external_ip);
+    }
+
+    #[test]
+    fn test_turn_rest_auth_secret_config() {
+        let auth: AuthConfig = toml::from_str(
+            "use_auth_secret = true\nsecret = 'auth-secret'\nlifetime = 7200",
+        ).unwrap();
+        assert!(auth.use_auth_secret);
+        assert_eq!(auth.secret.as_deref(), Some("auth-secret"));
+        assert_eq!(auth.lifetime, Some(7200));
+        let serialized = toml::to_string(&auth).unwrap();
+        assert!(serialized.contains("use_auth_secret = true"));
+        let restored: AuthConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(restored.use_auth_secret, auth.use_auth_secret);
+        assert_eq!(restored.secret, auth.secret);
+        assert_eq!(restored.lifetime, auth.lifetime);
+
+        let auth: AuthConfig = toml::from_str("users = []").unwrap();
+        assert!(!auth.use_auth_secret);
+        assert!(auth.secret.is_none());
+        assert!(auth.lifetime.is_none());
+        let auth: AuthConfig = toml::from_str("use_auth_secret = true\nsecret = 'auth-secret'").unwrap();
+        assert!(auth.use_auth_secret);
+        assert!(auth.lifetime.is_none());
+        assert!(toml::from_str::<AuthConfig>("use_auth_secret = 'auth-secret'").is_err());
     }
 
     #[test]

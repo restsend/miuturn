@@ -72,6 +72,11 @@ turn_rest_enabled = true
 turn_rest_secret = "your-secret-key"
 turn_rest_default_lifetime = 3600
 
+[auth]
+use_auth_secret = true
+secret = "your-secret-key"
+lifetime = 3600 # optional; default lifetime for credential generation, in seconds
+
 [[auth.users]]
 username = "regular_user"
 password = "userpass"
@@ -100,6 +105,40 @@ ip_range = "0.0.0.0/0"
 action = "Deny"
 priority = 1
 ```
+
+With `[auth].use_auth_secret = true` and a nonempty `[auth].secret`,
+TURN protocol authentication uses only temporary credentials minted with that secret.
+Stored user passwords are not accepted in this mode, including for usernames present
+in `[[auth.users]]`. Set `use_auth_secret = false` or omit it to use stored-user authentication.
+The optional `auth.lifetime` sets the credential manager's default generation lifetime
+in seconds (3600 when omitted). Authentication checks the expiry embedded in the
+provided username; this setting does not change credentials issued by RustPBX.
+User/API management and ACL checks remain separate from this credential mode.
+HTTP configuration is not required. The global password is used only by servers
+without an auth manager.
+The username is `<expiry Unix timestamp>:<user id>` and the password is the
+standard padded Base64 encoding of `HMAC-SHA1(secret, username)`, compatible with
+coturn's TURN REST convention. Expired credentials are rejected. TURN authentication
+reads these authentication settings at startup; changing them requires restarting miuturn.
+The HTTP credential endpoint uses its own `[http].turn_rest_secret` setting. If
+you use that endpoint to issue credentials for this server, configure both secrets
+with the same value.
+
+This replaces the previous hex output. Update credential issuers together with
+miuturn and fetch fresh credentials; previously issued hex passwords no longer work.
+
+For RustPBX, configure its browser `/iceservers` endpoint with:
+
+```toml
+[[ice_servers]]
+urls = ["turn:turn.example.com:3478", "turn:turn.example.com:3478?transport=tcp"]
+secrete = "your-secret-key" # same as miuturn's [auth].secret
+username = "rustpbx"
+lifetime = 3600
+```
+
+Only temporary credentials are returned to the browser. Keep the shared secret
+on the servers and fetch fresh ICE configuration before the credentials expire.
 
 `external_ip` is the relay address advertised back to clients.
 `relay_bind_ip` is the local interface used to bind relay sockets. If omitted, it defaults to `0.0.0.0`. In NAT deployments, set `external_ip` to the public IP and keep `relay_bind_ip` as `0.0.0.0` (or a specific local interface IP if needed).
