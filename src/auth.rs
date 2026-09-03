@@ -1,3 +1,4 @@
+use crate::short_term::ShortTermCredentialManager;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -44,6 +45,7 @@ pub struct AuthManager {
     api_keys: RwLock<HashMap<String, String>>,
     acl_rules: RwLock<Vec<AclRule>>,
     realm: String,
+    secret_credentials: Option<ShortTermCredentialManager>,
 }
 
 impl AuthManager {
@@ -53,6 +55,7 @@ impl AuthManager {
             api_keys: RwLock::new(HashMap::new()),
             acl_rules: RwLock::new(Vec::new()),
             realm,
+            secret_credentials: None,
         }
     }
 
@@ -199,9 +202,21 @@ impl AuthManager {
         &self.realm
     }
 
-    /// Get the password for a user by username (for TURN HMAC key derivation).
-    /// Returns None if the user doesn't exist or has expired.
+    /// Select shared-secret authentication at startup, before sharing this manager.
+    pub fn with_secret_credentials(mut self, manager: Option<ShortTermCredentialManager>) -> Self {
+        self.secret_credentials = manager;
+        self
+    }
+
+    /// Resolve a TURN password using shared-secret mode or stored-user mode.
+    /// Shared-secret mode never falls back to stored passwords.
     pub fn get_user_password(&self, username: &str) -> Option<String> {
+        if let Some(ref manager) = self.secret_credentials {
+            if manager.is_expired(username) {
+                return None;
+            }
+            return Some(manager.compute_password(username));
+        }
         let users = self.users.read();
         let user = users.get(username)?;
         if let Some(expires) = user.expires_at {

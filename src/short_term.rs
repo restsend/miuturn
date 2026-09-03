@@ -1,8 +1,9 @@
 //! Short-term credentials support for WebRTC TURN
 //!
 //! Implements TURN REST API for generating short-term credentials.
-//! Format: username = timestamp:user_id, password = HMAC(timestamp:user_id, key)
+//! Format: username = timestamp:user_id, password = Base64(HMAC-SHA1(secret, username))
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,6 +20,22 @@ pub struct ShortTermCredentialManager {
 }
 
 impl ShortTermCredentialManager {
+    /// Read the startup shared secret from the authentication section.
+    pub fn from_auth_config(
+        config: &crate::config::AuthConfig,
+    ) -> Result<Option<Self>, &'static str> {
+        if !config.use_auth_secret {
+            return Ok(None);
+        }
+        let secret = config.secret.as_ref().filter(|secret| !secret.is_empty())
+            .ok_or("auth.secret must be nonempty when use_auth_secret is enabled")?;
+        let lifetime = config.lifetime.unwrap_or(3600);
+        if lifetime == 0 {
+            return Err("auth.lifetime must be greater than zero");
+        }
+        Ok(Some(Self::new(secret.clone()).with_lifetime(lifetime)))
+    }
+
     pub fn new(secret_key: String) -> Self {
         Self {
             secret_key: secret_key.into_bytes(),
@@ -47,12 +64,12 @@ impl ShortTermCredentialManager {
         (username, password, timestamp)
     }
 
-    /// Compute HMAC-SHA1 password for the given username
+    /// Compute a standard padded Base64 HMAC-SHA1 password for the given username.
     pub fn compute_password(&self, username: &str) -> String {
         let mut mac = HmacSha1::new_from_slice(&self.secret_key).unwrap();
         mac.update(username.as_bytes());
         let result = mac.finalize();
-        hex::encode(result.into_bytes())
+        STANDARD.encode(result.into_bytes())
     }
 
     /// Verify short-term credentials
@@ -113,6 +130,42 @@ impl ShortTermCredentialManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_turn_rest_requires_explicit_secret() {
+        let mut config = crate::config::Config::default();
+        assert!(ShortTermCredentialManager::from_auth_config(&config.auth).unwrap().is_none());
+        config.http = Some(crate::config::HttpConfig {
+            turn_rest_enabled: Some(true),
+            turn_rest_secret: Some("http-only-secret".to_string()),
+            ..Default::default()
+        });
+        assert!(ShortTermCredentialManager::from_auth_config(&config.auth).unwrap().is_none());
+
+        config.auth.use_auth_secret = true;
+        assert!(ShortTermCredentialManager::from_auth_config(&config.auth).is_err());
+        config.auth.secret = Some(String::new());
+        assert!(ShortTermCredentialManager::from_auth_config(&config.auth).is_err());
+        config.auth.secret = Some("interop-secret".to_string());
+        let manager = ShortTermCredentialManager::from_auth_config(&config.auth).unwrap().unwrap();
+        assert_eq!(manager.default_lifetime_secs, 3600);
+        assert_eq!(manager.compute_password("4102444800:rustpbx"), "+dOIp7n9DHzIT8uNfVz8tNFZoLs=");
+        config.http = None;
+        let manager = ShortTermCredentialManager::from_auth_config(&config.auth).unwrap().unwrap();
+        assert_eq!(manager.compute_password("4102444800:rustpbx"), "+dOIp7n9DHzIT8uNfVz8tNFZoLs=");
+
+        config.auth.lifetime = Some(7200);
+        let manager = ShortTermCredentialManager::from_auth_config(&config.auth).unwrap().unwrap();
+        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let (_, _, expires) = manager.generate("configured-lifetime", None);
+        let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        assert!(expires >= before + 7200 && expires <= after + 7200);
+
+        config.auth.lifetime = Some(0);
+        assert!(ShortTermCredentialManager::from_auth_config(&config.auth).is_err());
+        config.auth.use_auth_secret = false;
+        assert!(ShortTermCredentialManager::from_auth_config(&config.auth).unwrap().is_none());
+    }
 
     #[test]
     fn test_short_term_credential_generation() {
@@ -233,6 +286,9 @@ mod tests {
 
         let password1 = manager.compute_password("1234567890:user1");
         let password2 = manager.compute_password("1234567890:user1");
+
+        // Independent vector covers the standard alphabet and required padding.
+        assert_eq!(password1, "S5LWEBNl0p/S5vdwWibXr2xxTnU=");
 
         // Same input should produce same password
         assert_eq!(password1, password2);

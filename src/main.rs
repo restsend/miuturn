@@ -112,9 +112,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "configured relay addressing"
     );
 
-    let auth_manager: SharedAuthManager = Arc::new(AuthManager::new(config.server.realm.clone()));
+    let auth_manager: SharedAuthManager = Arc::new(
+        AuthManager::new(config.server.realm.clone()).with_secret_credentials(
+            miuturn::ShortTermCredentialManager::from_auth_config(&config.auth)?,
+        ),
+    );
 
-    // Set auth_manager so TURN protocol uses per-user passwords
+    // The auth manager handles the configured TURN credential mode and ACLs.
     server.set_auth_manager(auth_manager.clone());
 
     let server = server; // remove mut

@@ -1,9 +1,9 @@
 //! End-to-end test for the `/metrics` endpoint and the config reload flow:
-//!  1. start a real TURN UDP server + admin HTTP server against a temp config
-//!  2. allocate with long-term credentials, confirm /metrics shows real data
-//!  3. edit the config file (add user, change TURN REST secret, log level)
+//!  1. start a shared-secret TURN UDP server + admin HTTP server
+//!  2. allocate with shared-secret credentials, confirm /metrics shows real data
+//!  3. edit the config file (add user, change auth/HTTP secrets, log level)
 //!  4. POST /api/v1/reload, confirm auth / turn_rest / log_level all applied
-//!  5. the newly-added user can allocate; TURN REST credentials change
+//!  5. users reload independently; the TURN auth secret stays fixed at startup
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -36,6 +36,7 @@ fn pick_free_udp_port() -> u16 {
 fn write_config(
     path: &PathBuf,
     users_toml: &str,
+    auth_secret: &str,
     rest_secret: &str,
     log_level: &str,
     udp_port: u16,
@@ -62,6 +63,9 @@ turn_rest_default_lifetime = 3600
 log_level = "{log_level}"
 
 [auth]
+use_auth_secret = true
+secret = "{auth_secret}"
+lifetime = 7200
 users = [ {users_toml} ]
 "#
     );
@@ -114,10 +118,11 @@ async fn metrics_and_reload_e2e() {
     let udp_addr: SocketAddr = format!("127.0.0.1:{}", udp_port).parse().unwrap();
     let http_addr: SocketAddr = format!("127.0.0.1:{}", http_port).parse().unwrap();
 
-    // Initial config: only "bob", TURN REST secret "secret-a", log "info".
+    // The authentication and HTTP issuer use different secrets.
     write_config(
         &config_path,
         r#"{ username = "bob", password = "pass", user_type = "fixed" }"#,
+        "auth-secret-a",
         "secret-a",
         "info",
         udp_port,
@@ -133,7 +138,13 @@ async fn metrics_and_reload_e2e() {
         relay_max,
         "password".to_string(),
     );
-    let auth = Arc::new(AuthManager::new("test-realm".to_string()));
+    let config = miuturn::Config::load(config_path.clone()).unwrap();
+    let turn_credentials = miuturn::ShortTermCredentialManager::from_auth_config(&config.auth)
+        .unwrap().unwrap();
+    let auth = Arc::new(
+        AuthManager::new("test-realm".to_string())
+            .with_secret_credentials(Some(turn_credentials.clone())),
+    );
     auth.add_user(User {
         username: "bob".to_string(),
         password: "pass".to_string(),
@@ -176,13 +187,14 @@ async fn metrics_and_reload_e2e() {
         address: udp_addr.to_string(),
     }];
     let admin_config_path = config_path.clone();
+    let admin_auth = auth.clone();
     let admin_task = tokio::spawn(async move {
         let _ = miuturn::create_admin_routes(
             http_addr.to_string(),
             stats_fn,
             None,
             None,
-            auth,
+            admin_auth,
             true,
             Some("secret-a".to_string()),
             3600,
@@ -203,10 +215,15 @@ async fn metrics_and_reload_e2e() {
     let http = reqwest::Client::new();
     let base = format!("http://{}", http_addr);
 
-    // ── 1. bob allocates via real TURN long-term credentials ───────────────
+    // ── 1. TURN uses shared-secret credentials, not stored passwords ───────
     assert!(
-        allocate_turn(udp_addr, "bob", "pass").await,
-        "bob should be able to allocate before reload"
+        !allocate_turn(udp_addr, "bob", "pass").await,
+        "shared-secret mode must reject stored user passwords"
+    );
+    let (auth_username, auth_credential, _) = turn_credentials.generate("external-user", None);
+    assert!(
+        allocate_turn(udp_addr, &auth_username, &auth_credential).await,
+        "auth.secret credentials should allocate without a stored user"
     );
 
     // ── 2. /metrics shows real data (was all-zeros before the fix) ──────────
@@ -237,11 +254,19 @@ async fn metrics_and_reload_e2e() {
         .await
         .unwrap();
     assert!(rest_before.contains("turn:127.0.0.1"), "{}", rest_before);
+    let ice_before: serde_json::Value = serde_json::from_str(&rest_before).unwrap();
+    let username_before = ice_before[0]["username"].as_str().unwrap();
+    let credential_before = ice_before[0]["credential"].as_str().unwrap();
+    assert!(
+        !allocate_turn(udp_addr, username_before, credential_before).await,
+        "the HTTP secret must not be used for TURN authentication"
+    );
 
     // ── 4. Edit the config: add alice, new secret, log level debug ──────────
     write_config(
         &config_path,
         r#"{ username = "bob", password = "pass", user_type = "fixed" }, { username = "alice", password = "secret2", user_type = "fixed" }"#,
+        "auth-secret-b",
         "secret-b",
         "debug",
         udp_port,
@@ -269,10 +294,11 @@ async fn metrics_and_reload_e2e() {
     }
     assert_eq!(resp["user_count"], 2, "{}", resp);
 
-    // ── 6. newly-added alice can now allocate (auth reload is live) ─────────
+    // ── 6. users reload without changing the TURN credential mode ──────────
+    assert!(auth.authenticate("alice", "secret2").is_some());
     assert!(
-        allocate_turn(udp_addr, "alice", "secret2").await,
-        "alice should be able to allocate after reload"
+        !allocate_turn(udp_addr, "alice", "secret2").await,
+        "reloading stored users must not change shared-secret mode"
     );
 
     // ── 7. TURN REST credential changed with the new secret ─────────────────
@@ -288,6 +314,26 @@ async fn metrics_and_reload_e2e() {
         rest_before, rest_after,
         "TURN REST credential should change after secret reload"
     );
+    assert!(
+        allocate_turn(udp_addr, &auth_username, &auth_credential).await,
+        "TURN authentication must retain its startup secret after config reload"
+    );
+    let config = miuturn::Config::load(config_path.clone()).unwrap();
+    let new_credentials = miuturn::ShortTermCredentialManager::from_auth_config(&config.auth)
+        .unwrap().unwrap();
+    assert!(
+        !allocate_turn(udp_addr, &auth_username, &new_credentials.compute_password(&auth_username)).await,
+        "changing auth.secret requires a restart"
+    );
+    let ice_after: serde_json::Value = serde_json::from_str(&rest_after).unwrap();
+    assert!(
+        !allocate_turn(
+            udp_addr,
+            ice_after[0]["username"].as_str().unwrap(),
+            ice_after[0]["credential"].as_str().unwrap(),
+        ).await,
+        "reloading the HTTP secret must not affect TURN authentication"
+    );
 
     // ── 8. log level reload reached the (recording) handle ──────────────────
     let applied_logs = log_applied.lock().unwrap().clone();
@@ -297,7 +343,7 @@ async fn metrics_and_reload_e2e() {
         applied_logs
     );
 
-    // ── 9. cumulative allocation counter reflects the second allocation ─────
+    // ── 9. cumulative allocation counter reflects both successful allocations ──
     let body = http
         .get(format!("{}/metrics", base))
         .send()

@@ -30,6 +30,11 @@ address = "0.0.0.0:3478"
 # Trust X-Forwarded-For / X-Real-IP headers when checking admin ACL (default: false)
 #trust_proxy = false
 
+[auth]
+use_auth_secret = true
+secret = "local-test-secret"
+lifetime = 3600
+
 [[auth.users]]
 username = "miuturn.admin"
 password = "miuturn.pwd.changeme"

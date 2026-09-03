@@ -368,7 +368,7 @@ impl TurnServer {
         server
     }
 
-    /// Set the auth manager for per-user password lookup
+    /// Set the auth manager for TURN password lookup and ACL checks.
     pub fn set_auth_manager(&mut self, auth_manager: Arc<AuthManager>) {
         self.auth_manager = Some(auth_manager);
     }
@@ -380,12 +380,11 @@ impl TurnServer {
     }
 
     /// Look up password for a given username.
-    /// First tries auth_manager, then falls back to the global password.
+    /// The auth manager selects shared-secret or stored-user authentication.
+    /// The global password is used only when no auth manager is configured.
     fn get_password_for_user(&self, username: &str) -> Option<String> {
         if let Some(ref am) = self.auth_manager {
-            if let Some(pw) = am.get_user_password(username) {
-                return Some(pw);
-            }
+            return am.get_user_password(username);
         }
         // Fallback to global password if non-empty
         if !self.password.is_empty() {
@@ -1221,7 +1220,7 @@ fn verify_turn_auth(
         ));
     }
 
-    // Look up password for this user (from AuthManager or global password)
+    // Resolve the password using the configured authentication mode.
     let password = match server.get_password_for_user(&username) {
         Some(pw) => pw,
         None => {
@@ -2049,6 +2048,102 @@ mod tests {
     fn test_message_integrity_key() {
         let key = compute_message_integrity_key("user", "realm", "pass");
         assert_eq!(key.len(), 16);
+    }
+
+    #[test]
+    fn test_turn_rest_auth_credentials_and_expiry() {
+        use crate::auth::{User, UserType};
+        use crate::short_term::ShortTermCredentialManager;
+
+        let mut server = TurnServer::with_password(
+            Ipv4Addr::LOCALHOST, "test-realm".to_string(), "global-password".to_string(),
+        );
+        let mut config = crate::config::Config::default();
+        config.auth = toml::from_str("use_auth_secret = true\nsecret = 'interop-secret'").unwrap();
+        assert!(config.http.is_none());
+        let manager = ShortTermCredentialManager::from_auth_config(&config.auth).unwrap().unwrap();
+        let auth = Arc::new(
+            AuthManager::new("test-realm".to_string())
+                .with_secret_credentials(Some(manager.clone())),
+        );
+        server.set_auth_manager(auth.clone());
+        let nonce = generate_nonce();
+        insert_nonce_capped(&server.nonce_map, nonce.clone());
+        let client_addr = "127.0.0.1:50000".parse().unwrap();
+
+        // Same independent vector as RustPBX's browser ICE configuration test.
+        let username = "4102444800:rustpbx";
+        let credential = "+dOIp7n9DHzIT8uNfVz8tNFZoLs=";
+        let valid = build_authenticated_allocate_request(
+            [1; 12], username, "test-realm", &nonce, credential,
+        );
+        assert_eq!(verify_turn_auth(&valid, &server, client_addr).unwrap(), username);
+        assert!(auth.list_users().is_empty(), "secret credentials require no stored users");
+
+        for (user, password) in [
+            // The former hex password must not authenticate in Base64 mode.
+            (username, "f9d388a7b9fd0c7cc84fcb8d7d5cfcb4d159a0bb".to_string()),
+            (username, "wrong-secret".to_string()),
+            (username, "global-password".to_string()),
+            ("unknown-user", "global-password".to_string()),
+            ("1:expired", manager.compute_password("1:expired")),
+            ("1:expired", "global-password".to_string()),
+            ("invalid:user", "global-password".to_string()),
+            ("4102444800:user:extra", manager.compute_password("4102444800:user:extra")),
+            ("4102444800:tampered", credential.to_string()),
+        ] {
+            let request = build_authenticated_allocate_request(
+                [2; 12], user, "test-realm", &nonce, &password,
+            );
+            assert!(verify_turn_auth(&request, &server, client_addr).is_err(), "accepted {user}");
+        }
+
+        // Stored users do not override shared-secret authentication.
+        let mut user = User {
+            username: username.to_string(),
+            password: "stored-password".to_string(),
+            user_type: UserType::Fixed,
+            created_at: 0,
+            expires_at: None,
+            max_allocations: 10,
+            bandwidth_limit: None,
+            ip_whitelist: None,
+            max_allocation_duration_secs: None,
+        };
+        auth.add_user(user.clone());
+        let stored_request = build_authenticated_allocate_request(
+            [5; 12], username, "test-realm", &nonce, &user.password,
+        );
+        assert!(verify_turn_auth(&stored_request, &server, client_addr).is_err());
+        assert!(verify_turn_auth(&valid, &server, client_addr).is_ok());
+
+        // Shared-secret mode does not consult the stored user's expiry either.
+        user.expires_at = Some(1);
+        auth.add_user(user.clone());
+        assert!(verify_turn_auth(&stored_request, &server, client_addr).is_err());
+        assert!(verify_turn_auth(&valid, &server, client_addr).is_ok());
+        let global_request = build_authenticated_allocate_request(
+            [6; 12], username, "test-realm", &nonce, "global-password",
+        );
+        assert!(verify_turn_auth(&global_request, &server, client_addr).is_err());
+        // Omitting the secret selects stored-user authentication, including expiry.
+        let stored_auth = Arc::new(AuthManager::new("test-realm".to_string()));
+        stored_auth.add_user(user.clone());
+        server.set_auth_manager(stored_auth.clone());
+        assert!(verify_turn_auth(&stored_request, &server, client_addr).is_err());
+        assert!(verify_turn_auth(&valid, &server, client_addr).is_err());
+        user.expires_at = None;
+        stored_auth.add_user(user);
+        assert!(verify_turn_auth(&stored_request, &server, client_addr).is_ok());
+        assert!(verify_turn_auth(&valid, &server, client_addr).is_err());
+
+        // Global-password mode is available only without an auth manager.
+        let static_request = build_authenticated_allocate_request(
+            [4; 12], "legacy-user", "test-realm", &nonce, "global-password",
+        );
+        assert!(verify_turn_auth(&static_request, &server, client_addr).is_err());
+        server.auth_manager = None;
+        assert!(verify_turn_auth(&static_request, &server, client_addr).is_ok());
     }
 
     #[tokio::test]
