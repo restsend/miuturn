@@ -15,6 +15,7 @@ mod relay_data_path_tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
     use tokio::net::UdpSocket;
+    use tokio::time::timeout;
 
     // =========================================================================
     // Source-level bug verification (compile-time checks)
@@ -36,19 +37,32 @@ mod relay_data_path_tests {
             "FIX CONFIRMED: `let _ =` pattern for ChannelData send failure removed from server.rs"
         );
 
-        // All ChannelData paths should now use `if let Err(e) = ...` with `warn!`
+        // ChannelData (TCP + UDP) is routed through AllocationTable::send_to_peer,
+        // where send failures are logged with warn! and permission drops with
+        // debug! — and which also carries the same-server internal-delivery
+        // short-circuit. Direct relay-socket sends in the handlers would bypass
+        // both, so their absence is part of the invariant.
         assert!(
-            source
-                .contains("if let Err(e) = relay_sock.send_to(&payload, &channel.peer_addr).await"),
-            "ChannelData send failures should be handled with if let Err"
+            !source.contains("relay_sock.send_to(&payload, &channel.peer_addr)"),
+            "ChannelData handlers must not send via the relay socket directly"
         );
         assert!(
-            source.contains("\"UDP ChannelData send to peer {} failed: {}\""),
-            "UDP ChannelData send failure should be logged with warn!"
+            source.matches(".send_to_peer(&peer_addr, peer, &payload)").count() >= 2,
+            "TCP and UDP ChannelData handlers must both route through send_to_peer"
+        );
+
+        // Failure handling lives in send_to_peer (allocation.rs).
+        let alloc_rs = std::path::Path::new(&crate_root).join("src/allocation.rs");
+        let alloc_source = std::fs::read_to_string(&alloc_rs)
+            .unwrap_or_else(|_| panic!("cannot read {}", alloc_rs.display()));
+        assert!(
+            alloc_source
+                .contains("\"failed to send relay packet to peer\""),
+            "relay send failures should be logged with warn! in send_to_peer"
         );
         assert!(
-            source.contains("\"TCP ChannelData send to peer {} failed: {}\""),
-            "TCP ChannelData send failure should be logged with warn!"
+            alloc_source.contains("dropping relay packet because peer is not in permission list"),
+            "permission drops should be logged in send_to_peer"
         );
     }
 
@@ -1069,6 +1083,230 @@ mod relay_data_path_tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let after = table.stats().total_bytes_relayed.load(Ordering::Relaxed);
         assert!(after > before, "permitted peer packet must be relayed");
+    }
+
+    // =========================================================================
+    // Field case vendor-case-a1368cfd: miuturn behind 1:1 NAT.
+    //
+    // The server advertises a public VIP that is NOT assigned to the machine;
+    // two allocations on the same server talk relay↔relay and the NAT hairpins
+    // those packets back with the machine's REAL interface IP as source (never
+    // the advertised VIP). The receiving client permissions the advertised VIP
+    // only, so the hairpinned direction dies at the permission check and the
+    // WebRTC DTLS handshake starves (one-way relay path → zero media → both
+    // watchdogs hang up).
+    // =========================================================================
+
+    /// Parse STUN TLV attributes from a raw message.
+    fn stun_tlv_attrs(buf: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let mut out = Vec::new();
+        if buf.len() < 20 {
+            return out;
+        }
+        let msg_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+        let end = (20 + msg_len).min(buf.len());
+        let mut off = 20;
+        while off + 4 <= end {
+            let t = u16::from_be_bytes([buf[off], buf[off + 1]]);
+            let l = u16::from_be_bytes([buf[off + 2], buf[off + 3]]) as usize;
+            if off + 4 + l > end {
+                break;
+            }
+            out.push((t, buf[off + 4..off + 4 + l].to_vec()));
+            off += 4 + l + ((4 - (l % 4)) % 4);
+        }
+        out
+    }
+
+    /// Decode an 8-byte XOR IPv4 address attribute value.
+    fn xor_v4_decode(raw: &[u8]) -> SocketAddr {
+        let magic: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
+        let xport = u16::from_be_bytes([raw[2], raw[3]]) ^ (0x2112A442u32 >> 16) as u16;
+        let ip = Ipv4Addr::new(
+            raw[4] ^ magic[0],
+            raw[5] ^ magic[1],
+            raw[6] ^ magic[2],
+            raw[7] ^ magic[3],
+        );
+        SocketAddr::new(ip.into(), xport)
+    }
+
+    /// The NAT hairpins a packet from the peer allocation back to our relay
+    /// socket with the machine's real interface IP as source (not the
+    /// advertised VIP). The client's permission covers the advertised VIP only.
+    ///
+    /// BUG (field case): the permission check runs on the raw source IP, so the
+    /// packet is dropped and the client receives nothing — one-way relay path.
+    /// FIX: normalize the source to the advertised relay IP BEFORE the
+    /// permission check and deliver with XOR-PEER-ADDRESS equal to the
+    /// advertised form (VIP:peer_port), exactly matching the SDP candidate.
+    #[tokio::test]
+    async fn test_hairpin_local_source_normalized_before_permission_check() {
+        let table = AllocationTable::with_port_range_and_bind_addr(
+            Ipv4Addr::new(198, 51, 100, 10), // TEST-NET-2 VIP: not assigned to this machine
+            Ipv4Addr::UNSPECIFIED,           // relay_bind 0.0.0.0 (field config)
+            "test".to_string(),
+            56000,
+            56999,
+            None,
+            None,
+            None,
+        );
+        let channel_table = ChannelTable::new();
+
+        let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+
+        let alloc = table
+            .create_allocation(client_addr, Some(600), &channel_table)
+            .await
+            .unwrap();
+        let relayed = alloc.read().relayed_addr;
+        assert_eq!(
+            relayed.ip(),
+            Ipv4Addr::new(198, 51, 100, 10),
+            "allocation must advertise the external VIP"
+        );
+
+        // The client permissioned the peer's ADVERTISED relay address only —
+        // it cannot know the TURN host's internal address.
+        let peer_advertised: SocketAddr = format!("198.51.100.10:{}", relayed.port() + 1)
+            .parse()
+            .unwrap();
+        assert!(table.add_permissions(&client_addr, &[peer_advertised]));
+
+        // Simulate the NAT-hairpinned packet: source = this machine's real
+        // interface IP (never permissioned), destination = our relay socket.
+        let real_ip = detect_local_ipv4s()
+            .into_iter()
+            .next()
+            .expect("test host must have a non-loopback IPv4 interface");
+        let hairpin = UdpSocket::bind((real_ip, 0)).await.unwrap();
+        let hairpin_addr = hairpin.local_addr().unwrap();
+        assert_eq!(hairpin_addr.ip(), real_ip);
+        hairpin
+            .send_to(b"hairpin-dtls", &SocketAddr::from(([127, 0, 0, 1], relayed.port())))
+            .await
+            .unwrap();
+
+        // The packet must be normalized (real_ip → advertised VIP) before the
+        // permission check and delivered with a XOR-PEER-ADDRESS equal to the
+        // advertised form, so the client sees its SDP candidate — not an
+        // internal address it never permissioned.
+        let mut buf = vec![0u8; 1024];
+        let (len, _) = timeout(Duration::from_secs(3), client_sock.recv_from(&mut buf))
+            .await
+            .expect(
+                "hairpinned packet must be normalized to the advertised relay IP and delivered, not dropped",
+            )
+            .unwrap();
+        assert_eq!(u16::from_be_bytes([buf[0], buf[1]]), 0x0017, "Data indication");
+        let attrs = stun_tlv_attrs(&buf[..len]);
+        let peer_attr = attrs
+            .iter()
+            .find(|(t, _)| *t == crate::message::Attribute::PEER_ADDRESS)
+            .expect("Data indication must carry XOR-PEER-ADDRESS");
+        let observed_peer = xor_v4_decode(&peer_attr.1);
+        assert_eq!(
+            observed_peer.ip(),
+            Ipv4Addr::new(198, 51, 100, 10),
+            "XOR-PEER-ADDRESS must be the advertised VIP, got {} (raw source was {})",
+            observed_peer.ip(),
+            real_ip
+        );
+        assert_eq!(observed_peer.port(), hairpin_addr.port(), "peer port preserved");
+        let data_attr = attrs
+            .iter()
+            .find(|(t, _)| *t == crate::message::Attribute::DATA)
+            .expect("Data indication must carry DATA");
+        assert_eq!(&data_attr.1[..], b"hairpin-dtls", "payload intact");
+    }
+
+    /// Same-server relay↔relay (the nominated ICE pair in the field case):
+    /// both allocations advertise the same VIP. A sends to B's advertised
+    /// relayed address; the packet must be delivered INTERNALLY — it must not
+    /// be hairpinned out to the (possibly unroutable / source-mangling) VIP.
+    /// B's client receives a Data indication whose XOR-PEER-ADDRESS is A's
+    /// advertised relayed address, matching B's permission.
+    #[tokio::test]
+    async fn test_same_server_relay_relay_delivers_internally_via_advertised_addrs() {
+        let table = AllocationTable::with_port_range_and_bind_addr(
+            Ipv4Addr::new(198, 51, 100, 10),
+            Ipv4Addr::UNSPECIFIED,
+            "test".to_string(),
+            57000,
+            57999,
+            None,
+            None,
+            None,
+        );
+        let channel_table = ChannelTable::new();
+
+        let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_a = sock_a.local_addr().unwrap();
+        let client_b = sock_b.local_addr().unwrap();
+
+        let alloc_a = table
+            .create_allocation(client_a, Some(600), &channel_table)
+            .await
+            .unwrap();
+        let alloc_b = table
+            .create_allocation(client_b, Some(600), &channel_table)
+            .await
+            .unwrap();
+        let relayed_a = alloc_a.read().relayed_addr;
+        let relayed_b = alloc_b.read().relayed_addr;
+        assert_ne!(relayed_a, relayed_b, "distinct relay ports");
+        assert_eq!(relayed_a.ip(), relayed_b.ip(), "same advertised VIP");
+
+        // Each side permissions the peer's advertised relay address only.
+        assert!(table.add_permissions(&client_a, &[relayed_b]));
+        assert!(table.add_permissions(&client_b, &[relayed_a]));
+
+        // A → B (a DTLS ClientHello flight)
+        let res = table.send_to_peer(&client_a, relayed_b, b"clienthello-from-a").await;
+        assert!(res.is_some(), "send_to_peer must accept permitted peer");
+
+        let mut buf = vec![0u8; 1024];
+        let (len, _) = timeout(Duration::from_secs(3), sock_b.recv_from(&mut buf))
+            .await
+            .expect(
+                "same-server relay↔relay must deliver internally, not hairpin out to the external VIP",
+            )
+            .unwrap();
+        assert_eq!(u16::from_be_bytes([buf[0], buf[1]]), 0x0017, "Data indication");
+        let attrs = stun_tlv_attrs(&buf[..len]);
+        let peer_attr = attrs
+            .iter()
+            .find(|(t, _)| *t == crate::message::Attribute::PEER_ADDRESS)
+            .expect("XOR-PEER-ADDRESS present");
+        assert_eq!(xor_v4_decode(&peer_attr.1), relayed_a, "source = A's advertised relay");
+        let data_attr = attrs
+            .iter()
+            .find(|(t, _)| *t == crate::message::Attribute::DATA)
+            .expect("DATA present");
+        assert_eq!(&data_attr.1[..], b"clienthello-from-a");
+
+        // B → A (the ServerHello flight) — the direction that died in the field.
+        let res = table.send_to_peer(&client_b, relayed_a, b"serverhello-from-b").await;
+        assert!(res.is_some());
+        let (len, _) = timeout(Duration::from_secs(3), sock_a.recv_from(&mut buf))
+            .await
+            .expect("reverse direction must also deliver internally")
+            .unwrap();
+        assert_eq!(u16::from_be_bytes([buf[0], buf[1]]), 0x0017, "Data indication");
+        let attrs = stun_tlv_attrs(&buf[..len]);
+        let peer_attr = attrs
+            .iter()
+            .find(|(t, _)| *t == crate::message::Attribute::PEER_ADDRESS)
+            .expect("XOR-PEER-ADDRESS present");
+        assert_eq!(xor_v4_decode(&peer_attr.1), relayed_b, "source = B's advertised relay");
+        let data_attr = attrs
+            .iter()
+            .find(|(t, _)| *t == crate::message::Attribute::DATA)
+            .expect("DATA present");
+        assert_eq!(&data_attr.1[..], b"serverhello-from-b");
     }
 
     // ---------------------------------------------------------------------------

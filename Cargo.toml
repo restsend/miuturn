@@ -42,6 +42,11 @@ prometheus = "0.14.0"
 # Time utilities
 time = "0.3"
 
+# Local interface enumeration: same-server hairpin packets arrive with one of
+# the host's interface IPs as source and must be normalized to the advertised
+# relay address (field case a1368cfd).
+if-addrs = "0.14"
+
 # CPU detection for worker pool sizing
 num_cpus = "1.17"
 

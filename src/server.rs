@@ -803,31 +803,47 @@ async fn handle_tcp_message(
             }
             let payload = data.slice(4..);
 
-            let allocation = server.allocation_table.get_allocation_by_client(&peer_addr);
-            let relayed_addr = allocation.as_ref().map(|alloc| alloc.read().relayed_addr);
-            let channel_binding = if let Some(relayed_addr) = relayed_addr {
+            // Resolve the bound peer for this channel, then route through
+            // send_to_peer so TCP channel traffic takes the same-server
+            // internal-delivery short-circuit and the permission check
+            // (ChannelBind installs the permission) like the UDP path.
+            // An unbound channel is silently dropped per RFC 5766 §11.
+            let relayed_addr = server
+                .allocation_table
+                .get_allocation_by_client(&peer_addr)
+                .map(|alloc| alloc.read().relayed_addr);
+            let channel_peer = if let Some(relayed_addr) = relayed_addr {
                 server
                     .channel_table
                     .read()
                     .await
                     .get_by_channel(relayed_addr, channel_num)
+                    .map(|binding| binding.peer_addr)
             } else {
                 None
             };
 
-            if let Some(channel) = channel_binding {
-                let relay_socket = allocation.as_ref().and_then(|alloc| {
-                    let a = alloc.read();
-                    a.relay.as_ref().map(|r| r.socket.clone())
-                });
-
-                if let Some(relay_sock) = relay_socket {
-                    if let Err(e) = relay_sock.send_to(&payload, &channel.peer_addr).await {
-                        warn!(
-                            "TCP ChannelData send to peer {} failed: {}",
-                            channel.peer_addr, e
+            match channel_peer {
+                Some(peer) => {
+                    if server
+                        .allocation_table
+                        .send_to_peer(&peer_addr, peer, &payload)
+                        .await
+                        .is_none()
+                    {
+                        debug!(
+                            %peer,
+                            channel = channel_num,
+                            "TCP ChannelData relay dropped (permission or send failure)"
                         );
                     }
+                }
+                None => {
+                    debug!(
+                        %peer_addr,
+                        channel = channel_num,
+                        "TCP ChannelData dropped: no channel binding for this allocation"
+                    );
                 }
             }
             return None;
@@ -869,40 +885,49 @@ async fn handle_udp_message(
         }
         let payload = data.slice(4..);
 
-        let allocation = server.allocation_table.get_allocation_by_client(&peer_addr);
-        let has_allocation = allocation.is_some();
-        let relayed_addr = allocation.as_ref().map(|alloc| alloc.read().relayed_addr);
-        let channel_binding = if let Some(relayed_addr) = relayed_addr {
+        // Resolve the bound peer for this channel, then route through
+        // send_to_peer so UDP channel traffic takes the same-server
+        // internal-delivery short-circuit and the permission check (ChannelBind
+        // installs the permission). An unbound channel is silently dropped per
+        // RFC 5766 §11 — logged with the channel number for field diagnosis.
+        let relayed_addr = server
+            .allocation_table
+            .get_allocation_by_client(&peer_addr)
+            .map(|alloc| alloc.read().relayed_addr);
+        let channel_peer = if let Some(relayed_addr) = relayed_addr {
             server
                 .channel_table
                 .read()
                 .await
                 .get_by_channel(relayed_addr, channel_num)
+                .map(|binding| binding.peer_addr)
         } else {
             None
         };
 
-        if let Some(channel) = channel_binding {
-            // Get the relay socket from the allocation (must release lock before await)
-            let relay_socket = allocation.as_ref().and_then(|alloc| {
-                let a = alloc.read();
-                a.relay.as_ref().map(|r| r.socket.clone())
-            });
-
-            if let Some(relay_sock) = relay_socket {
-                if let Err(e) = relay_sock.send_to(&payload, &channel.peer_addr).await {
-                    warn!(
-                        "UDP ChannelData send to peer {} failed: {}",
-                        channel.peer_addr, e
+        match channel_peer {
+            Some(peer) => {
+                if server
+                    .allocation_table
+                    .send_to_peer(&peer_addr, peer, &payload)
+                    .await
+                    .is_none()
+                {
+                    debug!(
+                        %peer,
+                        channel = channel_num,
+                        "UDP ChannelData relay dropped (permission or send failure)"
                     );
                 }
             }
-        } else {
-            tracing::debug!(
-                "ChannelData dropped: has_alloc={} binding={}",
-                has_allocation,
-                channel_binding.is_some()
-            );
+            None => {
+                debug!(
+                    %peer_addr,
+                    channel = channel_num,
+                    has_alloc = relayed_addr.is_some(),
+                    "UDP ChannelData dropped: no channel binding for this allocation"
+                );
+            }
         }
         return None;
     }

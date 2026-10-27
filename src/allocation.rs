@@ -45,6 +45,19 @@ pub enum AllocationMessage {
     ClientData { data: Bytes, peer_addr: SocketAddr },
     /// Channel data from client
     ChannelData { data: Bytes, channel_num: u16 },
+    /// Same-server relay↔relay forwarding: the source allocation passed the
+    /// permission check on its side and the destination address is another
+    /// allocation's advertised relayed address. Delivered inside the server
+    /// through the same peer→client pipeline (permission check, bandwidth,
+    /// channel lookup, ChannelData/Data indication) instead of hairpinning the
+    /// packet out to the external NAT, where the source address would be
+    /// rewritten to the host's interface IP and dropped by the peer's
+    /// permission check (field case a1368cfd).
+    InternalDelivery {
+        /// The sending allocation's ADVERTISED relayed address.
+        from_relayed: SocketAddr,
+        data: Bytes,
+    },
     /// Update the client address (for NAT rebind detection)
     UpdateClientAddr { client_addr: SocketAddr },
     /// Set a channel to forward peer→client data (TCP fallback).
@@ -364,6 +377,11 @@ pub struct AllocationTable {
     bind_addr: Ipv4Addr,
     external_addr: Ipv4Addr,
     realm: String,
+    /// Non-loopback IPv4 addresses of this host (enumerated at construction).
+    /// Same-server hairpin packets arrive with one of these as their source;
+    /// the relay path normalizes them to `external_addr` before permission
+    /// checks and delivery (field case a1368cfd).
+    local_ips: Arc<Vec<Ipv4Addr>>,
     stats: Arc<ServerStats>,
     max_concurrent_allocations: Option<usize>,
     max_allocation_duration_secs: Option<u32>,
@@ -467,6 +485,7 @@ impl AllocationTable {
             bind_addr,
             external_addr,
             realm,
+            local_ips: Arc::new(detect_local_ipv4s()),
             stats: Arc::new(ServerStats::default()),
             max_concurrent_allocations,
             max_allocation_duration_secs,
@@ -519,6 +538,7 @@ impl AllocationTable {
             bind_addr,
             external_addr,
             realm,
+            local_ips: Arc::new(detect_local_ipv4s()),
             stats: Arc::new(ServerStats::default()),
             max_concurrent_allocations,
             max_allocation_duration_secs,
@@ -702,6 +722,7 @@ impl AllocationTable {
             channel_table.clone(),
             permissions.clone(),
             self.bandwidth_manager.clone(),
+            self.local_ips.clone(),
         )
         .await;
 
@@ -950,14 +971,27 @@ impl AllocationTable {
         peer: SocketAddr,
         data: &[u8],
     ) -> Option<()> {
+        // How the packet reaches `peer`: internally when the destination is
+        // another allocation on this server, otherwise out through the relay
+        // socket (external peer).
+        enum Route {
+            Internal {
+                target_tx: mpsc::Sender<AllocationMessage>,
+                from_relayed: SocketAddr,
+                sender_bytes: Arc<AtomicU64>,
+                sender_msgs: Arc<AtomicU64>,
+            },
+            External {
+                socket: Arc<UdpSocket>,
+                relayed_addr: SocketAddr,
+                permission_count: usize,
+                bytes_fwd: Arc<AtomicU64>,
+                msgs_fwd: Arc<AtomicU64>,
+            },
+        }
+
         // Look up relay state under lock, then release before await.
-        let relay_state: Option<(
-            Arc<UdpSocket>,
-            SocketAddr,
-            usize,
-            Arc<AtomicU64>,
-            Arc<AtomicU64>,
-        )> = {
+        let route: Option<Route> = {
             let alloc = match self.by_client.read().get(client_addr) {
                 Some(a) => a.clone(),
                 None => {
@@ -984,61 +1018,142 @@ impl AllocationTable {
                 );
                 return None;
             }
-            // Clone the socket Arc so we can send after releasing the lock.
-            match a.relay {
-                Some(ref relay) => Some((
-                    relay.socket.clone(),
-                    a.relayed_addr,
-                    permission_count,
-                    a.bytes_forwarded.clone(),
-                    a.messages_forwarded.clone(),
-                )),
-                None => {
+
+            let mut out: Option<Route> = None;
+
+            // Same-server short-circuit: when the destination is another
+            // allocation's advertised relayed address on THIS server, deliver
+            // internally. Hairpinning the packet out through the external NAT
+            // rewrites the source to the host's interface IP, which the peer's
+            // client never permissioned — the packet gets dropped on arrival
+            // and the relay path becomes one-way (field case a1368cfd: two
+            // same-server relayed candidates nominated, DTLS starved). The
+            // source presented to the peer allocation is our ADVERTISED
+            // relayed address, so its permission check matches exactly.
+            if let Some(target_alloc) = self.allocations.read().get(&peer) {
+                let target = target_alloc.read();
+                if let Some(ref relay) = target.relay {
+                    out = Some(Route::Internal {
+                        target_tx: relay.tx.clone(),
+                        from_relayed: a.relayed_addr,
+                        sender_bytes: a.bytes_forwarded.clone(),
+                        sender_msgs: a.messages_forwarded.clone(),
+                    });
+                } else {
                     debug!(
                         %client_addr,
                         %peer,
-                        relayed_addr = %a.relayed_addr,
-                        permission_count,
-                        payload_len = data.len(),
-                        "dropping relay packet because allocation has no active relay socket"
+                        "target allocation on this server has no active relay; falling back to external send"
                     );
-                    None
                 }
             }
+
+            if out.is_none() {
+                // Clone the socket Arc so we can send after releasing the lock.
+                out = match a.relay {
+                    Some(ref relay) => Some(Route::External {
+                        socket: relay.socket.clone(),
+                        relayed_addr: a.relayed_addr,
+                        permission_count,
+                        bytes_fwd: a.bytes_forwarded.clone(),
+                        msgs_fwd: a.messages_forwarded.clone(),
+                    }),
+                    None => {
+                        debug!(
+                            %client_addr,
+                            %peer,
+                            relayed_addr = %a.relayed_addr,
+                            permission_count,
+                            payload_len = data.len(),
+                            "dropping relay packet because allocation has no active relay socket"
+                        );
+                        None
+                    }
+                };
+            }
+            out
         };
-        if let Some((socket, relayed_addr, permission_count, bytes_fwd, messages_fwd)) = relay_state
-        {
-            // Enforce the (global) bandwidth budget before sending.
-            if !self.bandwidth_manager.try_relay(&relayed_addr, data.len()) {
-                debug!(
-                    %client_addr,
-                    %peer,
-                    %relayed_addr,
-                    payload_len = data.len(),
-                    "dropping relay packet because bandwidth limit is exceeded"
-                );
-                return None;
+        match route {
+            Some(Route::Internal {
+                target_tx,
+                from_relayed,
+                sender_bytes,
+                sender_msgs,
+            }) => {
+                // Enforce the sender-side bandwidth budget like the external path.
+                if !self.bandwidth_manager.try_relay(&from_relayed, data.len()) {
+                    debug!(
+                        %client_addr,
+                        %peer,
+                        %from_relayed,
+                        payload_len = data.len(),
+                        "dropping internally forwarded relay packet because bandwidth limit is exceeded"
+                    );
+                    return None;
+                }
+                let msg = AllocationMessage::InternalDelivery {
+                    from_relayed,
+                    data: Bytes::copy_from_slice(data),
+                };
+                if let Err(err) = target_tx.send(msg).await {
+                    warn!(
+                        %client_addr,
+                        %peer,
+                        payload_len = data.len(),
+                        error = %err,
+                        "internal delivery queue closed on target allocation"
+                    );
+                    return None;
+                }
+                let n = data.len() as u64;
+                self.stats
+                    .total_bytes_relayed
+                    .fetch_add(n, Ordering::Relaxed);
+                self.stats.total_messages.fetch_add(1, Ordering::Relaxed);
+                sender_bytes.fetch_add(n, Ordering::Relaxed);
+                sender_msgs.fetch_add(1, Ordering::Relaxed);
+                return Some(());
             }
-            if let Err(err) = socket.send_to(data, &peer).await {
-                warn!(
-                    %client_addr,
-                    %peer,
-                    %relayed_addr,
-                    permission_count,
-                    payload_len = data.len(),
-                    error = %err,
-                    "failed to send relay packet to peer"
-                );
-                return None;
+            Some(Route::External {
+                socket,
+                relayed_addr,
+                permission_count,
+                bytes_fwd,
+                msgs_fwd,
+            }) => {
+                // Enforce the (global) bandwidth budget before sending.
+                if !self.bandwidth_manager.try_relay(&relayed_addr, data.len()) {
+                    debug!(
+                        %client_addr,
+                        %peer,
+                        %relayed_addr,
+                        payload_len = data.len(),
+                        "dropping relay packet because bandwidth limit is exceeded"
+                    );
+                    return None;
+                }
+                if let Err(err) = socket.send_to(data, &peer).await {
+                    warn!(
+                        %client_addr,
+                        %peer,
+                        %relayed_addr,
+                        permission_count,
+                        payload_len = data.len(),
+                        error = %err,
+                        "failed to send relay packet to peer"
+                    );
+                    return None;
+                }
+                let n = data.len() as u64;
+                self.stats
+                    .total_bytes_relayed
+                    .fetch_add(n, Ordering::Relaxed);
+                self.stats.total_messages.fetch_add(1, Ordering::Relaxed);
+                bytes_fwd.fetch_add(n, Ordering::Relaxed);
+                msgs_fwd.fetch_add(1, Ordering::Relaxed);
+                return Some(());
             }
-            let n = data.len() as u64;
-            self.stats
-                .total_bytes_relayed
-                .fetch_add(n, Ordering::Relaxed);
-            self.stats.total_messages.fetch_add(1, Ordering::Relaxed);
-            bytes_fwd.fetch_add(n, Ordering::Relaxed);
-            messages_fwd.fetch_add(1, Ordering::Relaxed);
-            return Some(());
+            None => {}
         }
         debug!(
             %client_addr,
@@ -1236,15 +1351,51 @@ fn build_data_indication(peer_addr: SocketAddr, payload: &[u8]) -> Bytes {
     buf.freeze()
 }
 
+/// IPv4 addresses assigned to this host's non-loopback interfaces.
+///
+/// Same-server relay↔relay packets hairpin through the external NAT and arrive
+/// at the peer's relay socket with one of these as their source (the 1:1 NAT
+/// does not rewrite them back to the advertised VIP). The relay path
+/// normalizes such sources to the advertised relay address so permission
+/// checks and XOR-PEER-ADDRESS values match the addresses clients actually
+/// permission and put in SDP.
+pub fn detect_local_ipv4s() -> Vec<std::net::Ipv4Addr> {
+    let mut out = Vec::new();
+    if let Ok(addrs) = if_addrs::get_if_addrs() {
+        for iface in addrs {
+            if let if_addrs::IfAddr::V4(v4) = iface.addr {
+                if !v4.ip.is_loopback() {
+                    out.push(v4.ip);
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn normalize_peer_addr_for_client(
     peer_addr: SocketAddr,
     relay_bind_addr: SocketAddr,
     relayed_addr: SocketAddr,
+    local_ips: &[Ipv4Addr],
 ) -> SocketAddr {
-    // Only rewrite addresses that originate from this server's relay bind
-    // interface. External peer traffic must keep the original source address
-    // so CreatePermission / ChannelBind matching remains correct.
-    if peer_addr.ip() == relay_bind_addr.ip() && relay_bind_addr.ip() != relayed_addr.ip() {
+    // Rewrite addresses that originate from this machine itself. When two
+    // allocations on this server talk relay↔relay, the packets hairpin through
+    // the external NAT and arrive with one of the host's interface IPs as
+    // source (a 1:1 NAT does not rewrite them back to the advertised relay
+    // address). Delivering them with the raw internal source would poison the
+    // receiving client's permission checks and XOR-PEER-ADDRESS values —
+    // clients only ever permission and advertise the relayed address.
+    //
+    // External peer traffic must keep the original source address so
+    // CreatePermission / ChannelBind matching remains correct.
+    let from_this_host = match peer_addr.ip() {
+        std::net::IpAddr::V4(v4) => v4 == relay_bind_addr.ip() || local_ips.contains(&v4),
+        std::net::IpAddr::V6(_) => false,
+    };
+    if from_this_host && peer_addr.ip() != relayed_addr.ip() {
         SocketAddr::new(relayed_addr.ip(), peer_addr.port())
     } else {
         peer_addr
@@ -1263,6 +1414,7 @@ fn is_fatal_recv_error(kind: io::ErrorKind) -> bool {
 
 /// Spawn a dedicated task for an allocation to handle relay traffic
 /// This eliminates lock contention by giving each allocation its own processing loop
+#[allow(clippy::too_many_arguments)] // internal plumbing; parameter set mirrors the relay task's context
 async fn spawn_allocation_task(
     socket: Arc<UdpSocket>,
     main_socket: Arc<UdpSocket>, // Main socket for sending Data Indication / ChannelData to client
@@ -1273,6 +1425,7 @@ async fn spawn_allocation_task(
     channel_table: ChannelTable,
     permissions: Arc<RwLock<std::collections::HashSet<std::net::IpAddr>>>,
     bandwidth_manager: Arc<crate::bandwidth::BandwidthManager>,
+    local_ips: Arc<Vec<Ipv4Addr>>,
 ) -> AllocationRelay {
     let (tx, mut rx) = mpsc::channel::<AllocationMessage>(1024);
 
@@ -1303,14 +1456,28 @@ async fn spawn_allocation_task(
                             consecutive_recv_errors = 0;
                             last_recv_error_at = None;
 
+                            // Normalize BEFORE the permission check: same-server
+                            // hairpin packets arrive with one of this host's
+                            // interface IPs as source (a 1:1 NAT does not rewrite
+                            // them back to the advertised relay address). Clients
+                            // permission the advertised relay IP, so the check —
+                            // and the XOR-PEER-ADDRESS delivered to the client —
+                            // must use the normalized (advertised) form.
                             // RFC 5766 §10: only relay traffic from peers for
                             // which a permission exists (ChannelBind installs
                             // one implicitly). Without this check any host that
                             // learns the relay port could inject/amplify traffic.
-                            if !permissions.read().contains(&peer_addr.ip()) {
-                                trace!(
+                            let effective_peer = normalize_peer_addr_for_client(
+                                peer_addr,
+                                relay_bind_addr,
+                                relayed_addr,
+                                &local_ips,
+                            );
+                            if !permissions.read().contains(&effective_peer.ip()) {
+                                debug!(
                                     %client_addr,
-                                    peer = %peer_addr,
+                                    peer = %effective_peer,
+                                    raw_peer = %peer_addr,
                                     payload_len = len,
                                     "dropping peer packet without permission"
                                 );
@@ -1322,7 +1489,7 @@ async fn spawn_allocation_task(
                             if !bandwidth_manager.try_relay(&relayed_addr, len) {
                                 trace!(
                                     %client_addr,
-                                    peer = %peer_addr,
+                                    peer = %effective_peer,
                                     payload_len = len,
                                     "dropping peer packet because bandwidth limit is exceeded"
                                 );
@@ -1332,14 +1499,6 @@ async fn spawn_allocation_task(
                             // Update stats using atomics - no lock contention
                             stats.total_bytes_relayed.fetch_add(len as u64, Ordering::Relaxed);
                             stats.total_messages.fetch_add(1, Ordering::Relaxed);
-
-                            // Only rewrite local relay-bind source addresses to external relay IP.
-                            // Real peer traffic from external hosts must keep original source IP.
-                            let effective_peer = normalize_peer_addr_for_client(
-                                peer_addr,
-                                relay_bind_addr,
-                                relayed_addr,
-                            );
 
                             // RFC 5766 §10.4: if a channel binding exists for this peer on this
                             // allocation, send ChannelData; otherwise send Data Indication.
@@ -1465,6 +1624,82 @@ async fn spawn_allocation_task(
                                     error = %e,
                                     "allocation task failed to forward channel data to client"
                                 );
+                            }
+                        }
+                        AllocationMessage::InternalDelivery { from_relayed, data } => {
+                            // Same-server relay↔relay: run the same peer→client
+                            // pipeline as the relay socket path. `from_relayed`
+                            // is the sending allocation's ADVERTISED address, so
+                            // the permission check and XOR-PEER-ADDRESS match
+                            // what an external (hairpinned) packet would look
+                            // like after normalization.
+                            if !permissions.read().contains(&from_relayed.ip()) {
+                                debug!(
+                                    %client_addr,
+                                    peer = %from_relayed,
+                                    payload_len = data.len(),
+                                    "dropping internally forwarded packet without permission"
+                                );
+                                continue;
+                            }
+                            if !bandwidth_manager.try_relay(&relayed_addr, data.len()) {
+                                debug!(
+                                    %client_addr,
+                                    peer = %from_relayed,
+                                    payload_len = data.len(),
+                                    "dropping internally forwarded packet because bandwidth limit is exceeded"
+                                );
+                                continue;
+                            }
+                            let n = data.len() as u64;
+                            stats.total_bytes_relayed.fetch_add(n, Ordering::Relaxed);
+                            stats.total_messages.fetch_add(1, Ordering::Relaxed);
+
+                            let channel_num =
+                                channel_table.get_by_peer_for_relayed(&relayed_addr, &from_relayed);
+                            if let Some(ch_num) = channel_num {
+                                use bytes::BufMut;
+                                channel_scratch.clear();
+                                channel_scratch.reserve(4 + data.len());
+                                channel_scratch.put_u16(ch_num);
+                                channel_scratch.put_u16(data.len() as u16);
+                                channel_scratch.put_slice(&data);
+
+                                if let Some(ref tx) = tcp_client_tx {
+                                    let framed = frame_for_tcp(&channel_scratch);
+                                    if let Err(e) = tx.try_send(framed) {
+                                        warn!(%client_addr, "TCP forward to client failed: {}", e);
+                                    }
+                                } else if let Err(e) =
+                                    main_socket_clone.send_to(&channel_scratch, &client_addr).await
+                                {
+                                    warn!(
+                                        %client_addr,
+                                        peer = %from_relayed,
+                                        channel = ch_num,
+                                        payload_len = data.len(),
+                                        error = %e,
+                                        "failed to forward internally relayed packet to client as ChannelData"
+                                    );
+                                }
+                            } else {
+                                let indication = build_data_indication(from_relayed, &data);
+                                if let Some(ref tx) = tcp_client_tx {
+                                    let framed = frame_for_tcp(&indication);
+                                    if let Err(e) = tx.try_send(framed) {
+                                        warn!(%client_addr, "TCP Data Indication forward failed: {}", e);
+                                    }
+                                } else if let Err(e) =
+                                    main_socket_clone.send_to(&indication, &client_addr).await
+                                {
+                                    warn!(
+                                        %client_addr,
+                                        peer = %from_relayed,
+                                        payload_len = data.len(),
+                                        error = %e,
+                                        "failed to forward internally relayed packet to client as Data Indication"
+                                    );
+                                }
                             }
                         }
                         AllocationMessage::UpdateClientAddr { client_addr: new_addr } => {
@@ -2434,13 +2669,34 @@ mod tests {
         let relayed_addr: SocketAddr = "146.56.243.54:49152".parse().unwrap();
         let local_peer: SocketAddr = "127.0.0.1:63746".parse().unwrap();
         let external_peer: SocketAddr = "129.211.168.132:63746".parse().unwrap();
+        // Field config: relay sockets bind 0.0.0.0, so the bind IP can never
+        // match a packet source — the host's interface IPs carry the rewrite.
+        let local_ips = vec![Ipv4Addr::new(10, 68, 163, 18)];
 
         assert_eq!(
-            normalize_peer_addr_for_client(local_peer, relay_bind_addr, relayed_addr),
+            normalize_peer_addr_for_client(local_peer, relay_bind_addr, relayed_addr, &[]),
             "146.56.243.54:63746".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(
-            normalize_peer_addr_for_client(external_peer, relay_bind_addr, relayed_addr),
+            normalize_peer_addr_for_client(external_peer, relay_bind_addr, relayed_addr, &[]),
+            external_peer
+        );
+
+        // Wildcard bind (field config): a hairpinned packet sourced from one of
+        // the host's interface IPs is rewritten to the advertised relay IP.
+        let host_peer: SocketAddr = "10.68.163.18:63746".parse().unwrap();
+        assert_eq!(
+            normalize_peer_addr_for_client(host_peer, relay_bind_addr, relayed_addr, &local_ips),
+            "146.56.243.54:63746".parse::<SocketAddr>().unwrap()
+        );
+        // Already-advertised sources and unknown external sources stay verbatim.
+        let advertised_peer: SocketAddr = "146.56.243.54:63746".parse().unwrap();
+        assert_eq!(
+            normalize_peer_addr_for_client(advertised_peer, relay_bind_addr, relayed_addr, &local_ips),
+            advertised_peer
+        );
+        assert_eq!(
+            normalize_peer_addr_for_client(external_peer, relay_bind_addr, relayed_addr, &local_ips),
             external_peer
         );
     }
