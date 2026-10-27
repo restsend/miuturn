@@ -235,6 +235,16 @@ async fn start_server(relay: &str, realm: &str, password: &str) -> (SocketAddr, 
 
 /// Start a TurnServer with auth disabled.
 async fn start_server_no_auth(relay: &str, realm: &str) -> (SocketAddr, TurnServer) {
+    start_server_no_auth_with_permission_mode(relay, realm, false).await
+}
+
+/// Start a TurnServer with auth disabled and an optional peer→relay permission
+/// enforcement mode (`enforce_peer_permissions`).
+async fn start_server_no_auth_with_permission_mode(
+    relay: &str,
+    realm: &str,
+    enforce_peer_permissions: bool,
+) -> (SocketAddr, TurnServer) {
     let relay_addr: std::net::Ipv4Addr = relay.parse().unwrap();
     let port = pick_free_udp_port();
     let (min_relay, max_relay) = next_relay_range();
@@ -244,6 +254,7 @@ async fn start_server_no_auth(relay: &str, realm: &str) -> (SocketAddr, TurnServ
         min_relay,
         max_relay,
     );
+    server.set_enforce_peer_permissions(enforce_peer_permissions);
     let srv = server.clone();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
@@ -1015,6 +1026,199 @@ async fn turn_peer_to_client_is_data_indication() {
     .expect("decode XOR-PEER-ADDRESS");
     assert_eq!(decoded_peer, peer_addr);
 
+    let data_attr = msg
+        .get_attribute(miuturn::message::Attribute::DATA)
+        .expect("missing DATA attr");
+    assert_eq!(&data_attr.value[..], payload);
+}
+
+// ── 12b. Lenient default: peer→client relayed WITHOUT any permission ────────
+// Regression for the 0.2.0/0.3.0 incident: the client only creates TURN
+// permissions for private/host peer addresses while the peer's media arrives
+// from a different (public) source IP. With permission enforcement disabled by
+// default, the server must transparently relay peer→client traffic even though
+// no permission exists for that source IP (so ICE/media keep flowing).
+
+#[tokio::test]
+async fn turn_peer_to_client_relayed_without_permission_lenient_default() {
+    let (server_addr, _) = start_server_no_auth("127.0.0.1", "test").await;
+    let (conn, _client_addr) = bind_udp().await;
+
+    // Allocate Request
+    let mut alloc_req = Vec::new();
+    alloc_req.extend_from_slice(&[0x00, 0x03]);
+    alloc_req.extend_from_slice(&[0x00, 0x00]);
+    alloc_req.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+    alloc_req.extend_from_slice(&[0x11; 12]);
+    conn.send_to(&alloc_req, server_addr).await.unwrap();
+
+    let mut buf = vec![0u8; 1500];
+    let (len, _) = tokio::select! {
+        r = conn.recv_from(&mut buf) => r.unwrap(),
+        _ = sleep(Duration::from_secs(2)) => panic!("timeout on Allocate"),
+    };
+    let mut relay_addr: Option<SocketAddr> = None;
+    let mut offset = 20usize;
+    let attr_end = 20 + u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    while offset + 4 <= attr_end {
+        let a_type = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+        let a_len = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
+        if a_type == 0x0016 && offset + 4 + a_len <= len {
+            let port = u16::from_be_bytes([buf[offset + 6], buf[offset + 7]]) ^ 0x2112;
+            relay_addr = Some(
+                format!(
+                    "{}.{}.{}.{}:{}",
+                    buf[offset + 8] ^ 0x21,
+                    buf[offset + 9] ^ 0x12,
+                    buf[offset + 10] ^ 0xA4,
+                    buf[offset + 11] ^ 0x42,
+                    port
+                )
+                .parse()
+                .unwrap(),
+            );
+            break;
+        }
+        offset += 4 + a_len;
+        offset += (4 - (a_len % 4)) % 4;
+    }
+    let relay_addr = relay_addr.expect("no XOR-RELAYED-ADDRESS");
+
+    // Deliberately NO CreatePermission: the peer sends directly to the relay
+    // address from an address that has no permission.
+    let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let payload = b"lenient-peer-to-client";
+    peer_socket.send_to(payload, relay_addr).await.unwrap();
+
+    let mut recv = vec![0u8; 2048];
+    let (recv_len, _from) = tokio::select! {
+        r = conn.recv_from(&mut recv) => r.unwrap(),
+        _ = sleep(Duration::from_secs(2)) => panic!(
+            "lenient default must relay peer→client traffic without a permission"
+        ),
+    };
+
+    let msg =
+        miuturn::message::Message::parse(&recv[..recv_len]).expect("expected STUN Data Indication");
+    assert_eq!(msg.header.method, miuturn::message::Method::Data);
+    let data_attr = msg
+        .get_attribute(miuturn::message::Attribute::DATA)
+        .expect("missing DATA attr");
+    assert_eq!(&data_attr.value[..], payload);
+}
+
+// ── 12c. Strict mode: peer→client traffic IS gated by permission ───────────
+
+#[tokio::test]
+async fn turn_peer_to_client_permission_gated_in_strict_mode() {
+    let (server_addr, _) =
+        start_server_no_auth_with_permission_mode("127.0.0.1", "test", true).await;
+    let (conn, _client_addr) = bind_udp().await;
+
+    // Allocate Request
+    let mut alloc_req = Vec::new();
+    alloc_req.extend_from_slice(&[0x00, 0x03]);
+    alloc_req.extend_from_slice(&[0x00, 0x00]);
+    alloc_req.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+    alloc_req.extend_from_slice(&[0x11; 12]);
+    conn.send_to(&alloc_req, server_addr).await.unwrap();
+
+    let mut buf = vec![0u8; 1500];
+    let (len, _) = tokio::select! {
+        r = conn.recv_from(&mut buf) => r.unwrap(),
+        _ = sleep(Duration::from_secs(2)) => panic!("timeout on Allocate"),
+    };
+    let mut relay_addr: Option<SocketAddr> = None;
+    let mut offset = 20usize;
+    let attr_end = 20 + u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    while offset + 4 <= attr_end {
+        let a_type = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+        let a_len = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
+        if a_type == 0x0016 && offset + 4 + a_len <= len {
+            let port = u16::from_be_bytes([buf[offset + 6], buf[offset + 7]]) ^ 0x2112;
+            relay_addr = Some(
+                format!(
+                    "{}.{}.{}.{}:{}",
+                    buf[offset + 8] ^ 0x21,
+                    buf[offset + 9] ^ 0x12,
+                    buf[offset + 10] ^ 0xA4,
+                    buf[offset + 11] ^ 0x42,
+                    port
+                )
+                .parse()
+                .unwrap(),
+            );
+            break;
+        }
+        offset += 4 + a_len;
+        offset += (4 - (a_len % 4)) % 4;
+    }
+    let relay_addr = relay_addr.expect("no XOR-RELAYED-ADDRESS");
+
+    let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer_socket.local_addr().unwrap();
+    let payload = b"strict-peer-to-client";
+
+    // No permission → server must drop it; the client must NOT receive it.
+    peer_socket.send_to(payload, relay_addr).await.unwrap();
+    let mut recv = vec![0u8; 2048];
+    let got_unpermitted =
+        tokio::time::timeout(Duration::from_millis(400), conn.recv_from(&mut recv))
+            .await
+            .is_ok();
+    assert!(
+        !got_unpermitted,
+        "strict mode must drop peer→client traffic without a permission"
+    );
+
+    // Install a permission for the peer → packet is now relayed.
+    let mut create_perm = Vec::new();
+    create_perm.extend_from_slice(&[0x00, 0x08]); // CreatePermission Request
+    create_perm.extend_from_slice(&[0x00, 0x0C]); // message length (12: 1 attr)
+    create_perm.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+    create_perm.extend_from_slice(&[0x22; 12]); // transaction id
+    create_perm.extend_from_slice(&[0x00, 0x12, 0x00, 0x08]); // XOR-PEER-ADDRESS
+    create_perm.extend_from_slice(&[0x00, 0x01]); // family = IPv4
+    let xport = peer_addr.port() ^ 0x2112;
+    create_perm.extend_from_slice(&xport.to_be_bytes());
+    let octets = match peer_addr.ip() {
+        std::net::IpAddr::V4(v4) => v4.octets(),
+        std::net::IpAddr::V6(v6) => {
+            let o = v6.octets();
+            [o[0], o[1], o[2], o[3]]
+        }
+    };
+    create_perm.extend_from_slice(&[
+        octets[0] ^ 0x21,
+        octets[1] ^ 0x12,
+        octets[2] ^ 0xA4,
+        octets[3] ^ 0x42,
+    ]);
+    conn.send_to(&create_perm, server_addr).await.unwrap();
+
+    let mut perm_buf = [0u8; 1500];
+    let (perm_len, _) = tokio::select! {
+        r = conn.recv_from(&mut perm_buf) => r.unwrap(),
+        _ = sleep(Duration::from_secs(2)) => panic!("timeout on CreatePermission"),
+    };
+    assert_eq!(
+        u16::from_be_bytes([perm_buf[0], perm_buf[1]]),
+        0x0108,
+        "expected CreatePermission Success (0x0108), got raw {:?}",
+        &perm_buf[..perm_len.min(24)]
+    );
+
+    peer_socket.send_to(payload, relay_addr).await.unwrap();
+    let mut recv = vec![0u8; 2048];
+    let (recv_len, _from) = tokio::select! {
+        r = conn.recv_from(&mut recv) => r.unwrap(),
+        _ = sleep(Duration::from_secs(2)) => panic!(
+            "strict mode must relay peer→client traffic after a permission exists"
+        ),
+    };
+    let msg =
+        miuturn::message::Message::parse(&recv[..recv_len]).expect("expected STUN Data Indication");
+    assert_eq!(msg.header.method, miuturn::message::Method::Data);
     let data_attr = msg
         .get_attribute(miuturn::message::Attribute::DATA)
         .expect("missing DATA attr");

@@ -31,6 +31,14 @@ pub struct ServerConfig {
     pub stats_dump_skip_if_no_change: bool,
     #[serde(default = "ServerConfig::default_server_name")]
     pub server_name: String,
+    /// When `true`, enforce RFC 5766 §10 permission checks on the peer→relay
+    /// direction: packets from an IP that has no TURN permission are dropped.
+    /// When `false` (default, matches the pre-0.2.0 behavior), peer→client
+    /// traffic is relayed without a source-IP permission check so clients that
+    /// only create permissions for private/host peer addresses still receive
+    /// media arriving from the peer's public address.
+    #[serde(default)]
+    pub relay_enforce_peer_permissions: bool,
 }
 
 impl ServerConfig {
@@ -137,6 +145,42 @@ pub struct AuthConfig {
     pub api_keys: HashMap<String, String>,
     #[serde(default)]
     pub acl_rules: Vec<AclRuleConfig>,
+    /// Shared HMAC secret for TURN REST API ephemeral credentials
+    /// (shared between an agent server and miuturn). Takes precedence over
+    /// the legacy `http.turn_rest_secret`.
+    #[serde(default)]
+    pub shared_secret: Option<String>,
+    /// Policy applied when an established allocation's ephemeral token has
+    /// expired. Only relevant when `shared_secret` is configured.
+    #[serde(default)]
+    pub expired_token_policy: ExpiredTokenPolicy,
+}
+
+/// Policy for handling Refresh requests whose ephemeral (REST API) token
+/// has already expired.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ExpiredTokenPolicy {
+    /// Token only gates new Allocate requests; established sessions renew
+    /// indefinitely as long as the HMAC is valid (default).
+    #[default]
+    Renew,
+    /// Expired tokens are rejected on every request (coturn behavior).
+    Strict,
+    /// Allocation lifetime is capped at the token expiry: granted lifetime =
+    /// min(requested, token remaining seconds).
+    Cap,
+}
+
+impl AuthConfig {
+    /// Resolve the shared secret, preferring `auth.shared_secret` over the
+    /// legacy `http.turn_rest_secret`.
+    pub fn resolve_shared_secret(&self, http: Option<&HttpConfig>) -> Option<String> {
+        if let Some(ref secret) = self.shared_secret {
+            return Some(secret.clone());
+        }
+        http.and_then(|h| h.turn_rest_secret.clone())
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -197,6 +241,7 @@ impl Default for Config {
                 stats_dump_interval_secs: 30,
                 stats_dump_skip_if_no_change: true,
                 server_name: ServerConfig::default_server_name(),
+                relay_enforce_peer_permissions: false,
             },
             http: None,
             log: LogConfig::default(),
@@ -206,6 +251,8 @@ impl Default for Config {
                 lifetime: None,
                 users: vec![],
                 api_keys: HashMap::new(),
+                shared_secret: None,
+                expired_token_policy: ExpiredTokenPolicy::default(),
                 acl_rules: vec![AclRuleConfig {
                     ip_range: "0.0.0.0/0".to_string(),
                     action: "Allow".to_string(),
@@ -465,5 +512,157 @@ ip_whitelist = []
 "#;
         let user: UserConfig = toml::from_str(toml_content).unwrap();
         assert_eq!(user.ip_whitelist.as_ref().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_server_config_relay_enforce_peer_permissions_default_false() {
+        // The field is optional: absent → default false (lenient).
+        let config: Config = toml::from_str(
+            r#"
+[server]
+realm = "r"
+external_ip = "127.0.0.1"
+start_port = 49152
+end_port = 65535
+
+[[server.listening]]
+protocol = "udp"
+address = "0.0.0.0:3478"
+
+[auth]
+users = []
+"#,
+        )
+        .unwrap();
+        assert!(!config.server.relay_enforce_peer_permissions);
+    }
+
+    #[test]
+    fn test_server_config_relay_enforce_peer_permissions_parse() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+realm = "r"
+external_ip = "127.0.0.1"
+start_port = 49152
+end_port = 65535
+relay_enforce_peer_permissions = true
+
+[[server.listening]]
+protocol = "udp"
+address = "0.0.0.0:3478"
+
+[auth]
+users = []
+"#,
+        )
+        .unwrap();
+        assert!(config.server.relay_enforce_peer_permissions);
+
+        let default = Config::default();
+        assert!(!default.server.relay_enforce_peer_permissions);
+    }
+
+    #[test]
+    fn test_auth_shared_secret_and_policy() {
+        let toml_content = r#"
+[server]
+realm = "test-realm"
+external_ip = "192.168.1.1"
+start_port = 49152
+end_port = 65535
+
+[[server.listening]]
+protocol = "udp"
+address = "0.0.0.0:3478"
+
+[auth]
+shared_secret = "top-secret"
+expired_token_policy = "cap"
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(
+            config.auth.shared_secret.as_deref(),
+            Some("top-secret"),
+        );
+        assert_eq!(config.auth.expired_token_policy, ExpiredTokenPolicy::Cap);
+        // No http section: resolution falls back to the auth key.
+        assert_eq!(
+            config.auth.resolve_shared_secret(config.http.as_ref()).as_deref(),
+            Some("top-secret"),
+        );
+    }
+
+    #[test]
+    fn test_expired_token_policy_defaults_to_renew() {
+        let toml_content = r#"
+[server]
+realm = "r"
+external_ip = "0.0.0.0"
+start_port = 49152
+end_port = 65535
+
+[[server.listening]]
+protocol = "udp"
+address = "0.0.0.0:3478"
+
+[auth]
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(config.auth.expired_token_policy, ExpiredTokenPolicy::Renew);
+    }
+
+    #[test]
+    fn test_shared_secret_precedence_over_legacy_key() {
+        let toml_content = r#"
+[server]
+realm = "r"
+external_ip = "0.0.0.0"
+start_port = 49152
+end_port = 65535
+
+[[server.listening]]
+protocol = "udp"
+address = "0.0.0.0:3478"
+
+[http]
+address = "0.0.0.0:8080"
+turn_rest_secret = "legacy-secret"
+
+[auth]
+shared_secret = "new-secret"
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(
+            config.auth.resolve_shared_secret(config.http.as_ref()).as_deref(),
+            Some("new-secret"),
+        );
+
+        // Without auth.shared_secret, the legacy key is used.
+        let toml_no_auth_secret = toml_content.replace("shared_secret = \"new-secret\"", "");
+        let config2: Config = toml::from_str(&toml_no_auth_secret).unwrap();
+        assert_eq!(
+            config2.auth.resolve_shared_secret(config2.http.as_ref()).as_deref(),
+            Some("legacy-secret"),
+        );
+    }
+
+    #[test]
+    fn test_invalid_expired_token_policy_rejected() {
+        let toml_content = r#"
+[server]
+realm = "r"
+external_ip = "0.0.0.0"
+start_port = 49152
+end_port = 65535
+
+[[server.listening]]
+protocol = "udp"
+address = "0.0.0.0:3478"
+
+[auth]
+expired_token_policy = "bogus"
+"#;
+        assert!(toml::from_str::<Config>(toml_content).is_err());
     }
 }

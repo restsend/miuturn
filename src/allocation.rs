@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Fast xorshift64 PRNG for port randomization.
@@ -392,6 +392,11 @@ pub struct AllocationTable {
     /// Optional Prometheus metrics collector (recorded at low-frequency points:
     /// allocation create/remove and channel bind/unbind — never per packet).
     metrics: parking_lot::RwLock<Option<crate::metrics::Metrics>>,
+    /// When `true`, enforce RFC 5766 §10 permission checks on the peer→relay
+    /// direction (packets from an IP without a TURN permission are dropped).
+    /// When `false` (default, matching pre-0.2.0 behavior), peer→client traffic
+    /// is relayed without a source-IP permission check.
+    enforce_peer_permissions: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -496,6 +501,7 @@ impl AllocationTable {
             )),
             main_socket: RwLock::new(None),
             metrics: parking_lot::RwLock::new(None),
+            enforce_peer_permissions: AtomicBool::new(false),
         }
     }
 
@@ -549,11 +555,20 @@ impl AllocationTable {
             )),
             main_socket: RwLock::new(None),
             metrics: parking_lot::RwLock::new(None),
+            enforce_peer_permissions: AtomicBool::new(false),
         }
     }
 
     pub fn set_main_socket(&self, socket: Arc<tokio::net::UdpSocket>) {
         *self.main_socket.write() = Some(socket);
+    }
+
+    /// Enable or disable RFC 5766 §10 permission enforcement on the peer→relay
+    /// direction. Disabled by default (lenient, pre-0.2.0 behavior); set to
+    /// `true` for strict source-IP permission gating.
+    pub fn set_enforce_peer_permissions(&self, enforce: bool) {
+        self.enforce_peer_permissions
+            .store(enforce, Ordering::Relaxed);
     }
 
     /// Attach (or detach) the metrics collector used at allocation/channel
@@ -723,6 +738,7 @@ impl AllocationTable {
             permissions.clone(),
             self.bandwidth_manager.clone(),
             self.local_ips.clone(),
+            self.enforce_peer_permissions.load(Ordering::Relaxed),
         )
         .await;
 
@@ -824,6 +840,26 @@ impl AllocationTable {
             let mut alloc = allocation.write();
             let effective = self.effective_allocation_lifetime(Some(lifetime));
             alloc.lifetime = Duration::from_secs(effective as u64);
+            alloc.refreshed_at = Instant::now();
+            Ok(())
+        } else {
+            Err(Error::NotFound)
+        }
+    }
+
+    /// Set an allocation's lifetime exactly, bypassing the
+    /// `effective_allocation_lifetime` override. Used by the `cap`
+    /// expired-token policy to clamp a session's lifetime to the token's
+    /// remaining validity.
+    pub fn set_allocation_lifetime_exact(
+        &self,
+        relayed_addr: &SocketAddr,
+        lifetime_secs: u32,
+    ) -> Result<(), Error> {
+        let allocations = self.allocations.read();
+        if let Some(allocation) = allocations.get(relayed_addr) {
+            let mut alloc = allocation.write();
+            alloc.lifetime = Duration::from_secs(lifetime_secs as u64);
             alloc.refreshed_at = Instant::now();
             Ok(())
         } else {
@@ -1426,6 +1462,7 @@ async fn spawn_allocation_task(
     permissions: Arc<RwLock<std::collections::HashSet<std::net::IpAddr>>>,
     bandwidth_manager: Arc<crate::bandwidth::BandwidthManager>,
     local_ips: Arc<Vec<Ipv4Addr>>,
+    enforce_peer_permissions: bool,
 ) -> AllocationRelay {
     let (tx, mut rx) = mpsc::channel::<AllocationMessage>(1024);
 
@@ -1460,20 +1497,23 @@ async fn spawn_allocation_task(
                             // hairpin packets arrive with one of this host's
                             // interface IPs as source (a 1:1 NAT does not rewrite
                             // them back to the advertised relay address). Clients
-                            // permission the advertised relay IP, so the check —
+                            // permission and advertise the relay IP, so the check —
                             // and the XOR-PEER-ADDRESS delivered to the client —
-                            // must use the normalized (advertised) form.
-                            // RFC 5766 §10: only relay traffic from peers for
-                            // which a permission exists (ChannelBind installs
-                            // one implicitly). Without this check any host that
-                            // learns the relay port could inject/amplify traffic.
+                            // must use the normalized (advertised) form in both
+                            // lenient and strict modes.
                             let effective_peer = normalize_peer_addr_for_client(
                                 peer_addr,
                                 relay_bind_addr,
                                 relayed_addr,
                                 &local_ips,
                             );
-                            if !permissions.read().contains(&effective_peer.ip()) {
+                            // RFC 5766 §10 enforcement is opt-in (default off) for
+                            // backwards compatibility with clients that only create
+                            // permissions for private/host peer addresses while
+                            // media arrives from the peer's public address.
+                            if enforce_peer_permissions
+                                && !permissions.read().contains(&effective_peer.ip())
+                            {
                                 debug!(
                                     %client_addr,
                                     peer = %effective_peer,
@@ -1505,6 +1545,10 @@ async fn spawn_allocation_task(
                             let channel_num = channel_table.get_by_peer_for_relayed(&relayed_addr, &effective_peer);
 
                             if let Some(ch_num) = channel_num {
+                                // Keep the binding alive: peer traffic on a bound channel
+                                // refreshes its activity timestamp (same behavior as coturn).
+                                channel_table.refresh_binding_for_peer(&relayed_addr, &effective_peer);
+
                                 // Send as ChannelData (single scratch buffer, no per-packet alloc)
                                 use bytes::BufMut;
                                 channel_scratch.clear();
@@ -1853,6 +1897,38 @@ impl ChannelTable {
         channels.get(&(relayed_addr, channel_id)).cloned()
     }
 
+    /// Refresh the activity timestamp of a channel binding (client→peer
+    /// ChannelData path). Active bindings must not expire mid-session just
+    /// because the client does not re-issue ChannelBind requests.
+    pub fn refresh_binding(&self, relayed_addr: SocketAddr, channel_id: u16) -> bool {
+        let mut channels = self.channels.write();
+        match channels.get_mut(&(relayed_addr, channel_id)) {
+            Some(binding) => {
+                binding.created_at = Instant::now();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Refresh the activity timestamp of the binding for a peer on an
+    /// allocation (peer→client relay path).
+    pub fn refresh_binding_for_peer(
+        &self,
+        relayed_addr: &SocketAddr,
+        peer_addr: &SocketAddr,
+    ) -> bool {
+        let mut channels = self.channels.write();
+        let mut refreshed = false;
+        for ((ra, _), binding) in channels.iter_mut() {
+            if ra == relayed_addr && binding.peer_addr == *peer_addr {
+                binding.created_at = Instant::now();
+                refreshed = true;
+            }
+        }
+        refreshed
+    }
+
     pub fn get_by_peer(&self, peer_addr: &SocketAddr) -> Option<u16> {
         let channels = self.channels.read();
         for ((_, channel_id), ch) in channels.iter() {
@@ -1978,6 +2054,40 @@ mod tests {
             .wrapping_rem(SLOT_COUNT);
         let min = BASE_PORT + slot * RANGE_SIZE;
         (min, min + RANGE_SIZE - 1)
+    }
+
+    #[test]
+    fn test_channel_binding_refreshed_by_activity_does_not_expire() {
+        let relayed: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let table = ChannelTable::with_lifetime(Duration::from_secs(1));
+        table.bind(0x4000, peer, relayed).unwrap();
+
+        // Simulate an idle period longer than the binding lifetime.
+        {
+            let mut channels = table.channels.write();
+            let binding = channels.get_mut(&(relayed, 0x4000)).unwrap();
+            binding.created_at = Instant::now() - Duration::from_secs(2);
+        }
+        assert!(table.get_by_channel(relayed, 0x4000).unwrap().is_expired());
+
+        // Client→peer activity refreshes the binding.
+        assert!(table.refresh_binding(relayed, 0x4000));
+        assert!(!table.get_by_channel(relayed, 0x4000).unwrap().is_expired());
+
+        // Expire again, then refresh via the peer→client path.
+        {
+            let mut channels = table.channels.write();
+            let binding = channels.get_mut(&(relayed, 0x4000)).unwrap();
+            binding.created_at = Instant::now() - Duration::from_secs(2);
+        }
+        assert!(table.refresh_binding_for_peer(&relayed, &peer));
+        assert!(!table.get_by_channel(relayed, 0x4000).unwrap().is_expired());
+
+        // Refreshing an unrelated peer/relayed pair reports false.
+        let other_relayed: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        assert!(!table.refresh_binding(other_relayed, 0x4000));
+        assert!(!table.refresh_binding_for_peer(&relayed, &"10.0.0.3:5000".parse().unwrap()));
     }
 
     #[test]

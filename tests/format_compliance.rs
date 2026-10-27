@@ -3,12 +3,12 @@
 //! These tests verify that every message the server constructs matches
 //! the exact byte-level format specified in the RFCs.
 
-use miuturn::message::{
-    Attribute, ErrorCode, EventType, Message, MessageHeader, Method,
-    create_binding_response_fast, create_error_response_with_reason, create_success_response,
-    encode_xor_address, decode_xor_address,
-};
 use bytes::{Bytes, BytesMut};
+use miuturn::message::{
+    Attribute, ErrorCode, EventType, Message, MessageHeader, Method, create_binding_response_fast,
+    create_error_response_with_reason, create_success_response, decode_xor_address,
+    encode_xor_address,
+};
 use std::net::SocketAddr;
 
 // ---------------------------------------------------------------------------
@@ -111,7 +111,9 @@ fn stun_header_format_error_response() {
 #[test]
 fn xor_mapped_address_format_ipv4() {
     let addr: SocketAddr = "192.168.1.100:12345".parse().unwrap();
-    let tid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC];
+    let tid = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC,
+    ];
     let encoded = encode_xor_address(addr, 0x2112A442, &tid);
 
     // IPv4 XOR-ADDRESS: reserved(1) + family(1) + xport(2) + xip(4) = 8 bytes
@@ -148,7 +150,9 @@ fn xor_mapped_address_roundtrip_ipv4() {
 #[test]
 fn xor_mapped_address_format_ipv6() {
     let addr: SocketAddr = "[2001:db8::1]:3456".parse().unwrap();
-    let tid = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C];
+    let tid = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
+    ];
     let encoded = encode_xor_address(addr, 0x2112A442, &tid);
 
     // IPv6 XOR-ADDRESS: reserved(1) + family(1) + xport(2) + xip(16) = 20 bytes
@@ -183,7 +187,9 @@ fn xor_mapped_address_format_ipv6() {
 #[test]
 fn xor_mapped_address_roundtrip_ipv6() {
     let addr: SocketAddr = "[2001:db8:85a3::8a2e:370:7334]:4444".parse().unwrap();
-    let tid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC];
+    let tid = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC,
+    ];
     let encoded = encode_xor_address(addr, 0x2112A442, &tid);
     let decoded = decode_xor_address(&encoded, 0x2112A442, &tid).unwrap();
     assert_eq!(addr, decoded, "IPv6 XOR-ADDRESS round-trip");
@@ -209,7 +215,11 @@ fn error_code_attribute_format() {
         (ErrorCode::Unauthorized, 401, "Unauthorized"),
         (ErrorCode::Forbidden, 403, "Forbidden"),
         (ErrorCode::ServerError, 500, "ServerError"),
-        (ErrorCode::AllocationQuotaReached, 486, "AllocationQuotaReached"),
+        (
+            ErrorCode::AllocationQuotaReached,
+            486,
+            "AllocationQuotaReached",
+        ),
         (ErrorCode::InsufficientCapacity, 508, "InsufficientCapacity"),
         (ErrorCode::AllocationMismatch, 437, "AllocationMismatch"),
     ];
@@ -248,7 +258,12 @@ fn error_code_attribute_format() {
         let encoded = msg.encode();
         let parsed = Message::parse(&encoded).unwrap();
         let parsed_attr = parsed.get_attribute(Attribute::ERROR_CODE).unwrap();
-        assert_eq!(parsed_attr.value[4..], val[4..], "reason must survive encode+parse round-trip for code {}", expected_code);
+        assert_eq!(
+            parsed_attr.value[4..],
+            val[4..],
+            "reason must survive encode+parse round-trip for code {}",
+            expected_code
+        );
     }
 }
 
@@ -261,7 +276,11 @@ fn error_code_custom_reason() {
         magic_cookie: 0x2112A442,
         transaction_id: [0; 12],
     };
-    let msg = create_error_response_with_reason(&header, ErrorCode::InsufficientCapacity, Some("custom reason"));
+    let msg = create_error_response_with_reason(
+        &header,
+        ErrorCode::InsufficientCapacity,
+        Some("custom reason"),
+    );
     let err_attr = msg.get_attribute(Attribute::ERROR_CODE).unwrap();
     let reason = String::from_utf8_lossy(&err_attr.value[4..]);
     assert_eq!(reason, "custom reason", "custom reason must survive");
@@ -305,7 +324,7 @@ fn attribute_padding_is_zero() {
 #[test]
 fn attribute_without_padding() {
     let attr = Attribute {
-        attr_type: 0x8022, // SOFTWARE
+        attr_type: 0x8022,                  // SOFTWARE
         value: Bytes::from_static(b"test"), // 4 bytes, no padding needed
     };
     let mut buf = BytesMut::new();
@@ -357,8 +376,16 @@ fn channel_data_format() {
 
     // Data length must match payload
     let declared_len = (channel_data[2] as usize) << 8 | (channel_data[3] as usize);
-    assert_eq!(declared_len, payload.len(), "ChannelData length must match payload");
-    assert_eq!(channel_data.len(), 4 + declared_len, "ChannelData total length");
+    assert_eq!(
+        declared_len,
+        payload.len(),
+        "ChannelData length must match payload"
+    );
+    assert_eq!(
+        channel_data.len(),
+        4 + declared_len,
+        "ChannelData total length"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -440,7 +467,10 @@ fn binding_response_wire_format() {
 
     // Header: Binding Success Response
     assert_eq!(response[0], 0x01, "binding response type byte 0");
-    assert_eq!(response[1], 0x01, "binding response type byte 1 (method=1, class=2)");
+    assert_eq!(
+        response[1], 0x01,
+        "binding response type byte 1 (method=1, class=2)"
+    );
 
     // Message length = 12 (just the XOR-MAPPED-ADDRESS attribute)
     assert_eq!(response[2], 0x00, "header message_length high");

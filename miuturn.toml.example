@@ -14,6 +14,11 @@ stats_dump_interval_secs = 30
 stats_dump_skip_if_no_change = true
 # Server name for SOFTWARE attribute in TURN responses (default: miuturn/0.1.2)
 server_name = "miuturn/0.1.2"
+# Enforce RFC 5766 §10 source-IP permission checks on peer→client relay traffic
+# (default: false). Keep false for compatibility with clients that only create
+# permissions for private/host peer addresses while media arrives from the
+# peer's public address. Set true for strict RFC 5766 §10 gating.
+#relay_enforce_peer_permissions = false
 
 [[server.listening]]
 protocol = "udp"
@@ -29,6 +34,30 @@ address = "0.0.0.0:3478"
 #admin_acl = ["127.0.0.1", "192.168.1.0/24"]
 # Trust X-Forwarded-For / X-Real-IP headers when checking admin ACL (default: false)
 #trust_proxy = false
+# Enable the TURN REST API credential-minting endpoints (default: false).
+# Requires auth.shared_secret (or the deprecated turn_rest_secret) to be set.
+#turn_rest_enabled = true
+# Default lifetime for minted credentials in seconds (default: 3600)
+#turn_rest_default_lifetime = 3600
+
+[auth]
+# Shared HMAC secret for ephemeral TURN credentials (agent-issued tokens).
+# An agent server holding this secret mints credentials locally:
+#   username   = "<unix-expiry-secs>:<user-id>"
+#   credential = hex(HMAC-SHA1(shared_secret, username))
+# which miuturn accepts on the TURN port from any client IP.
+# Takes precedence over the deprecated http.turn_rest_secret.
+#
+# Generate with (>= 32 bytes of entropy):
+#   openssl rand -hex 32
+#   python3 -c "import secrets; print(secrets.token_hex(32))"
+#   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+shared_secret = "changeme-shared-secret"
+# Behavior for established sessions whose token has expired:
+#   "renew"  - token only gates new Allocate requests (default)
+#   "strict" - expired tokens rejected on every request (coturn behavior)
+#   "cap"    - allocation lifetime capped at the token expiry
+expired_token_policy = "renew"
 
 [auth]
 use_auth_secret = true

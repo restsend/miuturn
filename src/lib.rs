@@ -22,7 +22,8 @@ pub use bandwidth::{
     AllocationBandwidthTracker, BandwidthLimiter, BandwidthManager, UserBandwidthTracker,
 };
 pub use config::{
-    AclRuleConfig, AuthConfig, Config, HttpConfig, ListenConfig, ServerConfig, UserConfig,
+    AclRuleConfig, AuthConfig, Config, ExpiredTokenPolicy, HttpConfig, ListenConfig, ServerConfig,
+    UserConfig,
 };
 pub use errors::Error;
 pub use health::create_admin_routes;

@@ -1,5 +1,6 @@
 use miuturn::{
-    AclAction, AclRule, AuthManager, Config, Metrics, SharedAuthManager, TurnServer, User, UserType,
+    AclAction, AclRule, AuthManager, Config, Metrics, SharedAuthManager,
+    ShortTermCredentialManager, TurnServer, User, UserType,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -83,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or("0.0.0.0")
         .parse()
         .unwrap_or(std::net::Ipv4Addr::new(0, 0, 0, 0));
-    let mut server = TurnServer::with_port_range_limits_bind_address_and_password(
+    let mut server = TurnServer::with_port_range_limits_bind_address(
         relay_addr,
         relay_bind_addr,
         config.server.realm.clone(),
@@ -95,13 +96,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .server
             .max_bandwidth_bytes_per_sec
             .map(|b| b as usize),
-        "password".to_string(),
         false,
     );
+
+    // Resolve the shared secret for ephemeral TURN REST API credentials.
+    // `auth.shared_secret` takes precedence over the legacy `http.turn_rest_secret`.
+    let shared_secret = config.auth.resolve_shared_secret(config.http.as_ref());
+    if config.auth.shared_secret.is_none()
+        && config
+            .http
+            .as_ref()
+            .and_then(|h| h.turn_rest_secret.as_ref())
+            .is_some()
+    {
+        tracing::warn!(
+            "http.turn_rest_secret is deprecated; use auth.shared_secret instead"
+        );
+    }
+    let turn_rest_enabled = config
+        .http
+        .as_ref()
+        .and_then(|h| h.turn_rest_enabled)
+        .unwrap_or(false);
+    if turn_rest_enabled && shared_secret.is_none() {
+        return Err(
+            "turn_rest_enabled = true but no secret configured: set auth.shared_secret \
+             (or the legacy http.turn_rest_secret)"
+                .into(),
+        );
+    }
+    if let Some(ref secret) = shared_secret {
+        server.set_short_term_manager(ShortTermCredentialManager::new(secret.clone()));
+        println!(
+            "TURN REST API ephemeral credentials: enabled (expired_token_policy = {:?})",
+            config.auth.expired_token_policy
+        );
+    }
+    server.set_expired_token_policy(config.auth.expired_token_policy);
 
     server.set_stats_dump_interval(config.server.stats_dump_interval_secs);
     server.set_stats_dump_skip_if_no_change(config.server.stats_dump_skip_if_no_change);
     server.set_server_name(config.server.server_name.clone());
+    server.set_enforce_peer_permissions(config.server.relay_enforce_peer_permissions);
 
     info!(
         external_ip = %relay_addr,
@@ -109,6 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         stats_dump_interval = config.server.stats_dump_interval_secs,
         stats_dump_skip_if_no_change = config.server.stats_dump_skip_if_no_change,
         server_name = %config.server.server_name,
+        relay_enforce_peer_permissions = config.server.relay_enforce_peer_permissions,
         "configured relay addressing"
     );
 
@@ -212,8 +249,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .parse()
             .unwrap_or_else(|_| "0.0.0.0:8080".parse().unwrap());
 
-        let turn_rest_enabled = http.turn_rest_enabled.unwrap_or(false);
-        let turn_rest_secret = http.turn_rest_secret.clone();
         let turn_rest_default_lifetime = http.turn_rest_default_lifetime.unwrap_or(3600);
 
         let metrics = Metrics::new();
@@ -241,7 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 admin_password,
                 auth_manager.clone(),
                 turn_rest_enabled,
-                turn_rest_secret,
+                shared_secret.clone(),
                 turn_rest_default_lifetime,
                 Some(metrics),
                 Some(config_path),

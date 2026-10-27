@@ -161,17 +161,12 @@ fn rand_tx() -> [u8; 12] {
 #[tokio::test]
 async fn same_server_relay_relay_is_bidirectional_on_advertised_addresses() {
     // Field config: external VIP not on the machine, relay bind 0.0.0.0.
-    let server = TurnServer::with_port_range_limits_bind_address_and_password(
+    let server = TurnServer::with_port_range_bind_address_auth_disabled(
         VIP,
         Ipv4Addr::UNSPECIFIED,
         "test".to_string(),
         58100,
         58199,
-        None,
-        None,
-        None,
-        String::new(),
-        true, // auth disabled, like tests/e2e_turn_test.rs
     );
 
     let server_addr: SocketAddr = "127.0.0.1:3591".parse().unwrap();
