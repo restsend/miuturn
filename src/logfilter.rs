@@ -49,6 +49,13 @@ fn parse_level(s: &str) -> Option<u8> {
     }
 }
 
+/// One-time `MIUTURN_FILTER_DEBUG` check (cached in a `OnceLock` so the
+/// hot `enabled()` path never touches the environment).
+fn observe() -> bool {
+    static OBSERVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OBSERVE.get_or_init(|| std::env::var_os("MIUTURN_FILTER_DEBUG").is_some())
+}
+
 impl DynamicLevelFilter {
     pub fn new(level: &str) -> Self {
         match parse_level(level) {
@@ -74,7 +81,7 @@ impl DynamicLevelFilter {
         match parse_level(level) {
             Some(rank) => {
                 let old = self.level.swap(rank, Ordering::Relaxed);
-                if std::env::var_os("MIUTURN_FILTER_DEBUG").is_some() {
+                if observe() {
                     eprintln!("[F] set_level({level}) old={old} new={rank}");
                 }
                 true
@@ -97,7 +104,7 @@ impl<S: tracing::Subscriber> Filter<S> for DynamicLevelFilter {
 
     fn enabled(&self, metadata: &tracing::Metadata<'_>, _ctx: &Context<'_, S>) -> bool {
         let result = rank_of(metadata.level()) <= self.level.load(Ordering::Relaxed);
-        if std::env::var_os("MIUTURN_FILTER_DEBUG").is_some() {
+        if observe() {
             eprintln!(
                 "[F] enabled(level={}) -> {} (current={})",
                 metadata.level(),
