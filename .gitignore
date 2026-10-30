@@ -4,3 +4,4 @@ Cargo.lock
 static/turn_test.html
 .DS_Store
 __pycache__/
+AGENTS.md

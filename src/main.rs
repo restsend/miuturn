@@ -73,9 +73,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "unknown".into());
     println!(
-        "Version: {} (built {} UTC) | started {} UTC",
+        "Version: {} (built {} UTC, git {}, started {} UTC)",
         env!("CARGO_PKG_VERSION"),
         build_time,
+        option_env!("MIUTURN_BUILD_GIT").unwrap_or("unknown"),
         started_at
     );
     println!("Realm: {}", config.server.realm);

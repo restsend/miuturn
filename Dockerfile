@@ -9,9 +9,10 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy source
+# Copy source (including .git so build.rs can stamp the commit hash)
 COPY Cargo.toml ./
 COPY build.rs ./
+COPY .git ./.git
 COPY miuturn.toml.example ./miuturn.toml
 COPY src ./src
 COPY static ./static

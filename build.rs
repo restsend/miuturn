@@ -8,6 +8,7 @@
 //! in the cnb docker build), so the timestamp is derived directly from the
 //! system clock using the civil-from-days algorithm (Howard Hinnant).
 
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
@@ -34,5 +35,19 @@ fn main() {
 
     let ts = format!("{y:04}-{mth:02}-{d:02}T{h:02}:{m:02}:{s:02}Z");
     println!("cargo:rustc-env=MIUTURN_BUILD_TIME={ts}");
+
+    // Commit hash of the built source. Requires .git in the build context
+    // (Dockerfile COPYs it); "unknown" means the checkout was shallow or the
+    // context lacked .git.
+    let git_hash = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=MIUTURN_BUILD_GIT={git_hash}");
+
     println!("cargo:rerun-if-changed=build.rs");
 }
