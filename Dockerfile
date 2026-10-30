@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
 
 # Copy source
 COPY Cargo.toml ./
+COPY build.rs ./
 COPY miuturn.toml.example ./miuturn.toml
 COPY src ./src
 COPY static ./static
