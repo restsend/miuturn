@@ -11,6 +11,50 @@ pub struct Config {
     pub auth: AuthConfig,
     #[serde(default)]
     pub log: LogConfig,
+    /// State persistence across restarts. Disabled by default: when enabled,
+    /// active UDP allocations / channel bindings / nonces / lifetime counters
+    /// are checkpointed to a JSON file so a restart (docker stop, systemd
+    /// restart, SIGUSR2) resumes sessions instead of dropping them.
+    #[serde(default)]
+    pub persist: PersistConfig,
+}
+
+/// `[persist]` configuration: restart state persistence.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct PersistConfig {
+    /// Master switch. `false` (default) keeps the pre-persistence behavior:
+    /// restarts drop all in-memory sessions.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path of the state file (written atomically). In container deployments
+    /// this must live on a persistent volume (e.g. `/var/lib/miuturn`).
+    #[serde(default = "PersistConfig::default_path")]
+    pub path: String,
+    /// How often (seconds) to checkpoint state while running. Checkpoints
+    /// where nothing changed are skipped. A final save always happens on
+    /// SIGINT / SIGTERM / SIGUSR2.
+    #[serde(default = "PersistConfig::default_checkpoint_interval_secs")]
+    pub checkpoint_interval_secs: u64,
+}
+
+impl PersistConfig {
+    fn default_path() -> String {
+        "/var/lib/miuturn/state.json".to_string()
+    }
+
+    fn default_checkpoint_interval_secs() -> u64 {
+        30
+    }
+}
+
+impl Default for PersistConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: Self::default_path(),
+            checkpoint_interval_secs: Self::default_checkpoint_interval_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -245,6 +289,7 @@ impl Default for Config {
             },
             http: None,
             log: LogConfig::default(),
+            persist: PersistConfig::default(),
             auth: AuthConfig {
                 use_auth_secret: false,
                 secret: None,

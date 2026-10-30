@@ -74,3 +74,17 @@ max_allocations = 10
 ip_range = "0.0.0.0/0"
 action = "allow"
 priority = 0
+
+[persist]
+# Persist live session state (UDP allocations, channels, nonces, counters) so
+# restarts resume sessions instead of dropping them.
+#
+# !! CONTAINER DEPLOYMENTS (Docker/K8s): the path MUST be on a mounted
+# !! volume (e.g. `docker run -v miuturn-data:/var/lib/miuturn ...`).
+# !! Anything outside a volume is wiped when the container is recreated, and
+# !! every restart then silently behaves like a full session drop.
+#
+#enabled = true
+#path = "/var/lib/miuturn/state.json"
+# Checkpoint cadence in seconds; unchanged state is not rewritten (default: 30)
+#checkpoint_interval_secs = 30

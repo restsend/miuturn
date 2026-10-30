@@ -1,6 +1,6 @@
 [package]
 name = "miuturn"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 description = "A high-performance TURN server implemented in Rust, designed for WebRTC applications."
 authors = ["jinti<shenjindi@fourz.cn>"]
@@ -63,6 +63,9 @@ webrtc-util = "0.17.1"
 futures = "0.3"
 rustrtc = "0.3.113"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# Sending real signals (SIGTERM) to the server binary in restart tests.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [[test]]
 name = "integration_tests"

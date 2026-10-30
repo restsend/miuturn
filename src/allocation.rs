@@ -341,6 +341,45 @@ impl PortAllocator {
         self.allocated_count.load(Ordering::Relaxed)
     }
 
+    /// Mark a specific port as allocated without handing it out (restart
+    /// restore path). Returns `false` when the port is out of range or
+    /// already allocated.
+    #[inline]
+    pub fn mark_allocated(&self, port: u16) -> bool {
+        if port < self.min_port || port > self.max_port {
+            return false;
+        }
+
+        let port_index = (port - self.min_port) as usize;
+        let bitmap_index = port_index / 64;
+        let bit_index = (port_index % 64) as u32;
+        let mask = 1u64 << bit_index;
+
+        if bitmap_index >= self.allocated.len() {
+            return false;
+        }
+
+        let bitmap = &self.allocated[bitmap_index];
+        let mut current = bitmap.load(Ordering::Relaxed);
+        loop {
+            if current & mask != 0 {
+                return false;
+            }
+            match bitmap.compare_exchange_weak(
+                current,
+                current | mask,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.allocated_count.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+                Err(e) => current = e,
+            }
+        }
+    }
+
     /// Get total available ports
     #[inline]
     pub fn available_count(&self) -> usize {
@@ -364,6 +403,21 @@ impl PortAllocator {
 
         self.allocated[bitmap_index].load(Ordering::Relaxed) & mask != 0
     }
+}
+
+/// Outcome of `AllocationTable::restore_pending` (restart restore).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreSummary {
+    /// Allocations re-attached with the same relay port.
+    pub restored: usize,
+    /// Allocations that expired while the server was down.
+    pub skipped_expired: usize,
+    /// Allocations dropped because their relay port could not be re-bound.
+    pub failed: usize,
+    /// Channel bindings re-attached.
+    pub channels_restored: usize,
+    /// Channel bindings that expired while the server was down.
+    pub channels_skipped_expired: usize,
 }
 
 pub struct AllocationTable {
@@ -397,6 +451,10 @@ pub struct AllocationTable {
     /// When `false` (default, matching pre-0.2.0 behavior), peer→client traffic
     /// is relayed without a source-IP permission check.
     enforce_peer_permissions: AtomicBool,
+    /// Persisted allocations/channels waiting to be re-attached once the main
+    /// UDP socket is bound (restart restore). Set via `set_pending_restore`,
+    /// consumed once by `restore_pending` from `run_udp`.
+    pending_restore: parking_lot::Mutex<Option<crate::persist::PendingRestore>>,
 }
 
 #[derive(Debug)]
@@ -502,6 +560,7 @@ impl AllocationTable {
             main_socket: RwLock::new(None),
             metrics: parking_lot::RwLock::new(None),
             enforce_peer_permissions: AtomicBool::new(false),
+            pending_restore: parking_lot::Mutex::new(None),
         }
     }
 
@@ -556,11 +615,240 @@ impl AllocationTable {
             main_socket: RwLock::new(None),
             metrics: parking_lot::RwLock::new(None),
             enforce_peer_permissions: AtomicBool::new(false),
+            pending_restore: parking_lot::Mutex::new(None),
         }
     }
 
     pub fn set_main_socket(&self, socket: Arc<tokio::net::UdpSocket>) {
         *self.main_socket.write() = Some(socket);
+    }
+
+    /// Queue persisted sessions for restore. Consumed exactly once by
+    /// `restore_pending`, which `run_udp` calls after the main socket is
+    /// bound (relay tasks need it to deliver data towards clients).
+    pub fn set_pending_restore(
+        &self,
+        allocations: Vec<crate::persist::PersistedAllocation>,
+        channels: Vec<crate::persist::PersistedChannel>,
+    ) {
+        *self.pending_restore.lock() = Some(crate::persist::PendingRestore {
+            allocations,
+            channels,
+        });
+    }
+
+    /// Snapshot every live allocation (plus the lifetime counters) into the
+    /// persistence format. Expired entries are skipped; a new snapshot is
+    /// always a complete replacement of the previous one.
+    pub fn export_persisted(
+        &self,
+    ) -> (
+        Vec<crate::persist::PersistedAllocation>,
+        crate::persist::PersistedCounters,
+    ) {
+        let now_epoch = crate::persist::epoch_secs_now();
+        let allocations = self.allocations.read();
+        let mut out = Vec::with_capacity(allocations.len());
+        for alloc in allocations.values() {
+            let a = alloc.read();
+            if a.is_expired() || a.relay.is_none() {
+                continue;
+            }
+            out.push(crate::persist::PersistedAllocation {
+                id: a.id,
+                client_addr: a.client_addr,
+                server_addr: a.five_tuple.1,
+                relayed_addr: a.relayed_addr,
+                username: a.username.clone(),
+                created_at_epoch: crate::persist::epoch_of_instant(a.created_at, now_epoch),
+                refreshed_at_epoch: crate::persist::epoch_of_instant(a.refreshed_at, now_epoch),
+                lifetime_secs: a.lifetime.as_secs(),
+                permissions: a.permissions.read().iter().copied().collect(),
+                bytes_forwarded: a.bytes_forwarded.load(Ordering::Relaxed),
+                messages_forwarded: a.messages_forwarded.load(Ordering::Relaxed),
+            });
+        }
+        drop(allocations);
+
+        let counters = crate::persist::PersistedCounters {
+            total_allocations: self.stats.total_allocations.load(Ordering::Relaxed),
+            total_bytes_relayed: self.stats.total_bytes_relayed.load(Ordering::Relaxed),
+            total_messages: self.stats.total_messages.load(Ordering::Relaxed),
+        };
+        (out, counters)
+    }
+
+    /// Restore lifetime counters saved from the previous process. Only the
+    /// cumulative totals are set; `active_allocations` is maintained by
+    /// `restore_pending` (+1 per allocation actually restored).
+    pub fn restore_counters(&self, counters: &crate::persist::PersistedCounters) {
+        self.stats
+            .total_allocations
+            .store(counters.total_allocations, Ordering::Relaxed);
+        self.stats
+            .total_bytes_relayed
+            .store(counters.total_bytes_relayed, Ordering::Relaxed);
+        self.stats
+            .total_messages
+            .store(counters.total_messages, Ordering::Relaxed);
+    }
+
+    /// Re-attach persisted allocations: mark their relay ports as taken,
+    /// re-bind a relay socket on the exact same port, spawn a fresh relay
+    /// task around it and re-insert the allocation into both indexes. Also
+    /// restores the pending channel bindings.
+    ///
+    /// Called from `run_udp` once the main socket exists. Expired entries are
+    /// skipped; entries whose relay port cannot be re-bound are dropped (the
+    /// client re-allocates, same as a pre-persistence restart).
+    pub async fn restore_pending(&self, channel_table: &ChannelTable) -> RestoreSummary {
+        let pending = self.pending_restore.lock().take();
+        let Some(pending) = pending else {
+            return RestoreSummary::default();
+        };
+
+        let now_epoch = crate::persist::epoch_secs_now();
+        let main_socket = self.main_socket.read().clone();
+        let mut summary = RestoreSummary::default();
+
+        for saved in &pending.allocations {
+            // Skip allocations that expired while the process was down.
+            let age = now_epoch.saturating_sub(saved.refreshed_at_epoch);
+            if age >= saved.lifetime_secs {
+                summary.skipped_expired += 1;
+                debug!(
+                    client = %saved.client_addr,
+                    relayed = %saved.relayed_addr,
+                    "persist: skipping allocation expired while server was down"
+                );
+                continue;
+            }
+
+            let port = saved.relayed_addr.port();
+            if !self.port_allocator.mark_allocated(port) {
+                summary.failed += 1;
+                warn!(
+                    client = %saved.client_addr,
+                    port,
+                    "persist: relay port out of range or already taken, dropping allocation"
+                );
+                continue;
+            }
+
+            let relay_bind_addr = SocketAddr::V4(SocketAddrV4::new(self.bind_addr, port));
+            let Some(relay_socket) = self.bind_restore_relay_socket(relay_bind_addr).await else {
+                self.port_allocator.release(port);
+                summary.failed += 1;
+                continue;
+            };
+            let relay_socket = Arc::new(relay_socket);
+
+            let permissions: Arc<RwLock<std::collections::HashSet<std::net::IpAddr>>> = Arc::new(
+                RwLock::new(saved.permissions.iter().copied().collect()),
+            );
+
+            // Data Indications / ChannelData towards the client leave from the
+            // main socket, mirroring `create_allocation_with_socket`.
+            let main = main_socket
+                .clone()
+                .unwrap_or_else(|| relay_socket.clone());
+            let relay = spawn_allocation_task(
+                relay_socket.clone(),
+                main,
+                saved.client_addr,
+                relay_bind_addr,
+                saved.relayed_addr,
+                self.stats.clone(),
+                channel_table.clone(),
+                permissions.clone(),
+                self.bandwidth_manager.clone(),
+                self.local_ips.clone(),
+                self.enforce_peer_permissions.load(Ordering::Relaxed),
+            )
+            .await;
+
+            let allocation = Allocation {
+                id: saved.id,
+                relayed_addr: saved.relayed_addr,
+                client_addr: saved.client_addr,
+                created_at: crate::persist::instant_from_epoch(saved.created_at_epoch, now_epoch),
+                refreshed_at: crate::persist::instant_from_epoch(
+                    saved.refreshed_at_epoch,
+                    now_epoch,
+                ),
+                lifetime: Duration::from_secs(saved.lifetime_secs),
+                five_tuple: (saved.client_addr, saved.server_addr),
+                relay: Some(relay),
+                permissions,
+                bytes_forwarded: Arc::new(AtomicU64::new(saved.bytes_forwarded)),
+                messages_forwarded: Arc::new(AtomicU64::new(saved.messages_forwarded)),
+                username: saved.username.clone(),
+            };
+
+            // Lock order mirrors `create_allocation_with_socket`:
+            // `allocations` first, then `by_client`.
+            let allocation = Arc::new(RwLock::new(allocation));
+            let mut allocations = self.allocations.write();
+            allocations.insert(saved.relayed_addr, allocation.clone());
+            drop(allocations);
+            self.by_client
+                .write()
+                .insert(saved.client_addr, allocation);
+            self.stats.active_allocations.fetch_add(1, Ordering::Relaxed);
+            self.bandwidth_manager
+                .register_allocation(saved.relayed_addr, None);
+            if let Some(metrics) = self.metrics() {
+                metrics.record_allocation();
+            }
+            summary.restored += 1;
+            debug!(
+                client = %saved.client_addr,
+                relayed = %saved.relayed_addr,
+                remaining_lifetime = saved.lifetime_secs.saturating_sub(age),
+                "persist: allocation restored"
+            );
+        }
+
+        for saved in &pending.channels {
+            if channel_table.restore_binding(saved, now_epoch) {
+                summary.channels_restored += 1;
+            } else {
+                summary.channels_skipped_expired += 1;
+            }
+        }
+
+        summary
+    }
+
+    /// Re-bind a relay socket on its original port with a short retry loop,
+    /// tolerating the window where a previous process has not fully released
+    /// the port yet.
+    async fn bind_restore_relay_socket(&self, relay_bind_addr: SocketAddr) -> Option<UdpSocket> {
+        const RETRIES: usize = 10;
+        for attempt in 0..RETRIES {
+            match UdpSocket::bind(relay_bind_addr).await {
+                Ok(socket) => return Some(socket),
+                Err(e) if attempt + 1 < RETRIES => {
+                    debug!(
+                        %relay_bind_addr,
+                        attempt = attempt + 1,
+                        error = %e,
+                        "persist: relay port not free yet, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => {
+                    warn!(
+                        %relay_bind_addr,
+                        error = %e,
+                        retries = RETRIES,
+                        "persist: failed to re-bind relay socket, dropping allocation"
+                    );
+                    return None;
+                }
+            }
+        }
+        None
     }
 
     /// Enable or disable RFC 5766 §10 permission enforcement on the peer→relay
@@ -788,6 +1076,12 @@ impl AllocationTable {
     pub fn get_allocation(&self, relayed_addr: &SocketAddr) -> Option<Arc<RwLock<Allocation>>> {
         let allocations = self.allocations.read();
         allocations.get(relayed_addr).cloned()
+    }
+
+    /// Whether a relay port is currently marked as allocated. Used by tests
+    /// and admin introspection; the data path never needs it.
+    pub fn is_relay_port_allocated(&self, port: u16) -> bool {
+        self.port_allocator.is_allocated(port)
     }
 
     pub fn remove_allocation(
@@ -1972,8 +2266,63 @@ impl ChannelTable {
         removed
     }
 
-    pub fn next_id(&self) -> u16 {
-        use std::sync::atomic::Ordering;
+    /// Snapshot live channel bindings for persistence. Expired bindings are
+    /// skipped.
+    pub fn export_bindings(&self) -> Vec<crate::persist::PersistedChannel> {
+        let now_epoch = crate::persist::epoch_secs_now();
+        let channels = self.channels.read();
+        channels
+            .values()
+            .filter(|b| !b.is_expired())
+            .map(|b| crate::persist::PersistedChannel {
+                channel_id: b.channel_id,
+                peer_addr: b.peer_addr,
+                relayed_addr: b.relayed_addr,
+                created_at_epoch: crate::persist::epoch_of_instant(b.created_at, now_epoch),
+                lifetime_secs: b.lifetime.as_secs(),
+            })
+            .collect()
+    }
+
+    /// Re-attach a persisted channel binding with its original creation time
+    /// (reconstructed from unix seconds) and lifetime. Expired bindings and
+    /// duplicates are refused so the two indexes stay consistent. Returns
+    /// `true` when the binding was restored.
+    pub fn restore_binding(
+        &self,
+        saved: &crate::persist::PersistedChannel,
+        now_epoch: u64,
+    ) -> bool {
+        let age = now_epoch.saturating_sub(saved.created_at_epoch);
+        if age >= saved.lifetime_secs {
+            return false;
+        }
+        let binding = ChannelBinding {
+            channel_id: saved.channel_id,
+            peer_addr: saved.peer_addr,
+            relayed_addr: saved.relayed_addr,
+            created_at: crate::persist::instant_from_epoch(saved.created_at_epoch, now_epoch),
+            lifetime: Duration::from_secs(saved.lifetime_secs),
+        };
+
+        // Lock order is always `channels` then `by_peer` (same as `bind`).
+        let mut channels = self.channels.write();
+        let mut by_peer = self.by_peer.write();
+
+        let key = (saved.relayed_addr, saved.channel_id);
+        if channels.contains_key(&key) {
+            return false;
+        }
+        if by_peer.contains_key(&(saved.relayed_addr, saved.peer_addr)) {
+            return false;
+        }
+
+        channels.insert(key, binding.clone());
+        by_peer.insert((saved.relayed_addr, saved.peer_addr), binding);
+        true
+    }
+
+    pub fn next_id(&self) -> u16 {        use std::sync::atomic::Ordering;
         // Atomically fetch and wrap channel IDs within 0x4000..=0x7FFF
         loop {
             let current = self.next_channel.load(Ordering::Acquire);

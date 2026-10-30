@@ -5,7 +5,7 @@ use miuturn::{
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -160,6 +160,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let server = server; // remove mut
 
+    // ── Persistence: load previous session state (restart restore) ──────────
+    // Queues allocations/channels for re-attach on listener start, restores
+    // nonces and lifetime counters immediately. Mismatched or corrupt state
+    // is rotated aside and the server starts fresh.
+    let persist_settings = miuturn::PersistSettings::from(&config.persist);
+    let persist_fingerprint = miuturn::config_fingerprint(&config);
+    if persist_settings.enabled {
+        match miuturn::load_state(&persist_settings.path) {
+            Ok(state) if state.config_fingerprint == persist_fingerprint => {
+                server.allocation_table.restore_counters(&state.counters);
+                let nonces_restored = server.restore_nonces(state.nonces);
+                server.allocation_table.set_pending_restore(
+                    state.allocations,
+                    state.channels,
+                );
+                info!(
+                    path = %persist_settings.path.display(),
+                    saved_at_epoch = state.saved_at_epoch,
+                    nonces_restored,
+                    total_allocations = state.counters.total_allocations,
+                    "persist: previous state loaded, sessions will be restored on listener start"
+                );
+            }
+            Ok(state) => {
+                // Config changed: sessions from the old config cannot be
+                // resumed (relay range / external IP / listeners differ).
+                let aside = miuturn::persist::rotate_aside(&persist_settings.path, "mismatch");
+                warn!(
+                    saved_fingerprint = %state.config_fingerprint,
+                    current_fingerprint = %persist_fingerprint,
+                    aside = aside.as_ref().map(|p| p.display().to_string()).as_deref(),
+                    "persist: config changed since state was saved, starting fresh"
+                );
+            }
+            Err(miuturn::PersistLoadError::NotFound) => {
+                info!("persist: no previous state file, starting fresh");
+            }
+            Err(miuturn::PersistLoadError::Corrupt(e)) => {
+                let aside = miuturn::persist::rotate_aside(&persist_settings.path, "corrupt");
+                error!(
+                    error = %e,
+                    aside = aside.as_ref().map(|p| p.display().to_string()).as_deref(),
+                    "persist: state file unusable, starting fresh"
+                );
+            }
+        }
+
+        // Periodic checkpoint while running.
+        server.start_checkpoint_task(persist_settings.clone(), persist_fingerprint.clone());
+
+        // Container deployments: a state path outside a mounted volume is
+        // wiped on container recreation, silently degrading to the old
+        // drop-everything restart. miuturn cannot see the host's mount table,
+        // so just nudge the operator to double-check (see README warning).
+        let in_container =
+            std::path::Path::new("/.dockerenv").exists()
+                || std::path::Path::new("/run/.containerenv").exists();
+        if in_container {
+            warn!(
+                path = %persist_settings.path.display(),
+                "persist: running inside a container — make sure the state \
+                 directory is a mounted volume, or state will be lost on \
+                 container recreation (see README: Persistence & Restarts)"
+            );
+        }
+    }
+
     for user_config in &config.auth.users {
         let user = User {
             username: user_config.username.clone(),
@@ -295,7 +362,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("HTTP server available at http://{}", http.address);
     }
 
-    tokio::signal::ctrl_c().await?;
+    // Wait for a shutdown signal: Ctrl+C (SIGINT), SIGTERM (docker stop /
+    // systemctl stop / kill) or SIGUSR2 (explicit "save & restart" trigger,
+    // useful with a restart policy / supervisor). All three trigger the same
+    // graceful path; when persistence is enabled a final unconditional state
+    // save runs so the next process resumes sessions.
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigint = signal(SignalKind::interrupt())?;
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sigusr2 = signal(SignalKind::user_defined2())?;
+        tokio::select! {
+            _ = sigint.recv() => info!("SIGINT received, shutting down"),
+            _ = sigterm.recv() => info!("SIGTERM received, shutting down"),
+            _ = sigusr2.recv() => info!("SIGUSR2 received, shutting down for restart"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        info!("Ctrl+C received, shutting down");
+    }
+
+    // Final save: covers sessions created since the last checkpoint. Even if
+    // this fails, the last checkpoint is still on disk.
+    if persist_settings.enabled {
+        let state = server.build_persisted_state(&persist_fingerprint).await;
+        match miuturn::save_state(&persist_settings.path, &state) {
+            Ok(()) => info!(
+                allocations = state.allocations.len(),
+                channels = state.channels.len(),
+                path = %persist_settings.path.display(),
+                "persist: final state saved before shutdown"
+            ),
+            Err(e) => error!(
+                path = %persist_settings.path.display(),
+                error = %e,
+                "persist: final state save failed (last checkpoint remains on disk)"
+            ),
+        }
+    }
+
     info!("Shutting down...");
     Ok(())
 }

@@ -1019,3 +1019,616 @@ fn test_component_performance_analysis() {
 "
     );
 }
+
+// =============================================================================
+// Binary restart persistence tests (end-to-end, spawns the real binary).
+//
+// These tests exercise the full ops flow documented in the README:
+//   start binary -> allocate + permission + relay traffic
+//   -> SIGTERM (graceful save) -> start binary again
+//   -> sessions resumed on the same relay port without client re-Allocate.
+// =============================================================================
+
+#[cfg(unix)]
+mod restart_persistence_tests {
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
+    use std::time::Duration;
+
+    use bytes::{Bytes, BytesMut};
+    use tokio::net::UdpSocket;
+    use tokio::time::timeout;
+
+    use miuturn::{Attribute, EventType, Message, MessageHeader, Method};
+
+    const MAGIC: u32 = 0x2112A442;
+    const USERNAME: &str = "persist-user";
+    const PASSWORD: &str = "persist-pass";
+    const REALM: &str = "restart-test";
+
+    /// Pick a free UDP port by binding and releasing a probe socket.
+    fn free_udp_port() -> u16 {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    }
+
+    struct TestEnv {
+        dir: PathBuf,
+        config_path: PathBuf,
+        state_path: PathBuf,
+        listen_port: u16,
+        relay_start: u16,
+        relay_end: u16,
+    }
+
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn write_config(relay_start: u16, relay_end: u16) -> TestEnv {
+        let listen_port = free_udp_port();
+        let dir = std::env::temp_dir().join(format!(
+            "miuturn-restart-test-{}-{}",
+            std::process::id(),
+            listen_port
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let state_path = dir.join("state.json");
+        let config_path = dir.join("miuturn.toml");
+        let config = format!(
+            r#"[server]
+realm = "{REALM}"
+external_ip = "127.0.0.1"
+relay_bind_ip = "127.0.0.1"
+start_port = {relay_start}
+end_port = {relay_end}
+max_allocation_duration_secs = 600
+
+[[server.listening]]
+protocol = "udp"
+address = "127.0.0.1:{listen_port}"
+
+[auth]
+
+[[auth.users]]
+username = "{USERNAME}"
+password = "{PASSWORD}"
+user_type = "fixed"
+
+[persist]
+enabled = true
+path = "{}"
+checkpoint_interval_secs = 1
+"#,
+            state_path.display()
+        );
+        std::fs::write(&config_path, config).unwrap();
+
+        TestEnv {
+            dir,
+            config_path,
+            state_path,
+            listen_port,
+            relay_start,
+            relay_end,
+        }
+    }
+
+    fn spawn_server(env: &TestEnv) -> Child {
+        spawn_server_with(env, Stdio::null())
+    }
+
+    /// Spawn with explicit stdout handling. Pipes MUST be drained (see
+    /// `wait_with_output`): a full pipe blocks the child's logging and can
+    /// stall its shutdown path.
+    fn spawn_server_with(env: &TestEnv, stdout: Stdio) -> Child {
+        Command::new(env!("CARGO_BIN_EXE_miuturn"))
+            .env("CONFIG", &env.config_path)
+            .stdout(stdout)
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn miuturn binary")
+    }
+
+    /// Wait until the server answers an unauthenticated Allocate with 401
+    /// (proves the UDP listener is up and auth flow works).
+    async fn wait_until_ready(socket: &UdpSocket, server: SocketAddr) {
+        let req = Message {
+            header: MessageHeader {
+                method: Method::Allocate,
+                event_type: EventType::Request,
+                message_length: 0,
+                magic_cookie: MAGIC,
+                transaction_id: [9; 12],
+            },
+            attributes: vec![Attribute {
+                attr_type: Attribute::REQUESTED_TRANSPORT,
+                value: Bytes::from_static(&[0x11, 0, 0, 0]),
+            }],
+        };
+        let mut buf = [0u8; 2048];
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            socket.send_to(&req.encode(), server).await.unwrap();
+            match timeout(Duration::from_millis(400), socket.recv_from(&mut buf)).await {
+                Ok(Ok((len, _))) => {
+                    if let Some(msg) = Message::parse(&buf[..len]) {
+                        if msg.header.method == Method::Allocate {
+                            return; // got a response (401 expected)
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+        panic!("server did not become ready in time");
+    }
+
+    /// Perform the 401 handshake and return (nonce, realm).
+    async fn get_nonce(socket: &UdpSocket, server: SocketAddr, tid: [u8; 12]) -> (String, String) {
+        let req = Message {
+            header: MessageHeader {
+                method: Method::Allocate,
+                event_type: EventType::Request,
+                message_length: 0,
+                magic_cookie: MAGIC,
+                transaction_id: tid,
+            },
+            attributes: vec![Attribute {
+                attr_type: Attribute::REQUESTED_TRANSPORT,
+                value: Bytes::from_static(&[0x11, 0, 0, 0]),
+            }],
+        };
+        socket.send_to(&req.encode(), server).await.unwrap();
+        let mut buf = [0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(3), socket.recv_from(&mut buf))
+            .await
+            .expect("timeout waiting for 401")
+            .unwrap();
+        let resp = Message::parse(&buf[..len]).unwrap();
+        assert_eq!(resp.header.event_type, EventType::Error, "expected 401");
+        let nonce = String::from_utf8(
+            resp.get_attribute(Attribute::NONCE)
+                .expect("401 should carry NONCE")
+                .value
+                .to_vec(),
+        )
+        .unwrap();
+        let realm = String::from_utf8(
+            resp.get_attribute(Attribute::REALM)
+                .expect("401 should carry REALM")
+                .value
+                .to_vec(),
+        )
+        .unwrap();
+        (nonce, realm)
+    }
+
+    fn compute_key(username: &str, realm: &str, password: &str) -> Vec<u8> {
+        md5::compute(format!("{username}:{realm}:{password}").as_bytes()).to_vec()
+    }
+
+    /// Append USERNAME/REALM/NONCE + MESSAGE-INTEGRITY to a request.
+    fn sign_request(msg: &mut Message, username: &str, realm: &str, nonce: &str, password: &str) {
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::USERNAME,
+            value: Bytes::copy_from_slice(username.as_bytes()),
+        });
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::REALM,
+            value: Bytes::copy_from_slice(realm.as_bytes()),
+        });
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::NONCE,
+            value: Bytes::copy_from_slice(nonce.as_bytes()),
+        });
+
+        // MESSAGE-INTEGRITY covers header (with final length) + all attrs so far.
+        let mut attr_buf = BytesMut::new();
+        for attr in &msg.attributes {
+            attr.encode(&mut attr_buf);
+        }
+        let mut header = msg.header.clone();
+        header.message_length = (attr_buf.len() + 24) as u16;
+        header.magic_cookie = MAGIC;
+        let mut signed = BytesMut::new();
+        header.encode(&mut signed);
+        signed.extend_from_slice(&attr_buf.freeze());
+
+        use hmac::{Hmac, KeyInit, Mac};
+        type HmacSha1 = Hmac<sha1::Sha1>;
+        let mut mac = HmacSha1::new_from_slice(&compute_key(username, realm, password))
+            .ok()
+            .unwrap();
+        mac.update(&signed);
+        msg.attributes.push(Attribute {
+            attr_type: Attribute::MESSAGE_INTEGRITY,
+            value: Bytes::copy_from_slice(&mac.finalize().into_bytes()[..20]),
+        });
+    }
+
+    fn xor_attr(addr: SocketAddr, tid: [u8; 12]) -> Attribute {
+        Attribute {
+            attr_type: Attribute::PEER_ADDRESS, // XOR-PEER-ADDRESS (0x0012)
+            value: miuturn::encode_xor_address(addr, MAGIC, &tid),
+        }
+    }
+
+    fn decode_xor(value: &[u8], tid: [u8; 12]) -> SocketAddr {
+        miuturn::decode_xor_address(value, MAGIC, &tid).expect("valid XOR address")
+    }
+
+    /// Authenticated Allocate; returns the advertised relay address.
+    async fn allocate(
+        socket: &UdpSocket,
+        server: SocketAddr,
+    ) -> SocketAddr {
+        let tid = rand_tid();
+        let (nonce, realm) = get_nonce(socket, server, tid).await;
+        let mut req = Message {
+            header: MessageHeader {
+                method: Method::Allocate,
+                event_type: EventType::Request,
+                message_length: 0,
+                magic_cookie: MAGIC,
+                transaction_id: tid,
+            },
+            attributes: vec![Attribute {
+                attr_type: Attribute::REQUESTED_TRANSPORT,
+                value: Bytes::from_static(&[0x11, 0, 0, 0]),
+            }],
+        };
+        sign_request(&mut req, USERNAME, &realm, &nonce, PASSWORD);
+        socket.send_to(&req.encode(), server).await.unwrap();
+
+        let mut buf = [0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(3), socket.recv_from(&mut buf))
+            .await
+            .expect("timeout waiting for Allocate response")
+            .unwrap();
+        let resp = Message::parse(&buf[..len]).unwrap();
+        assert_eq!(
+            resp.header.event_type,
+            EventType::Success,
+            "authenticated Allocate should succeed"
+        );
+        decode_xor(
+            &resp
+                .get_attribute(Attribute::XOR_RELAYED_ADDRESS)
+                .expect("Allocate success carries XOR-RELAYED-ADDRESS")
+                .value,
+            tid,
+        )
+    }
+
+    fn rand_tid() -> [u8; 12] {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let mut tid = [0u8; 12];
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        tid[..8].copy_from_slice(&secs.to_be_bytes());
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        tid[8..12].copy_from_slice(&(pid ^ n.rotate_left(16)).to_be_bytes());
+        tid
+    }
+
+    /// Authenticated Refresh; asserts success.
+    async fn refresh(socket: &UdpSocket, server: SocketAddr, lifetime: u32) {
+        let tid = rand_tid();
+        let (nonce, realm) = get_nonce(socket, server, tid).await;
+        let mut req = Message {
+            header: MessageHeader {
+                method: Method::Refresh,
+                event_type: EventType::Request,
+                message_length: 0,
+                magic_cookie: MAGIC,
+                transaction_id: tid,
+            },
+            attributes: vec![Attribute {
+                attr_type: Attribute::LIFETIME,
+                value: Bytes::copy_from_slice(&lifetime.to_be_bytes()),
+            }],
+        };
+        sign_request(&mut req, USERNAME, &realm, &nonce, PASSWORD);
+        socket.send_to(&req.encode(), server).await.unwrap();
+
+        let mut buf = [0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(3), socket.recv_from(&mut buf))
+            .await
+            .expect("timeout waiting for Refresh response")
+            .unwrap();
+        let resp = Message::parse(&buf[..len]).unwrap();
+        assert_eq!(
+            resp.header.event_type,
+            EventType::Success,
+            "Refresh after restart should succeed (session must not be lost)"
+        );
+    }
+
+    /// Authenticated CreatePermission for the peer.
+    async fn create_permission(
+        socket: &UdpSocket,
+        server: SocketAddr,
+        peer: SocketAddr,
+    ) {
+        let tid = rand_tid();
+        let (nonce, realm) = get_nonce(socket, server, tid).await;
+        let mut req = Message {
+            header: MessageHeader {
+                method: Method::CreatePermission,
+                event_type: EventType::Request,
+                message_length: 0,
+                magic_cookie: MAGIC,
+                transaction_id: tid,
+            },
+            attributes: vec![xor_attr(peer, tid)],
+        };
+        sign_request(&mut req, USERNAME, &realm, &nonce, PASSWORD);
+        socket.send_to(&req.encode(), server).await.unwrap();
+
+        let mut buf = [0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(3), socket.recv_from(&mut buf))
+            .await
+            .expect("timeout waiting for CreatePermission response")
+            .unwrap();
+        let resp = Message::parse(&buf[..len]).unwrap();
+        assert_eq!(resp.header.event_type, EventType::Success);
+    }
+
+    /// Send Indication client -> peer via the relay.
+    async fn send_indication(socket: &UdpSocket, server: SocketAddr, peer: SocketAddr, payload: &[u8]) {
+        let tid = rand_tid();
+        let ind = Message {
+            header: MessageHeader {
+                method: Method::Send,
+                event_type: EventType::Indication,
+                message_length: 0,
+                magic_cookie: MAGIC,
+                transaction_id: tid,
+            },
+            attributes: vec![
+                xor_attr(peer, tid),
+                Attribute {
+                    attr_type: Attribute::DATA,
+                    value: Bytes::copy_from_slice(payload),
+                },
+            ],
+        };
+        socket.send_to(&ind.encode(), server).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_binary_persist_restart_restores_sessions() {
+        let env = write_config(57200, 57299);
+        let server: SocketAddr = format!("127.0.0.1:{}", env.listen_port)
+            .parse()
+            .unwrap();
+
+        // ── Generation 1: allocate, create permission, relay traffic ──
+        let mut child1 = spawn_server(&env);
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        wait_until_ready(&client, server).await;
+
+        let relayed = allocate(&client, server).await;
+        assert!(
+            relayed.port() >= env.relay_start && relayed.port() <= env.relay_end,
+            "relayed port {relayed} outside configured range"
+        );
+
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        create_permission(&client, server, peer_addr).await;
+
+        send_indication(&client, server, peer_addr, b"before-restart").await;
+        let mut buf = [0u8; 2048];
+        let (len, src) = timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("peer should receive relayed data before restart")
+            .unwrap();
+        assert_eq!(&buf[..len], b"before-restart");
+        assert_eq!(src, relayed, "peer traffic must come from the relay address");
+
+        // ── Graceful shutdown: SIGTERM → save state → exit 0 ──
+        unsafe {
+            libc::kill(child1.id() as i32, libc::SIGTERM);
+        }
+        let status = child1.wait().unwrap();
+        assert!(status.success(), "graceful SIGTERM exit should be clean: {status}");
+        assert!(
+            env.state_path.exists(),
+            "state file must be written on shutdown"
+        );
+
+        // ── Generation 2: same config, sessions must resume ──
+        // Piped so the restore log line can be asserted below; consumed by
+        // `wait_with_output` at the end of the test.
+        let mut child2 = spawn_server_with(&env, Stdio::piped());
+        // Same client socket → same client 5-tuple the allocation was keyed by.
+        wait_until_ready(&client, server).await;
+
+        // Refresh must succeed against the RESTORED allocation (a fresh
+        // server would answer 437 Allocation Mismatch).
+        refresh(&client, server, 300).await;
+
+        // Media path resumes through the SAME relay port, no re-Allocate.
+        send_indication(&client, server, peer_addr, b"after-restart").await;
+        let (len, src) = timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("peer should receive relayed data after restart")
+            .unwrap();
+        assert_eq!(&buf[..len], b"after-restart");
+        assert_eq!(
+            src, relayed,
+            "relay address must be identical across the restart"
+        );
+
+        // Stop generation 2 gracefully (final save is idempotent), then read
+        // its logs. wait_with_output needs the process to exit first.
+        unsafe {
+            libc::kill(child2.id() as i32, libc::SIGTERM);
+        }
+        let output = child2.wait_with_output().unwrap();
+        let logs = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            logs.contains("session restore complete"),
+            "expected restore log in child output, got:\n{logs}"
+        );
+    }
+
+    /// CRASH recovery: SIGKILL (no graceful save, no final write) — the new
+    /// process must resume the session from the last periodic checkpoint,
+    /// same relay port, media keeps flowing.
+    #[tokio::test]
+    async fn test_binary_persist_crash_recovers_from_checkpoint() {
+        let env = write_config(59200, 59299);
+        let server: SocketAddr = format!("127.0.0.1:{}", env.listen_port)
+            .parse()
+            .unwrap();
+
+        // ── Generation 1: session with media flowing ──
+        let mut child1 = spawn_server(&env);
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        wait_until_ready(&client, server).await;
+        let relayed = allocate(&client, server).await;
+
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        create_permission(&client, server, peer_addr).await;
+        send_indication(&client, server, peer_addr, b"before-crash").await;
+        let mut buf = [0u8; 2048];
+        let _ = timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("peer should receive data before crash");
+
+        // Wait until the periodic checkpoint (interval = 1s) actually
+        // captured the allocation. The file starts out with an empty
+        // allocation list at boot, so poll for a non-empty entry.
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        loop {
+            let content = std::fs::read_to_string(&env.state_path).unwrap_or_default();
+            if content.contains("\"allocations\":[{") {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("periodic checkpoint never captured the allocation");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // ── CRASH: SIGKILL. No graceful path, no final save. ──
+        child1.kill().expect("failed to SIGKILL generation 1");
+        child1.wait().unwrap();
+
+        // ── Generation 2: must resume from the checkpoint ──
+        let mut child2 = spawn_server(&env);
+        wait_until_ready(&client, server).await;
+
+        // Session survived the crash: Refresh succeeds instead of 437.
+        refresh(&client, server, 300).await;
+
+        // Media resumes through the SAME relay port.
+        send_indication(&client, server, peer_addr, b"after-crash").await;
+        let (len, src) = timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("peer should receive relayed data after crash recovery")
+            .unwrap();
+        assert_eq!(&buf[..len], b"after-crash");
+        assert_eq!(
+            src, relayed,
+            "relay address must survive a hard crash via checkpoint"
+        );
+
+        let _ = child2.kill();
+        let _ = child2.wait();
+    }
+
+    #[tokio::test]
+    async fn test_binary_persist_fingerprint_mismatch_starts_fresh() {
+        let env = write_config(58200, 58299);
+        let server: SocketAddr = format!("127.0.0.1:{}", env.listen_port)
+            .parse()
+            .unwrap();
+
+        // Generation 1: create a session and shut down cleanly.
+        let mut child1 = spawn_server(&env);
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        wait_until_ready(&client, server).await;
+        allocate(&client, server).await;
+
+        unsafe {
+            libc::kill(child1.id() as i32, libc::SIGTERM);
+        }
+        assert!(child1.wait().unwrap().success());
+        assert!(env.state_path.exists());
+
+        // Generation 2: SAME state file but a DIFFERENT relay range → the
+        // fingerprint changes; the server must start fresh instead of
+        // resuming sessions that no longer map to its config.
+        let mut config: String = std::fs::read_to_string(&env.config_path).unwrap();
+        config = config
+            .replacen(
+                &format!("start_port = {}", env.relay_start),
+                &format!("start_port = {}", env.relay_end + 1),
+                1,
+            )
+            .replacen(
+                &format!("end_port = {}", env.relay_end),
+                &format!("end_port = {}", env.relay_end + 50),
+                1,
+            );
+        std::fs::write(&env.config_path, config).unwrap();
+
+        let mut child2 = spawn_server(&env);
+        wait_until_ready(&client, server).await;
+
+        // Refresh against the old session must NOT succeed as a continuation:
+        // a fresh server has no such allocation (437 Allocation Mismatch).
+        let tid = rand_tid();
+        let (nonce, realm) = get_nonce(&client, server, tid).await;
+        let mut req = Message {
+            header: MessageHeader {
+                method: Method::Refresh,
+                event_type: EventType::Request,
+                message_length: 0,
+                magic_cookie: MAGIC,
+                transaction_id: tid,
+            },
+            attributes: vec![Attribute {
+                attr_type: Attribute::LIFETIME,
+                value: Bytes::copy_from_slice(&300u32.to_be_bytes()),
+            }],
+        };
+        sign_request(&mut req, USERNAME, &realm, &nonce, PASSWORD);
+        client.send_to(&req.encode(), server).await.unwrap();
+        let mut buf = [0u8; 2048];
+        let (len, _) = timeout(Duration::from_secs(3), client.recv_from(&mut buf))
+            .await
+            .expect("timeout waiting for Refresh response")
+            .unwrap();
+        let resp = Message::parse(&buf[..len]).unwrap();
+        assert_eq!(
+            resp.header.event_type,
+            EventType::Error,
+            "stale session must not survive a fingerprint mismatch"
+        );
+
+        // The mismatched state file was rotated aside.
+        let rotated = std::fs::read_dir(&env.dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with("state.json.mismatch"));
+        assert!(rotated, "mismatched state file should be rotated aside");
+
+        let _ = child2.kill();
+        let _ = child2.wait();
+    }
+}

@@ -1411,3 +1411,303 @@ mod relay_data_path_tests {
         );
     }
 }
+
+/// Restart-persistence unit tests: export → restore round-trip across two
+/// AllocationTable instances simulates a process restart without spawning a
+/// real second binary (that is covered by the integration test).
+#[cfg(test)]
+mod persistence_tests {
+    use crate::allocation::*;
+    use crate::persist::{
+        PersistedAllocation, PersistedCounters, epoch_secs_now, instant_from_epoch,
+    };
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use tokio::net::UdpSocket;
+    use tokio::time::timeout;
+
+    const RANGE_START: u16 = 55300;
+    const RANGE_END: u16 = 55399;
+
+    fn make_addr(ip: &str, port: u16) -> SocketAddr {
+        format!("{ip}:{port}").parse().unwrap()
+    }
+
+    fn table_for_range(start: u16, end: u16) -> AllocationTable {
+        AllocationTable::with_port_range(
+            Ipv4Addr::new(127, 0, 0, 1),
+            "test".to_string(),
+            start,
+            end,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Allocate one allocation on `table` and return (client, relayed_addr).
+    async fn make_allocation(
+        table: &AllocationTable,
+        channel_table: &ChannelTable,
+        client: SocketAddr,
+    ) -> SocketAddr {
+        let alloc = table
+            .create_allocation(client, Some(600), channel_table)
+            .await
+            .unwrap();
+        alloc.read().relayed_addr
+    }
+
+    #[tokio::test]
+    async fn test_export_restore_roundtrip_preserves_sessions() {
+        let client: SocketAddr = make_addr("192.168.7.10", 44401);
+        let table_a = table_for_range(RANGE_START, RANGE_END);
+        let channel_table_a = ChannelTable::new();
+
+        let relayed = make_allocation(&table_a, &channel_table_a, client).await;
+        let peer: SocketAddr = make_addr("10.9.9.9", 5555);
+        assert!(table_a.add_permissions(&client, &[peer]));
+
+        // Bind a channel on the allocation.
+        channel_table_a
+            .bind(0x4000, peer, relayed)
+            .expect("channel bind should succeed");
+
+        // Export from "process A".
+        let (allocs, counters) = table_a.export_persisted();
+        assert_eq!(allocs.len(), 1, "one live allocation should be exported");
+        let saved = allocs[0].clone();
+        assert_eq!(saved.client_addr, client);
+        assert_eq!(saved.relayed_addr, relayed);
+        assert_eq!(saved.permissions, vec![peer.ip()]);
+        assert_eq!(saved.lifetime_secs, 600);
+        let exported_channels = channel_table_a.export_bindings();
+        assert_eq!(exported_channels.len(), 1);
+        assert_eq!(exported_channels[0].channel_id, 0x4000);
+        let counters_exported = counters;
+        assert_eq!(counters_exported.total_allocations, 1);
+
+        // Tear down "process A": its sockets must go away before B rebinds.
+        table_a
+            .remove_allocation(&relayed, Some(&channel_table_a))
+            .expect("allocation should exist on A");
+
+        // "Process B": fresh tables, restore from the snapshot.
+        let table_b = table_for_range(RANGE_START, RANGE_END);
+        let channel_table_b = ChannelTable::new();
+        let main_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        table_b.set_main_socket(std::sync::Arc::new(main_sock));
+        table_b.restore_counters(&counters_exported);
+        table_b.set_pending_restore(allocs, exported_channels);
+
+        let summary = table_b.restore_pending(&channel_table_b).await;
+        assert_eq!(summary.restored, 1, "summary: {summary:?}");
+        assert_eq!(summary.skipped_expired, 0);
+        assert_eq!(summary.channels_restored, 1);
+
+        // The allocation is back with the same relay address.
+        let restored = table_b
+            .get_allocation(&relayed)
+            .expect("allocation should exist after restore");
+        {
+            let a = restored.read();
+            assert_eq!(a.client_addr, client);
+            assert_eq!(a.permissions.read().len(), 1);
+            assert_eq!(a.lifetime.as_secs(), 600);
+            assert_eq!(
+                a.bytes_forwarded.load(Ordering::Relaxed),
+                saved.bytes_forwarded
+            );        }
+
+        // The relay port is marked so fresh allocations cannot steal it.
+        assert!(table_b.is_relay_port_allocated(relayed.port()));
+
+        // Counters preserved; active count reflects the restored session.
+        let stats = table_b.stats().snapshot();
+        assert_eq!(stats.total_allocations, counters_exported.total_allocations);
+        assert_eq!(stats.active_allocations, 1);
+
+        // The data path actually works around the re-bound socket: peer
+        // traffic reaches the client through the restored relay task.
+        let peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_sock.local_addr().unwrap();
+        assert!(table_b.add_permissions(&client, &[peer_addr]));
+        assert!(
+            table_b
+                .send_to_peer(&client, peer_addr, b"after restart")
+                .await
+                .is_some(),
+            "restored allocation should relay peer data"
+        );
+        let mut buf = vec![0u8; 1024];
+        let (len, src) = timeout(
+            Duration::from_millis(500),
+            peer_sock.recv_from(&mut buf),
+        )
+        .await
+        .expect("peer should receive relayed data")
+        .unwrap();
+        assert_eq!(&buf[..len], b"after restart");
+        assert_eq!(src.port(), relayed.port(), "relay port must survive restart");
+
+        // Channel binding is usable on the restored table.
+        assert!(channel_table_b.get_by_channel(relayed, 0x4000).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_restore_skips_expired_allocations() {
+        let now = epoch_secs_now();
+        let expired = PersistedAllocation {
+            id: [1u8; 12],
+            client_addr: make_addr("192.168.7.20", 44402),
+            server_addr: make_addr("127.0.0.1", 3478),
+            relayed_addr: make_addr("127.0.0.1", RANGE_START),
+            username: None,
+            created_at_epoch: now - 10_000,
+            refreshed_at_epoch: now - 9_000,
+            lifetime_secs: 600,
+            permissions: vec![],
+            bytes_forwarded: 0,
+            messages_forwarded: 0,
+        };
+
+        let table = table_for_range(RANGE_START, RANGE_END);
+        let main_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        table.set_main_socket(std::sync::Arc::new(main_sock));
+        table.set_pending_restore(vec![expired], vec![]);
+
+        let summary = table.restore_pending(&ChannelTable::new()).await;
+        assert_eq!(summary.restored, 0);
+        assert_eq!(summary.skipped_expired, 1);
+        assert_eq!(summary.failed, 0);
+        // The port was not consumed by the skipped entry.
+        assert!(!table.is_relay_port_allocated(RANGE_START));
+    }
+
+    #[tokio::test]
+    async fn test_restore_rebind_failure_does_not_leak_port() {
+        // Occupy the target port with an unrelated socket so re-binding fails.
+        let blocker = UdpSocket::bind(("127.0.0.1", RANGE_START + 5)).await.unwrap();
+        let now = epoch_secs_now();
+        let saved = PersistedAllocation {
+            id: [2u8; 12],
+            client_addr: make_addr("192.168.7.30", 44403),
+            server_addr: make_addr("127.0.0.1", 3478),
+            relayed_addr: make_addr("127.0.0.1", RANGE_START + 5),
+            username: None,
+            created_at_epoch: now,
+            refreshed_at_epoch: now,
+            lifetime_secs: 600,
+            permissions: vec![],
+            bytes_forwarded: 7,
+            messages_forwarded: 3,
+        };
+
+        let table = table_for_range(RANGE_START, RANGE_END);
+        let main_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        table.set_main_socket(std::sync::Arc::new(main_sock));
+        table.set_pending_restore(vec![saved], vec![]);
+
+        let summary = table.restore_pending(&ChannelTable::new()).await;
+        assert_eq!(summary.restored, 0);
+        assert_eq!(summary.failed, 1, "summary: {summary:?}");
+        assert_eq!(blocker.local_addr().unwrap().port(), RANGE_START + 5);
+        // After the failed restore the port is released for normal allocation.
+        assert!(!table.is_relay_port_allocated(RANGE_START + 5));
+    }
+
+    #[test]
+    fn test_restore_counters_only_touches_totals() {
+        let table = table_for_range(RANGE_START, RANGE_END);
+        table.restore_counters(&PersistedCounters {
+            total_allocations: 1234,
+            total_bytes_relayed: 999_999,
+            total_messages: 5_000,
+        });
+        let stats = table.stats().snapshot();
+        assert_eq!(stats.total_allocations, 1234);
+        assert_eq!(stats.total_bytes_relayed, 999_999);
+        assert_eq!(stats.total_messages, 5_000);
+        // Active count is owned by restore_pending, not the snapshot.
+        assert_eq!(stats.active_allocations, 0);
+    }
+
+    #[test]
+    fn test_channel_binding_export_restore_roundtrip() {
+        let table_a = ChannelTable::new();
+        let relayed = make_addr("127.0.0.1", RANGE_START);
+        let peer = make_addr("10.0.0.1", 1111);
+        table_a.bind(0x4100, peer, relayed).unwrap();
+
+        let exported = table_a.export_bindings();
+        assert_eq!(exported.len(), 1);
+
+        let table_b = ChannelTable::new();
+        let now = epoch_secs_now();
+        assert!(table_b.restore_binding(&exported[0], now));
+        let binding = table_b
+            .get_by_channel(relayed, 0x4100)
+            .expect("binding should be restored");
+        assert_eq!(binding.peer_addr, peer);
+        assert_eq!(binding.channel_id, 0x4100);
+        // Secondary index is consistent.
+        assert_eq!(
+            table_b.get_by_peer_for_relayed(&relayed, &peer),
+            Some(0x4100),
+            "by_peer index should be rebuilt"
+        );
+
+        // Duplicates are refused (indexes stay consistent).
+        assert!(!table_b.restore_binding(&exported[0], now));
+
+        // Expired bindings are refused.
+        let mut expired = exported[0].clone();
+        expired.channel_id = 0x4200;
+        expired.created_at_epoch = now - expired.lifetime_secs - 1;
+        assert!(!table_b.restore_binding(&expired, now));
+        assert!(table_b.get_by_channel(relayed, 0x4200).is_none());
+    }
+
+    #[test]
+    fn test_instant_from_epoch_reconstructs_expiry_clock() {
+        // A session refreshed 100s ago with a 600s lifetime must still be
+        // live after restore, and must expire in ~500s.
+        let now = epoch_secs_now();
+        let refreshed = instant_from_epoch(now - 100, now);
+        let lifetime = Duration::from_secs(600);
+        assert!(refreshed.elapsed() >= Duration::from_secs(99));
+        assert!(refreshed.elapsed() < Duration::from_secs(105));
+        assert!(refreshed.elapsed() < lifetime, "restored session must be live");
+    }
+
+    #[tokio::test]
+    async fn test_nonce_export_restore_roundtrip() {
+        let server = crate::TurnServer::with_auth_disabled(
+            Ipv4Addr::new(127, 0, 0, 1),
+            "test".to_string(),
+        );
+
+        // Restore a fresh nonce.
+        let fresh = vec![crate::persist::PersistedNonce {
+            nonce: "nonce-alive-1".to_string(),
+            created_at_epoch: epoch_secs_now(),
+        }];
+        assert_eq!(server.restore_nonces(fresh), 1);
+        // The restored nonce is still fresh, so it exports again.
+        let exported = server.export_nonces();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].nonce, "nonce-alive-1");
+
+        // Expired nonces are dropped on restore.
+        let expired = vec![crate::persist::PersistedNonce {
+            nonce: "nonce-dead".to_string(),
+            created_at_epoch: epoch_secs_now() - 10_000,
+        }];
+        assert_eq!(server.restore_nonces(expired), 0);
+        assert!(
+            !server.export_nonces().iter().any(|n| n.nonce == "nonce-dead"),
+            "expired nonce must not be restored"
+        );
+    }
+}

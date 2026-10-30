@@ -94,6 +94,7 @@ struct BackgroundTaskFlags {
     channel_cleanup: std::sync::atomic::AtomicBool,
     allocation_cleanup: std::sync::atomic::AtomicBool,
     stats_dump: std::sync::atomic::AtomicBool,
+    checkpoint: std::sync::atomic::AtomicBool,
 }
 
 impl BackgroundTaskFlags {
@@ -498,6 +499,135 @@ impl TurnServer {
         self.allocation_table.stats().snapshot()
     }
 
+    /// Snapshot the nonces issued for long-term credential auth. Only fresh
+    /// nonces are exported; the rest would be rejected on restore anyway.
+    pub fn export_nonces(&self) -> Vec<crate::persist::PersistedNonce> {
+        let now_epoch = crate::persist::epoch_secs_now();
+        self.nonce_map
+            .read()
+            .iter()
+            .filter_map(|(nonce, entry)| {
+                // NONCE_EXPIRY_SECONDS is an age limit, not a timestamp.
+                let age_secs = entry.created_at.elapsed().as_secs();
+                if age_secs >= NONCE_EXPIRY_SECONDS {
+                    return None;
+                }
+                Some(crate::persist::PersistedNonce {
+                    nonce: nonce.clone(),
+                    created_at_epoch: now_epoch.saturating_sub(age_secs),
+                })
+            })
+            .collect()
+    }
+
+    /// Re-insert persisted nonces, dropping entries that expired while the
+    /// server was down. Returns how many were restored. Clients whose nonce
+    /// was dropped get a transparent `438 Stale Nonce` retry, so a partial
+    /// restore is harmless.
+    pub fn restore_nonces(&self, nonces: Vec<crate::persist::PersistedNonce>) -> usize {
+        let now_epoch = crate::persist::epoch_secs_now();
+        let mut map = self.nonce_map.write();
+        let mut restored = 0;
+        for saved in nonces {
+            let age = now_epoch.saturating_sub(saved.created_at_epoch);
+            if age >= NONCE_EXPIRY_SECONDS {
+                continue;
+            }
+            map.insert(
+                saved.nonce,
+                NonceEntry {
+                    created_at: crate::persist::instant_from_epoch(saved.created_at_epoch, now_epoch),
+                },
+            );
+            restored += 1;
+        }
+        restored
+    }
+
+    /// Build a complete persistence snapshot of the current session state.
+    pub async fn build_persisted_state(
+        &self,
+        fingerprint: &str,
+    ) -> crate::persist::PersistedState {
+        let (allocations, counters) = self.allocation_table.export_persisted();
+        crate::persist::PersistedState {
+            version: crate::persist::STATE_VERSION,
+            saved_at_epoch: crate::persist::epoch_secs_now(),
+            config_fingerprint: fingerprint.to_string(),
+            allocations,
+            channels: self.channel_table.read().await.export_bindings(),
+            nonces: self.export_nonces(),
+            counters,
+        }
+    }
+
+    /// Start the periodic checkpoint task (`[persist]`). Writes an atomic
+    /// snapshot every `checkpoint_interval_secs`, skipping intervals where
+    /// nothing changed. A final unconditional save happens on shutdown in
+    /// `main`.
+    pub fn start_checkpoint_task(
+        &self,
+        settings: crate::persist::PersistSettings,
+        fingerprint: String,
+    ) {
+        if !settings.enabled {
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        if !BackgroundTaskFlags::claim(&self.bg_tasks.checkpoint) {
+            return;
+        }
+
+        let server = self.clone();
+        tokio::spawn(async move {
+            let interval =
+                tokio::time::Duration::from_secs(settings.checkpoint_interval_secs.max(1));
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // First tick fires immediately; by then nothing has changed yet,
+            // so the change-detection below keeps it a no-op write.
+            let mut last_saved: Option<String> = None;
+
+            loop {
+                ticker.tick().await;
+                let state = server.build_persisted_state(&fingerprint).await;
+                // `saved_at_epoch` differs every tick; compare without it so
+                // an idle server neither rewrites the file nor logs.
+                let key = match state.comparison_key() {
+                    Ok(k) => k,
+                    Err(e) => {
+                        tracing::warn!("persist: checkpoint serialization failed: {}", e);
+                        continue;
+                    }
+                };
+                if last_saved.as_deref() == Some(key.as_str()) {
+                    continue;
+                }
+                match crate::persist::save_state(&settings.path, &state) {
+                    Ok(()) => {
+                        last_saved = Some(key);
+                        info!(
+                            allocations = state.allocations.len(),
+                            channels = state.channels.len(),
+                            nonces = state.nonces.len(),
+                            path = %settings.path.display(),
+                            "persist: checkpoint saved"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %settings.path.display(),
+                            error = %e,
+                            "persist: checkpoint save failed"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     /// Start a background task to periodically dump statistics
     pub fn start_stats_dump_task(&self, interval_secs: u64, skip_if_no_change: bool) {
         if interval_secs == 0 {
@@ -809,6 +939,26 @@ impl TurnServer {
 
         // Set main socket for Data Indication NAT traversal
         self.allocation_table.set_main_socket(socket.clone());
+
+        // Re-attach persisted allocations (restart restore). No-op unless
+        // `main` queued a snapshot from the state file. Runs before the
+        // receive loop starts so restored sessions are live for the very
+        // first client packet.
+        let channel_table = self.channel_table.read().await.clone();
+        let summary = self.allocation_table.restore_pending(&channel_table).await;
+        if summary.restored > 0
+            || summary.skipped_expired > 0
+            || summary.failed > 0
+            || summary.channels_restored > 0
+        {
+            info!(
+                restored = summary.restored,
+                skipped_expired = summary.skipped_expired,
+                failed = summary.failed,
+                channels_restored = summary.channels_restored,
+                "persist: session restore complete"
+            );
+        }
 
         // Optimized worker pool with stable per-client message distribution.
         //

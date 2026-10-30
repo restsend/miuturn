@@ -14,6 +14,7 @@ A high-performance TURN server written in Rust.
 - **ACL Rules**: IP-based access control with priority ordering
 - **Real-time Metrics**: Live throughput and active allocations charts
 - **Config Persistence**: UI changes auto-save to TOML
+- **Session Persistence Across Restarts**: allocations, channel bindings and nonces survive SIGTERM/SIGUSR2 restarts (`[persist]`)
 - **Prometheus Metrics**: Built-in metrics export
 - **TCP & UDP**: Dual protocol support
 
@@ -108,6 +109,13 @@ priority = 10
 ip_range = "0.0.0.0/0"
 action = "Deny"
 priority = 1
+
+# Optional: persist sessions across restarts (see "Persistence & Zero-Downtime
+# Restarts"). In Docker the state directory MUST be a mounted volume.
+# [persist]
+# enabled = true
+# path = "/var/lib/miuturn/state.json"
+# checkpoint_interval_secs = 30
 ```
 
 With `[auth].use_auth_secret = true` and a nonempty `[auth].secret`,
@@ -309,8 +317,9 @@ its token expires:
   so active media flows do not lose their channels after 600s.
 - NAT rebinding (client source port change) still breaks a TURN session by
   design (5-tuple semantics); clients handle it via ICE restart.
-- Restarting miuturn drops all in-memory allocations and nonces; clients
-  re-allocate automatically.
+- Restarting miuturn drops all in-memory allocations and nonces by default;
+  clients re-allocate automatically. Enable `[persist]` to survive restarts
+  with sessions intact — see "Persistence & Zero-Downtime Restarts" below.
 
 ## Admin Console
 
@@ -345,6 +354,141 @@ admin_password = "changeme"
 | `/api/v1/acl`              | PUT    | Update ACL rule           |
 | `/api/v1/acl`              | DELETE | Delete ACL rule           |
 | `/api/v1/turn-credentials` | POST   | Generate TURN credentials |
+
+## Persistence & Zero-Downtime Restarts
+
+miuturn can persist live session state (UDP allocations, channel bindings,
+auth nonces, lifetime counters) so a restart resumes sessions instead of
+dropping them. Clients keep sending to the **same relay addresses** — media
+freezes for the restart window (typically 1–3s under Docker) and then
+continues, without any re-Allocate or ICE restart on the client side.
+
+> **⚠️ The state file MUST live on a mounted volume in container deployments.**
+> Docker/K8s wipes everything outside volumes when a container/pod is
+> recreated. If `[persist].path` points at a container-local path (e.g. the
+> default `/var/lib/miuturn/state.json` **without** `-v miuturn-data:/var/lib/miuturn`),
+> the state dies with the old container and **every restart silently behaves
+> like the old drop-everything restart** — miuturn cannot detect this from
+> inside the container. Verify the mount once after first launch:
+>
+> ```bash
+> docker inspect -f '{{ range .Mounts }}{{ .Source }} -> {{ .Destination }}{{ "\n" }}{{ end }}' miuturn
+> # must include a line ending in -> /var/lib/miuturn
+> ```
+
+### Configuration
+
+```toml
+[persist]
+enabled = true
+# MUST be on a persistent volume in container deployments (see warning above).
+path = "/var/lib/miuturn/state.json"
+# Checkpoint cadence. Unchanged state is not rewritten; a final unconditional
+# save always happens on shutdown.
+checkpoint_interval_secs = 30
+```
+
+Persistence is **disabled by default**; without it a restart drops all
+in-memory sessions (pre-0.3 behavior).
+
+### What triggers a state save
+
+| Signal | Source | Behavior |
+| ------ | ------ | -------- |
+| SIGTERM | `docker stop`, `systemctl stop/restart`, `kill` | graceful save → exit |
+| SIGINT  | Ctrl+C | graceful save → exit |
+| SIGUSR2 | explicit restart trigger | graceful save → exit (restart policy brings it back) |
+| kill -9 / OOM / crash | — | last periodic checkpoint is used (lose at most `checkpoint_interval_secs` of allocations) |
+
+### Restore semantics
+
+On startup, if the state file exists **and** the config fingerprint matches
+(listeners, relay port range, external IP, realm, max allocation duration),
+sessions are re-attached with their original relay ports before the UDP
+receive loop starts. Otherwise the state file is rotated aside
+(`state.json.corrupt-*` / `state.json.mismatch-*`) and the server starts
+fresh — safe fallback, never a crash.
+
+Only UDP allocations are persisted. TCP/TLS client connections cannot be
+re-attached to a new process; those clients reconnect via ICE as before.
+
+### Docker deployment
+
+The state directory **must be a volume** — without it, state dies with the
+container and restarts behave like the old drop-everything restart (see the
+warning at the top of this section). Mount it explicitly:
+
+```bash
+docker run -d --name miuturn \
+  --restart unless-stopped \
+  -p 3478:3478 -p 3478:3478/udp -p 8080:8080 \
+  -v miuturn-data:/var/lib/miuturn \
+  docker.cnb.cool/miuda.ai/miuturn:latest
+```
+
+Failure modes at a glance:
+
+| Situation | What happens |
+| --------- | ------------ |
+| Volume mounted | restarts restore sessions, relay ports unchanged |
+| **No volume, container recreated** | state wiped with the container → **fresh start every time** |
+| Config changed between restarts (fingerprint mismatch) | old state rotated aside (`*.mismatch-*`) → fresh start |
+| State file corrupt | rotated aside (`*.corrupt-*`) → fresh start |
+| `docker rm` without backing out the volume | named volume survives `docker rm` of the container (only `docker volume rm` deletes it) |
+
+Upgrade flow (binary or image change):
+
+```bash
+# docker compose — `up -d` recreates the container; the SIGTERM during
+# recreation saves state, and the new container restores from the volume.
+docker compose pull && docker compose up -d
+
+# plain docker
+docker stop -t 15 miuturn     # SIGTERM → save state → exit
+docker rm miuturn
+docker run -d --name miuturn ... # same command/volume as before, new image
+```
+
+Verify the upgrade:
+
+```bash
+# The new container logs the restore summary on boot:
+docker logs miuturn 2>&1 | grep "persist:"
+# Compare active allocation counts before/after:
+curl -s http://localhost:8080/health | jq '.active_allocations'
+```
+
+Rollback: run the previous image with the same volume. If the state schema
+version changed in the newer release, the old binary starts fresh (documented
+in its release notes); sessions are lost but the service is unaffected.
+
+### Upgrade script (standalone docker run style)
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+NAME=miuturn
+IMAGE=docker.cnb.cool/miuda.ai/miuturn:NEW_TAG
+HEALTH=http://127.0.0.1:8080/health
+
+BEFORE=$(curl -s "$HEALTH" | jq -r '.active_allocations // 0')
+docker pull "$IMAGE"
+docker stop -t 15 "$NAME"
+docker rm "$NAME"
+docker run -d --name "$NAME" \
+  --restart unless-stopped \
+  -p 3478:3478 -p 3478:3478/udp -p 8080:8080 \
+  -v miuturn-data:/var/lib/miuturn \
+  "$IMAGE"
+
+for i in $(seq 1 30); do curl -sf "$HEALTH" >/dev/null && break; sleep 0.5; done
+curl -sf "$HEALTH" >/dev/null || { echo "health check failed"; exit 1; }
+
+AFTER=$(curl -s "$HEALTH" | jq -r '.active_allocations // 0')
+echo "active allocations: before=$BEFORE after=$AFTER"
+docker logs "$NAME" 2>&1 | grep "persist:"
+```
+
 
 ## Environment Variables
 
