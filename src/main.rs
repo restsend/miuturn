@@ -62,6 +62,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .map_err(|e| e.to_string())
         }));
     println!("Starting miuturn TURN server");
+    // Build identity: version + compile timestamp injected by build.rs, and
+    // the process start time — the three things a production log reader needs
+    // to know exactly which binary has been running for how long.
+    let build_time = option_env!("MIUTURN_BUILD_TIME").unwrap_or("unknown");
+    let started_at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown".into());
+    println!(
+        "Version: {} (built {} UTC) | started {} UTC",
+        env!("CARGO_PKG_VERSION"),
+        build_time,
+        started_at
+    );
     println!("Realm: {}", config.server.realm);
     println!("External IP: {}", config.server.external_ip);
     if let Some(ref relay_bind_ip) = config.server.relay_bind_ip {

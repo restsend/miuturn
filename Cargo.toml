@@ -1,6 +1,6 @@
 [package]
 name = "miuturn"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "A high-performance TURN server implemented in Rust, designed for WebRTC applications."
 authors = ["jinti<shenjindi@fourz.cn>"]
@@ -40,7 +40,7 @@ rcgen = "0.14.8"
 prometheus = "0.14.0"
 
 # Time utilities
-time = "0.3"
+time = { version = "0.3", features = ["formatting"] }
 
 # Local interface enumeration: same-server hairpin packets arrive with one of
 # the host's interface IPs as source and must be normalized to the advertised
