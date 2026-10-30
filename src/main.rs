@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer as _;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -23,15 +23,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     println!("Log level: {}", config.log.log_level);
 
-    // Build the subscriber with a reloadable EnvFilter so the log level can be
-    // changed at runtime via the admin /api/v1/reload endpoint. The writer is
-    // boxed so the subscriber type is identical for the file and console cases.
+    // Build the subscriber with a runtime-adjustable log level filter so the
+    // log level can be changed via the admin /api/v1/reload endpoint. The
+    // writer is boxed so the subscriber type is identical for the file and
+    // console cases.
     //
-    // The EnvFilter is registered as its own reloadable layer (not attached to
-    // the format layer via `with_filter`): replacing a `Filter` layer through
-    // `reload::Layer::modify` rebuilds tracing's callsite interest cache, while
-    // mutating `Filtered::filter_mut()` does not - the latter silently leaves
-    // DEBUG lines flowing after a downgrade (observed on linux deployments).
+    // DynamicLevelFilter answers Interest::sometimes() unconditionally, i.e.
+    // every event consults the live atomic level - no callsite interest cache
+    // is involved, so reload takes effect immediately on every platform.
+    // (EnvFilter + reload::Layer::modify is correct per tracing-subscriber's
+    // docs but the interest-cache rebuild never took effect in linux
+    // containers, leaving the boot-time level in force - see AGENTS.md.)
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -45,24 +47,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
         };
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&config.log.log_level));
+    let log_filter = miuturn::logfilter::DynamicLevelFilter::new(&config.log.log_level);
 
-    let (filter_layer, filter_reload) = tracing_subscriber::reload::Layer::new(env_filter);
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(writer)
-        .with_ansi(config.log.log_file.is_none());
+        .with_ansi(config.log.log_file.is_none())
+        .with_filter(log_filter.clone());
 
-    tracing_subscriber::Registry::default()
-        .with(filter_layer)
-        .with(fmt_layer)
-        .init();
+    tracing_subscriber::Registry::default().with(fmt_layer).init();
 
     let log_reload: Option<Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>> =
         Some(Arc::new(move |level: &str| {
-            filter_reload
-                .modify(|filter| *filter = EnvFilter::new(level))
-                .map_err(|e| e.to_string())
+            log_filter.set_level(level);
+            Ok(())
         }));
     println!("Starting miuturn TURN server");
     // Build identity: version + compile timestamp injected by build.rs, and

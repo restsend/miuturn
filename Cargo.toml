@@ -1,6 +1,6 @@
 [package]
 name = "miuturn"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 description = "A high-performance TURN server implemented in Rust, designed for WebRTC applications."
 authors = ["jinti<shenjindi@fourz.cn>"]
@@ -38,6 +38,9 @@ rcgen = "0.14.8"
 
 # Prometheus metrics (custom implementation)
 prometheus = "0.14.0"
+
+# Direct access to Interest/LevelFilter for the dynamic log-level filter
+tracing-core = "0.1"
 
 # Time utilities
 time = { version = "0.3", features = ["formatting"] }
