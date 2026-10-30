@@ -73,7 +73,10 @@ impl DynamicLevelFilter {
     pub fn set_level(&self, level: &str) -> bool {
         match parse_level(level) {
             Some(rank) => {
-                self.level.store(rank, Ordering::Relaxed);
+                let old = self.level.swap(rank, Ordering::Relaxed);
+                if std::env::var_os("MIUTURN_FILTER_DEBUG").is_some() {
+                    eprintln!("[F] set_level({level}) old={old} new={rank}");
+                }
                 true
             }
             None => false,
@@ -93,7 +96,16 @@ impl<S: tracing::Subscriber> Filter<S> for DynamicLevelFilter {
     }
 
     fn enabled(&self, metadata: &tracing::Metadata<'_>, _ctx: &Context<'_, S>) -> bool {
-        rank_of(metadata.level()) <= self.level.load(Ordering::Relaxed)
+        let result = rank_of(metadata.level()) <= self.level.load(Ordering::Relaxed);
+        if std::env::var_os("MIUTURN_FILTER_DEBUG").is_some() {
+            eprintln!(
+                "[F] enabled(level={}) -> {} (current={})",
+                metadata.level(),
+                result,
+                self.level.load(Ordering::Relaxed)
+            );
+        }
+        result
     }
 
     /// Keep the hint at TRACE so no registry short-circuit can ever skip a
