@@ -617,6 +617,7 @@ async fn reload_handler(jar: CookieJar, State(state): State<AppState>) -> Json<s
         "restart_required": [
             "server.realm",
             "server.external_ip",
+            "server.auto_external_ip",
             "server.relay_bind_ip",
             "server.start_port",
             "server.end_port",

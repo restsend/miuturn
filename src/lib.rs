@@ -3,6 +3,7 @@ pub mod auth;
 pub mod bandwidth;
 pub mod config;
 pub mod errors;
+pub mod external_ip;
 pub mod health;
 pub mod message;
 pub mod metrics;
@@ -28,6 +29,7 @@ pub use config::{
     ServerConfig, UserConfig,
 };
 pub use errors::Error;
+pub use external_ip::resolve as resolve_external_ip;
 pub use health::create_admin_routes;
 pub use message::{
     Attribute, ErrorCode, EventType, Message, MessageHeader, Method, decode_xor_address,

@@ -11,7 +11,7 @@ use tracing_subscriber::Layer as _;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config_path = std::env::var("CONFIG").unwrap_or_else(|_| "miuturn.toml".to_string());
-    let config = match Config::load(PathBuf::from(&config_path)) {
+    let mut config = match Config::load(PathBuf::from(&config_path)) {
         Ok(cfg) => {
             println!("Loaded configuration from {}", config_path);
             cfg
@@ -61,6 +61,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             log_filter.set_level(level);
             Ok(())
         }));
+
+    // Startup public-IP discovery (`server.auto_external_ip`). The resolved
+    // address replaces external_ip for everything downstream (relay advertising,
+    // admin console, persistence fingerprint). A transient network failure must
+    // never keep the TURN server down, so fall back to the configured value.
+    if let Some(spec) = config.server.auto_external_ip.clone() {
+        match miuturn::resolve_external_ip(&spec).await {
+            Ok(ip) => {
+                info!(
+                    source = %spec,
+                    external_ip = %ip,
+                    "auto external IP resolved"
+                );
+                config.server.external_ip = ip.to_string();
+            }
+            Err(e) => {
+                warn!(
+                    source = %spec,
+                    error = %e,
+                    fallback = %config.server.external_ip,
+                    "auto external IP discovery failed; using configured server.external_ip"
+                );
+            }
+        }
+    }
+
     println!("Starting miuturn TURN server");
     // Build identity: version + compile timestamp injected by build.rs, and
     // the process start time — the three things a production log reader needs

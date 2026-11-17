@@ -60,7 +60,16 @@ impl Default for PersistConfig {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServerConfig {
     pub realm: String,
+    /// Relay address advertised to clients. Used as-is unless
+    /// `auto_external_ip` succeeds at startup, in which case the discovered
+    /// address replaces this value at runtime.
     pub external_ip: String,
+    /// Optional HTTP(S) endpoint that reports the machine's public IPv4
+    /// address, fetched once at startup (e.g. `"https://ifconfig.me"`), or an
+    /// environment-variable reference (`"$IP_URL"` / `"${IP_URL}"`).
+    /// On failure the server logs a warning and keeps `external_ip`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_external_ip: Option<String>,
     #[serde(default)]
     pub relay_bind_ip: Option<String>,
     pub start_port: u16,
@@ -266,6 +275,7 @@ impl Default for Config {
             server: ServerConfig {
                 realm: "miuturn".to_string(),
                 external_ip: "0.0.0.0".to_string(),
+                auto_external_ip: None,
                 relay_bind_ip: None,
                 start_port: 49152,
                 end_port: 65535,
@@ -327,6 +337,38 @@ mod tests {
         assert_eq!(config.server.start_port, 49152);
         assert_eq!(config.server.end_port, 65535);
         assert!(config.server.max_concurrent_allocations.is_none());
+        assert!(config.server.auto_external_ip.is_none());
+    }
+
+    #[test]
+    fn test_auto_external_ip_parses_and_is_optional() {
+        let toml_content = r#"
+[server]
+realm = "r"
+external_ip = "0.0.0.0"
+auto_external_ip = "https://ifconfig.me"
+start_port = 49152
+end_port = 65535
+
+[[server.listening]]
+protocol = "udp"
+address = "0.0.0.0:3478"
+
+[auth]
+users = []
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(
+            config.server.auto_external_ip.as_deref(),
+            Some("https://ifconfig.me")
+        );
+
+        // Absent → None, and a default config round-trips without the field.
+        let config2 = Config::default();
+        let serialized = toml::to_string_pretty(&config2).unwrap();
+        assert!(!serialized.contains("auto_external_ip"));
+        let restored: Config = toml::from_str(&serialized).unwrap();
+        assert!(restored.server.auto_external_ip.is_none());
     }
 
     #[test]

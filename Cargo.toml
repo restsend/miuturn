@@ -1,6 +1,6 @@
 [package]
 name = "miuturn"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2024"
 description = "A high-performance TURN server implemented in Rust, designed for WebRTC applications."
 authors = ["jinti<shenjindi@fourz.cn>"]
@@ -52,6 +52,12 @@ if-addrs = "0.14"
 
 # CPU detection for worker pool sizing
 num_cpus = "1.17"
+
+# Public-IP discovery for `server.auto_external_ip` (startup only). The tiny
+# HTTP(S) client uses rustls (aws-lc-rs provider, already enabled by the rustls
+# dependency above) with bundled Mozilla roots, so the runtime image needs
+# neither OpenSSL nor a system CA store.
+webpki-roots = "1"
 
 # Session management for admin console
 axum-extra = { version = "0.12", features = ["cookie"] }

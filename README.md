@@ -50,6 +50,11 @@ Create `miuturn.toml`:
 [server]
 realm = "miuturn"
 external_ip = "YOUR PUBLIC IP HERE"
+# Optional: discover the public IPv4 at startup instead of hardcoding it.
+# Fetched once from an http(s) endpoint; on failure external_ip is used.
+#auto_external_ip = "https://ifconfig.me"
+# Or read the URL/IP from an environment variable:
+#auto_external_ip = "$PUBLIC_IP_ENDPOINT"
 relay_bind_ip = "0.0.0.0"
 start_port = 49152
 end_port = 65535
@@ -154,6 +159,17 @@ on the servers and fetch fresh ICE configuration before the credentials expire.
 
 `external_ip` is the relay address advertised back to clients.
 `relay_bind_ip` is the local interface used to bind relay sockets. If omitted, it defaults to `0.0.0.0`. In NAT deployments, set `external_ip` to the public IP and keep `relay_bind_ip` as `0.0.0.0` (or a specific local interface IP if needed).
+
+`auto_external_ip` optionally replaces `external_ip` at startup with the public
+IPv4 returned by an HTTP(S) "what is my IP" service (only `http://` and
+`https://` URLs are supported; the first IPv4 literal in the body is used, so
+JSON endpoints work too). The value may also be an environment-variable
+reference — `"$IP_URL"` or `"${IP_URL}"` — expanded once at startup; the
+variable's value can be a URL or a literal IPv4. It is a startup-only setting:
+changing it requires a restart (the admin reload endpoint reports it under
+`restart_required`). If the request fails or times out (5 s), miuturn logs a
+warning and keeps `external_ip`, so a temporary network problem never prevents
+startup.
 
 ## Agent-Issued TURN Tokens (shared secret)
 

@@ -5,6 +5,14 @@ log_level="info"
 [server]
 realm = "miuda.ai"
 external_ip = "0.0.0.0"
+# Optional: fetch the public IPv4 at startup from an HTTP(S) "what is my IP"
+# endpoint instead of hardcoding external_ip. Both plain-text ("1.2.3.4") and
+# JSON ({"ip":"1.2.3.4"}) responses work. If the request fails, miuturn logs a
+# warning and falls back to external_ip above, so startup is never blocked.
+#auto_external_ip = "https://ifconfig.me"
+#auto_external_ip = "https://api.ipify.org"
+# Env-var form (docker -e / systemd Environment=): the value may be a URL or IP.
+#auto_external_ip = "$PUBLIC_IP_ENDPOINT"
 relay_bind_ip = "0.0.0.0"
 start_port = 49152
 end_port = 65535
