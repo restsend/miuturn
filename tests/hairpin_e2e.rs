@@ -223,5 +223,25 @@ async fn same_server_relay_relay_is_bidirectional_on_advertised_addresses() {
     let data = attr(&tlvs, 0x0013).expect("DATA");
     assert_eq!(data, b"serverhello-from-b");
 
+    // Pacing diagnostics must observe the relay in both directions on both
+    // allocations (tx at the sender's allocation, rx at the receiver's).
+    let now = miuturn::pacing::monotonic_ms();
+    let pacing = server.allocation_table.pacing_snapshot(now);
+    assert_eq!(pacing.len(), 2, "both allocations must report pacing");
+    for c in &pacing {
+        assert!(
+            c.rx.packets >= 1,
+            "peer→client traffic not recorded for {}",
+            c.relayed_addr
+        );
+        assert!(
+            c.tx.packets >= 1,
+            "client→peer traffic not recorded for {}",
+            c.relayed_addr
+        );
+        assert!(c.rx.window_packets >= 1);
+        assert!(c.tx.window_packets >= 1);
+    }
+
     handle.abort();
 }

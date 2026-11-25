@@ -1,4 +1,4 @@
-use crate::allocation::{AllocationTable, ChannelTable, ServerStatsSnapshot};
+use crate::allocation::{AllocationTable, ChannelTable, ConnPacing, ServerStatsSnapshot};
 use crate::auth::{AuthManager, User, UserType};
 use crate::config::ExpiredTokenPolicy;
 use crate::message::{
@@ -95,6 +95,7 @@ struct BackgroundTaskFlags {
     allocation_cleanup: std::sync::atomic::AtomicBool,
     stats_dump: std::sync::atomic::AtomicBool,
     checkpoint: std::sync::atomic::AtomicBool,
+    pacing_report: std::sync::atomic::AtomicBool,
 }
 
 impl BackgroundTaskFlags {
@@ -166,6 +167,108 @@ struct AuthInfo {
     /// Expiry of the ephemeral token (unix seconds) if the request was
     /// authenticated with an ephemeral credential.
     token_expires_at: Option<u64>,
+}
+
+/// A relay gap at least this long is reported as a `[PACE-STALL]` event.
+const PACING_STALL_EVENT_MS: u64 = 300;
+/// Maximum per-connection detail lines of each kind per report tick. Prevents a
+/// global stall (every connection affected) from flooding the log.
+const PACING_MAX_DETAIL_LINES: usize = 10;
+
+/// Emit one pacing report.
+///
+/// Split from the reporting task so the log format and the anti-flood caps can
+/// be unit-tested without sleeping for a tick.
+fn log_pacing_report(conns: &[ConnPacing], now_ms: u64) {
+    if conns.is_empty() {
+        return;
+    }
+
+    let rx_pps: f64 = conns.iter().map(|c| c.rx.pps).sum();
+    let tx_pps: f64 = conns.iter().map(|c| c.tx.pps).sum();
+    let rx_bps: f64 = conns.iter().map(|c| c.rx.bps).sum();
+    let stalled = conns
+        .iter()
+        .filter(|c| c.rx_gap_ms >= PACING_STALL_EVENT_MS || c.tx_gap_ms >= PACING_STALL_EVENT_MS)
+        .count();
+    let worst_rx = conns.iter().map(|c| c.rx_gap_ms).max().unwrap_or(0);
+    let worst_tx = conns.iter().map(|c| c.tx_gap_ms).max().unwrap_or(0);
+    let stalls = crate::pacing::stall_snapshot(now_ms);
+
+    // L1: always-on summary. One line per tick regardless of connection count.
+    tracing::info!(
+        target: "miuturn::pacing",
+        conns = conns.len(),
+        rx_pps = format_args!("{rx_pps:.0}"),
+        tx_pps = format_args!("{tx_pps:.0}"),
+        rx_mbps = format_args!("{:.2}", rx_bps * 8.0 / 1_000_000.0),
+        gaps_over_300ms = stalled,
+        worst_rx_gap_ms = worst_rx,
+        worst_tx_gap_ms = worst_tx,
+        global_stall_slots_3s = stalls.slots_with_multiple,
+        max_conns_stalled_together = stalls.max_conns_in_slot,
+        "[PACE] relay pacing summary (per-conn window 3.2s)"
+    );
+
+    // L3: individual stall events, worst first, capped.
+    let mut worst: Vec<&ConnPacing> = conns
+        .iter()
+        .filter(|c| c.rx_gap_ms >= PACING_STALL_EVENT_MS || c.tx_gap_ms >= PACING_STALL_EVENT_MS)
+        .collect();
+    worst.sort_by_key(|c| c.rx_gap_ms.max(c.tx_gap_ms));
+    for c in worst.iter().rev().take(PACING_MAX_DETAIL_LINES) {
+        let (dir, gap, snap) = if c.rx_gap_ms >= c.tx_gap_ms {
+            ("rx", c.rx_gap_ms, &c.rx)
+        } else {
+            ("tx", c.tx_gap_ms, &c.tx)
+        };
+        tracing::warn!(
+            target: "miuturn::pacing",
+            direction = dir,
+            gap_ms = gap,
+            relayed = %c.relayed_addr,
+            client = %c.client_addr,
+            user = c.username.as_deref().unwrap_or("-"),
+            pps = format_args!("{:.1}", snap.pps),
+            burst_ratio = format_args!("{:.1}", snap.burst_ratio),
+            slots_100ms = ?&snap.recent[..],
+            peers_stalled_same_slot = stalls.max_conns_in_slot,
+            "[PACE-STALL] relay gap on connection"
+        );
+    }
+
+    // L2: bursty-but-not-stalled connections, debug only.
+    let mut bursty: Vec<&ConnPacing> = conns
+        .iter()
+        .filter(|c| {
+            c.rx.zero_run >= 2
+                || c.tx.zero_run >= 2
+                || c.rx.burst_ratio >= 5.0
+                || c.tx.burst_ratio >= 5.0
+        })
+        .collect();
+    bursty.sort_by(|a, b| {
+        let ka = a.rx.burst_ratio.max(a.tx.burst_ratio);
+        let kb = b.rx.burst_ratio.max(b.tx.burst_ratio);
+        kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for c in bursty.iter().take(PACING_MAX_DETAIL_LINES) {
+        tracing::debug!(
+            target: "miuturn::pacing",
+            relayed = %c.relayed_addr,
+            client = %c.client_addr,
+            user = c.username.as_deref().unwrap_or("-"),
+            rx_pps = format_args!("{:.1}", c.rx.pps),
+            tx_pps = format_args!("{:.1}", c.tx.pps),
+            rx_cv = format_args!("{:.2}", c.rx.cv),
+            tx_cv = format_args!("{:.2}", c.tx.cv),
+            rx_burst = format_args!("{:.1}", c.rx.burst_ratio),
+            tx_burst = format_args!("{:.1}", c.tx.burst_ratio),
+            rx_zero_slots = c.rx.zero_run,
+            tx_zero_slots = c.tx.zero_run,
+            "[PACE] bursty relay connection"
+        );
+    }
 }
 
 impl TurnServer {
@@ -706,7 +809,42 @@ impl TurnServer {
         });
     }
 
-    /// Start a background task to clean up expired allocations
+    /// Start the relay pacing reporter.
+    ///
+    /// Every 10 s this prints:
+    /// * one `[PACE]` summary line (info) — aggregate rate, worst gaps and how
+    ///   many connections stalled *together* (global stall) vs alone;
+    /// * up to 10 `[PACE]` per-connection anomaly lines (debug) — the
+    ///   connections whose traffic is bursty rather than even;
+    /// * up to 10 `[PACE-STALL]` event lines (warn) — connections whose worst
+    ///   gap exceeded 300 ms in this interval, with their last 1.6 s of 100 ms
+    ///   packet buckets (e.g. `0,0,0,0,38` = a hole followed by a catch-up).
+    ///
+    /// Detail lines are rate-limited and capped, so a global stall affecting
+    /// every connection still produces a bounded number of lines.
+    pub fn start_pacing_report_task(&self) {
+        const INTERVAL_SECS: u64 = 10;
+
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        if !BackgroundTaskFlags::claim(&self.bg_tasks.pacing_report) {
+            return;
+        }
+
+        let table = self.allocation_table.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(INTERVAL_SECS));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let now_ms = crate::pacing::monotonic_ms();
+                log_pacing_report(&table.pacing_snapshot(now_ms), now_ms);
+            }
+        });
+    }
+
+    /// Start the background task to clean up expired allocations
     pub fn start_allocation_cleanup_task(&self) {
         let allocation_table = self.allocation_table.clone();
         let channel_table = self.channel_table.clone();
@@ -933,6 +1071,7 @@ impl TurnServer {
             self.stats_dump_interval_secs,
             self.stats_dump_skip_if_no_change,
         );
+        self.start_pacing_report_task();
 
         let socket = Arc::new(UdpSocket::bind(addr).await?);
         info!("TURN UDP server listening on {}", addr);
@@ -1060,9 +1199,13 @@ async fn handle_tcp_message(
             // An unbound channel is silently dropped per RFC 5766 §11.
             let allocation = server.allocation_table.get_allocation_by_client(&peer_addr);
             let relayed_addr = allocation.as_ref().map(|alloc| alloc.read().relayed_addr);
-            let table = server.channel_table.read().await;
+            // Clone the Arc-backed table and drop the Tokio read guard before
+            // the relay await: the lookup below is the media hot path and must
+            // not pin a guard across an await point.
+            let table = server.channel_table.read().await.clone();
             let channel_peer = if let Some(relayed_addr) = relayed_addr {
-                table.get_by_channel(relayed_addr, channel_num)
+                table
+                    .get_by_channel_touching(relayed_addr, channel_num)
                     .map(|binding| binding.peer_addr)
             } else {
                 None
@@ -1072,9 +1215,7 @@ async fn handle_tcp_message(
                 Some(peer) => {
                     // Keep the binding alive: client traffic on a bound channel
                     // refreshes its activity timestamp (same behavior as coturn).
-                    if let Some(relayed_addr) = relayed_addr {
-                        table.refresh_binding(relayed_addr, channel_num);
-                    }
+                    // The touch already happened in `get_by_channel_touching`.
                     if server
                         .allocation_table
                         .send_to_peer(&peer_addr, peer, &payload)
@@ -1142,9 +1283,12 @@ async fn handle_udp_message(
         // RFC 5766 §11 — logged with the channel number for field diagnosis.
         let allocation = server.allocation_table.get_allocation_by_client(&peer_addr);
         let relayed_addr = allocation.as_ref().map(|alloc| alloc.read().relayed_addr);
-        let table = server.channel_table.read().await;
+        // Clone the Arc-backed table and drop the Tokio read guard before the
+        // relay await (see handle_allocate): the lookup is the media hot path.
+        let table = server.channel_table.read().await.clone();
         let channel_peer = if let Some(relayed_addr) = relayed_addr {
-            table.get_by_channel(relayed_addr, channel_num)
+            table
+                .get_by_channel_touching(relayed_addr, channel_num)
                 .map(|binding| binding.peer_addr)
         } else {
             None
@@ -1154,9 +1298,7 @@ async fn handle_udp_message(
             Some(peer) => {
                 // Keep the binding alive: client traffic on a bound channel
                 // refreshes its activity timestamp (same behavior as coturn).
-                if let Some(relayed_addr) = relayed_addr {
-                    table.refresh_binding(relayed_addr, channel_num);
-                }
+                // The touch already happened in `get_by_channel_touching`.
                 if server
                     .allocation_table
                     .send_to_peer(&peer_addr, peer, &payload)
@@ -3596,5 +3738,126 @@ mod tests {
         let parsed = Message::parse(&response).unwrap();
         assert_eq!(parsed.header.event_type, EventType::Error);
         assert_eq!(error_code_of(&parsed), Some(401));
+    }
+
+    // -------------------------------------------------------------------
+    // Pacing report: log format + anti-flood caps
+    // -------------------------------------------------------------------
+
+    /// Captures tracing output on the current thread.
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> LogBuf {
+            self.clone()
+        }
+    }
+
+    fn pacing_snap(pps: f64, burst_ratio: f64, zero_run: u32) -> crate::pacing::DirectionSnapshot {
+        crate::pacing::DirectionSnapshot {
+            packets: 100,
+            bytes: 120_000,
+            window_packets: 100,
+            active_slots: 10,
+            max_slot: 30,
+            zero_run,
+            pps,
+            bps: pps * 1200.0,
+            cv: 0.3,
+            burst_ratio,
+            recent: [0; crate::pacing::RECENT_SLOTS],
+        }
+    }
+
+    fn conn(i: u8, rx_gap: u64, burst: f64) -> ConnPacing {
+        ConnPacing {
+            relayed_addr: format!("10.0.0.{i}:50000").parse().unwrap(),
+            client_addr: format!("192.168.0.{i}:40000").parse().unwrap(),
+            username: Some(format!("user{i}")),
+            rx_gap_ms: rx_gap,
+            tx_gap_ms: 0,
+            rx: pacing_snap(50.0, burst, if burst > 5.0 { 3 } else { 0 }),
+            tx: pacing_snap(50.0, 1.0, 0),
+        }
+    }
+
+    #[test]
+    fn pacing_report_has_bounded_output_and_a_summary() {
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+
+        // 40 connections: 25 stalled (>300 ms gap) and 15 bursty (no stall).
+        let mut conns: Vec<ConnPacing> = Vec::new();
+        for i in 0..25u8 {
+            conns.push(conn(i, 400, 1.0));
+        }
+        for i in 25..40u8 {
+            conns.push(conn(i, 10, 8.0));
+        }
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_pacing_report(&conns, crate::pacing::monotonic_ms());
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            out.matches("[PACE] relay pacing summary").count(),
+            1,
+            "exactly one summary line per tick:\n{out}"
+        );
+        assert!(
+            out.contains("gaps_over_300ms=25"),
+            "summary must count every stalled connection:\n{out}"
+        );
+        assert_eq!(
+            out.matches("[PACE-STALL]").count(),
+            PACING_MAX_DETAIL_LINES,
+            "stall detail lines must be capped:\n{out}"
+        );
+        assert_eq!(
+            out.matches("[PACE] bursty relay connection").count(),
+            PACING_MAX_DETAIL_LINES,
+            "burst detail lines must be capped:\n{out}"
+        );
+        assert!(out.contains("direction=\"rx\""), "direction field:\n{out}");
+        assert!(out.contains("slots_100ms="), "bucket series:\n{out}");
+
+        // Worst case: every connection stalled. Only WARN is enabled here, so
+        // this also proves the summary is info-level and the detail is not.
+        let all_stalled: Vec<ConnPacing> = (0..50u8).map(|i| conn(i, 500, 1.0)).collect();
+        let buf2 = LogBuf::default();
+        let subscriber2 = tracing_subscriber::fmt()
+            .with_writer(buf2.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber2, || {
+            log_pacing_report(&all_stalled, crate::pacing::monotonic_ms());
+        });
+        let out2 = String::from_utf8(buf2.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            out2.matches("[PACE-STALL]").count(),
+            PACING_MAX_DETAIL_LINES
+        );
+        assert!(
+            !out2.contains("relay pacing summary"),
+            "summary must stay at info level:\n{out2}"
+        );
     }
 }

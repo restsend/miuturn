@@ -1710,4 +1710,40 @@ mod persistence_tests {
             "expired nonce must not be restored"
         );
     }
+
+    /// Pacing state must live in (and die with) the allocation: no global
+    /// per-connection registry, so teardown cannot leak accounting data.
+    #[tokio::test]
+    async fn test_pacing_state_is_freed_with_the_allocation() {
+        let client: SocketAddr = make_addr("192.168.7.44", 44444);
+        let table = table_for_range(RANGE_START, RANGE_END);
+        let channel_table = ChannelTable::new();
+        let relayed = make_allocation(&table, &channel_table, client).await;
+
+        let now = crate::pacing::monotonic_ms();
+        let snap = table.pacing_snapshot(now);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].relayed_addr, relayed);
+        assert_eq!(snap[0].rx.packets, 0);
+
+        // Per-direction counters are per allocation, not server-wide.
+        {
+            let alloc = table.get_allocation(&relayed).expect("live allocation");
+            let a = alloc.read();
+            a.rx_pacer.record(now + 1, 1200);
+            a.rx_pacer.record(now + 21, 1200);
+            a.tx_pacer.record(now + 1, 1200);
+        }
+        let snap = table.pacing_snapshot(now + 21);
+        assert_eq!(snap[0].rx.packets, 2);
+        assert_eq!(snap[0].rx.bytes, 2400);
+        assert_eq!(snap[0].tx.packets, 1);
+
+        // Tearing the allocation down leaves no pacing state behind.
+        table.remove_allocation(&relayed, Some(&channel_table));
+        assert!(
+            table.pacing_snapshot(now + 100).is_empty(),
+            "pacing state outlived its allocation"
+        );
+    }
 }

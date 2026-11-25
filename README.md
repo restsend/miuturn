@@ -337,6 +337,46 @@ its token expires:
   clients re-allocate automatically. Enable `[persist]` to survive restarts
   with sessions intact — see "Persistence & Zero-Downtime Restarts" below.
 
+## Relay Pacing Diagnostics
+
+Every 10 s miuturn logs one `[PACE]` summary line per server process:
+
+```
+[PACE] relay pacing summary (per-conn window 3.2s) conns=1200 rx_pps=59800
+  tx_pps=59720 rx_mbps=61.30 gaps_over_300ms=3 worst_rx_gap_ms=412
+  worst_tx_gap_ms=0 global_stall_slots_3s=0 max_conns_stalled_together=0
+```
+
+* `conns` — live allocations sampled.
+* `rx_pps` / `tx_pps` / `rx_mbps` — aggregate peer→client and client→peer rates.
+* `gaps_over_300ms` — connections whose worst inter-packet gap in this interval
+  exceeded 300 ms. This is the number that explains client-side "audio arrives
+  in batches" reports.
+* `global_stall_slots_3s` / `max_conns_stalled_together` — how many 100 ms slots
+  in the last 3.2 s had **two or more** connections stall at the same moment.
+  Non-zero means a server-side stall (CPU throttling, runtime starvation), not
+  per-link pacing.
+
+When a connection's worst gap exceeds 300 ms, one `[PACE-STALL]` line is logged
+per affected connection (capped at 10 per interval, worst first):
+
+```
+[PACE-STALL] relay gap on connection direction="rx" gap_ms=412
+  relayed=203.0.113.5:50122 client=10.0.0.8:52114 user="agent-17" pps=48.9
+  burst_ratio=4.2 slots_100ms=[5, 5, 5, 0, 0, 0, 0, 1, 38, 5, 5, 5, ...]
+```
+
+`slots_100ms` is the most recent 1.6 s of 100 ms packet buckets (oldest first).
+An even 20 ms stream shows a flat `5, 5, 5, ...`; `0, 0, 0, 0, 38` is a hole
+followed by a catch-up burst — exactly the shape a client jitter buffer reports
+as batching.
+
+Set `log_level = "debug"` (hot-reloadable via `POST /api/v1/reload`) to also get
+one `[PACE] bursty relay connection` line per interval for connections that are
+uneven but not stalled (`zero_run` / `burst_ratio`), capped at 10 per interval.
+The per-connection accounting costs ~30 ns per relayed packet and no locks; the
+counters live in the allocation and are freed with it.
+
 ## Admin Console
 
 Access the web UI at `http://localhost:8080/console`

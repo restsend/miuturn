@@ -1,4 +1,5 @@
 use crate::errors::Error;
+use crate::pacing::{DirectionPacer, DirectionSnapshot, monotonic_ms};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -110,6 +111,10 @@ pub struct Allocation {
     pub bytes_forwarded: Arc<AtomicU64>,
     /// Messages successfully relayed through this allocation
     pub messages_forwarded: Arc<AtomicU64>,
+    /// Arrival pacing of peer→client media (see `pacing`).
+    pub rx_pacer: Arc<DirectionPacer>,
+    /// Send pacing of client→peer media (see `pacing`).
+    pub tx_pacer: Arc<DirectionPacer>,
     /// Authenticated username that created this allocation (used for the
     /// NAT-rebind Refresh fallback lookup).
     pub username: Option<String>,
@@ -141,6 +146,8 @@ impl Allocation {
             permissions: Arc::new(RwLock::new(std::collections::HashSet::new())),
             bytes_forwarded: Arc::new(AtomicU64::new(0)),
             messages_forwarded: Arc::new(AtomicU64::new(0)),
+            rx_pacer: Arc::new(DirectionPacer::new()),
+            tx_pacer: Arc::new(DirectionPacer::new()),
             username: None,
         }
     }
@@ -167,6 +174,8 @@ impl Allocation {
             permissions,
             bytes_forwarded: Arc::new(AtomicU64::new(0)),
             messages_forwarded: Arc::new(AtomicU64::new(0)),
+            rx_pacer: Arc::new(DirectionPacer::new()),
+            tx_pacer: Arc::new(DirectionPacer::new()),
             username: None,
         }
     }
@@ -506,6 +515,20 @@ pub struct ServerStatsSnapshot {
     pub total_messages: u64,
 }
 
+/// Pacing picture for one live allocation (see [`AllocationTable::pacing_snapshot`]).
+#[derive(Debug, Clone)]
+pub struct ConnPacing {
+    pub relayed_addr: SocketAddr,
+    pub client_addr: SocketAddr,
+    pub username: Option<String>,
+    /// Largest peer→client gap since the previous sweep.
+    pub rx_gap_ms: u64,
+    /// Largest client→peer gap since the previous sweep.
+    pub tx_gap_ms: u64,
+    pub rx: DirectionSnapshot,
+    pub tx: DirectionSnapshot,
+}
+
 impl AllocationTable {
     pub fn new(addr: Ipv4Addr, realm: String) -> Self {
         Self::with_limits(addr, realm, None, None, None)
@@ -752,6 +775,8 @@ impl AllocationTable {
             let main = main_socket
                 .clone()
                 .unwrap_or_else(|| relay_socket.clone());
+            let rx_pacer = Arc::new(DirectionPacer::new());
+            let tx_pacer = Arc::new(DirectionPacer::new());
             let relay = spawn_allocation_task(
                 relay_socket.clone(),
                 main,
@@ -764,6 +789,7 @@ impl AllocationTable {
                 self.bandwidth_manager.clone(),
                 self.local_ips.clone(),
                 self.enforce_peer_permissions.load(Ordering::Relaxed),
+                rx_pacer.clone(),
             )
             .await;
 
@@ -782,6 +808,8 @@ impl AllocationTable {
                 permissions,
                 bytes_forwarded: Arc::new(AtomicU64::new(saved.bytes_forwarded)),
                 messages_forwarded: Arc::new(AtomicU64::new(saved.messages_forwarded)),
+                rx_pacer,
+                tx_pacer,
                 username: saved.username.clone(),
             };
 
@@ -1015,6 +1043,8 @@ impl AllocationTable {
         let main_socket = recv_socket
             .or_else(|| self.main_socket.read().clone())
             .unwrap_or_else(|| relay_socket.clone());
+        let rx_pacer = Arc::new(DirectionPacer::new());
+        let tx_pacer = Arc::new(DirectionPacer::new());
         let relay = spawn_allocation_task(
             relay_socket.clone(),
             main_socket, // Use main socket for sending Data Indication
@@ -1027,10 +1057,11 @@ impl AllocationTable {
             self.bandwidth_manager.clone(),
             self.local_ips.clone(),
             self.enforce_peer_permissions.load(Ordering::Relaxed),
+            rx_pacer.clone(),
         )
         .await;
 
-        let allocation = Arc::new(RwLock::new(Allocation::with_relay(
+        let mut allocation = Allocation::with_relay(
             id,
             relayed_addr,
             client_addr,
@@ -1039,7 +1070,10 @@ impl AllocationTable {
             relayed_addr,
             relay,
             permissions,
-        )));
+        );
+        allocation.rx_pacer = rx_pacer;
+        allocation.tx_pacer = tx_pacer;
+        let allocation = Arc::new(RwLock::new(allocation));
 
         // Insert into both maps. Lock order is always `allocations` then
         // `by_client` to avoid deadlocks.
@@ -1310,6 +1344,7 @@ impl AllocationTable {
                 from_relayed: SocketAddr,
                 sender_bytes: Arc<AtomicU64>,
                 sender_msgs: Arc<AtomicU64>,
+                pacer: Arc<DirectionPacer>,
             },
             External {
                 socket: Arc<UdpSocket>,
@@ -1317,6 +1352,7 @@ impl AllocationTable {
                 permission_count: usize,
                 bytes_fwd: Arc<AtomicU64>,
                 msgs_fwd: Arc<AtomicU64>,
+                pacer: Arc<DirectionPacer>,
             },
         }
 
@@ -1368,6 +1404,7 @@ impl AllocationTable {
                         from_relayed: a.relayed_addr,
                         sender_bytes: a.bytes_forwarded.clone(),
                         sender_msgs: a.messages_forwarded.clone(),
+                        pacer: a.tx_pacer.clone(),
                     });
                 } else {
                     debug!(
@@ -1387,6 +1424,7 @@ impl AllocationTable {
                         permission_count,
                         bytes_fwd: a.bytes_forwarded.clone(),
                         msgs_fwd: a.messages_forwarded.clone(),
+                        pacer: a.tx_pacer.clone(),
                     }),
                     None => {
                         debug!(
@@ -1409,6 +1447,7 @@ impl AllocationTable {
                 from_relayed,
                 sender_bytes,
                 sender_msgs,
+                pacer,
             }) => {
                 // Enforce the sender-side bandwidth budget like the external path.
                 if !self.bandwidth_manager.try_relay(&from_relayed, data.len()) {
@@ -1442,6 +1481,7 @@ impl AllocationTable {
                 self.stats.total_messages.fetch_add(1, Ordering::Relaxed);
                 sender_bytes.fetch_add(n, Ordering::Relaxed);
                 sender_msgs.fetch_add(1, Ordering::Relaxed);
+                pacer.record(monotonic_ms(), data.len());
                 return Some(());
             }
             Some(Route::External {
@@ -1450,6 +1490,7 @@ impl AllocationTable {
                 permission_count,
                 bytes_fwd,
                 msgs_fwd,
+                pacer,
             }) => {
                 // Enforce the (global) bandwidth budget before sending.
                 if !self.bandwidth_manager.try_relay(&relayed_addr, data.len()) {
@@ -1481,6 +1522,7 @@ impl AllocationTable {
                 self.stats.total_messages.fetch_add(1, Ordering::Relaxed);
                 bytes_fwd.fetch_add(n, Ordering::Relaxed);
                 msgs_fwd.fetch_add(1, Ordering::Relaxed);
+                pacer.record(monotonic_ms(), data.len());
                 return Some(());
             }
             None => {}
@@ -1519,6 +1561,32 @@ impl AllocationTable {
             self.port_allocator.allocated_count(),
             self.port_allocator.available_count(),
         )
+    }
+
+    /// Snapshot relay pacing for every live allocation.
+    ///
+    /// Called once per report tick. Holds `allocations.read()` only for the
+    /// pass (same pattern as `export_persisted`); the returned `Vec` is dropped
+    /// by the caller, so no per-connection state is retained anywhere and a
+    /// torn-down allocation cannot leak accounting data.
+    pub fn pacing_snapshot(&self, now_ms: u64) -> Vec<ConnPacing> {
+        let allocations = self.allocations.read();
+        let mut out = Vec::with_capacity(allocations.len());
+        for alloc in allocations.values() {
+            let a = alloc.read();
+            let rx_gap_ms = a.rx_pacer.take_max_gap();
+            let tx_gap_ms = a.tx_pacer.take_max_gap();
+            out.push(ConnPacing {
+                relayed_addr: a.relayed_addr,
+                client_addr: a.client_addr,
+                username: a.username.clone(),
+                rx_gap_ms,
+                tx_gap_ms,
+                rx: a.rx_pacer.snapshot(now_ms),
+                tx: a.tx_pacer.snapshot(now_ms),
+            });
+        }
+        out
     }
 
     /// Clean up expired allocations and their channel bindings
@@ -1757,6 +1825,7 @@ async fn spawn_allocation_task(
     bandwidth_manager: Arc<crate::bandwidth::BandwidthManager>,
     local_ips: Arc<Vec<Ipv4Addr>>,
     enforce_peer_permissions: bool,
+    rx_pacer: Arc<DirectionPacer>,
 ) -> AllocationRelay {
     let (tx, mut rx) = mpsc::channel::<AllocationMessage>(1024);
 
@@ -1786,6 +1855,14 @@ async fn spawn_allocation_task(
                             // Reset error counter on success
                             consecutive_recv_errors = 0;
                             last_recv_error_at = None;
+
+                            // Arrival pacing (peer→client). Recorded at receipt,
+                            // before any permission/bandwidth filtering, because
+                            // this is what the client's jitter buffer observes.
+                            // The same timestamp feeds the channel-binding touch
+                            // below, so the loop still reads the clock once.
+                            let now_ms = monotonic_ms();
+                            rx_pacer.record(now_ms, len);
 
                             // Normalize BEFORE the permission check: same-server
                             // hairpin packets arrive with one of this host's
@@ -1836,13 +1913,18 @@ async fn spawn_allocation_task(
 
                             // RFC 5766 §10.4: if a channel binding exists for this peer on this
                             // allocation, send ChannelData; otherwise send Data Indication.
-                            let channel_num = channel_table.get_by_peer_for_relayed(&relayed_addr, &effective_peer);
+                            // Resolving the channel and refreshing its activity happen in one
+                            // shared-lock lookup: peer traffic on a bound channel keeps the
+                            // binding alive (same behavior as coturn) without touching the
+                            // server-wide channel table exclusively.
+                            let channel_num = channel_table
+                                .get_by_peer_for_relayed_touching_at(
+                                    &relayed_addr,
+                                    &effective_peer,
+                                    now_ms,
+                                );
 
                             if let Some(ch_num) = channel_num {
-                                // Keep the binding alive: peer traffic on a bound channel
-                                // refreshes its activity timestamp (same behavior as coturn).
-                                channel_table.refresh_binding_for_peer(&relayed_addr, &effective_peer);
-
                                 // Send as ChannelData (single scratch buffer, no per-packet alloc)
                                 use bytes::BufMut;
                                 channel_scratch.clear();
@@ -1993,8 +2075,14 @@ async fn spawn_allocation_task(
                             stats.total_bytes_relayed.fetch_add(n, Ordering::Relaxed);
                             stats.total_messages.fetch_add(1, Ordering::Relaxed);
 
-                            let channel_num =
-                                channel_table.get_by_peer_for_relayed(&relayed_addr, &from_relayed);
+                            let now_ms = monotonic_ms();
+                            rx_pacer.record(now_ms, data.len());
+                            let channel_num = channel_table
+                                .get_by_peer_for_relayed_touching_at(
+                                    &relayed_addr,
+                                    &from_relayed,
+                                    now_ms,
+                                );
                             if let Some(ch_num) = channel_num {
                                 use bytes::BufMut;
                                 channel_scratch.clear();
@@ -2083,37 +2171,119 @@ fn frame_for_tcp(message: &[u8]) -> Vec<u8> {
     framed
 }
 
+type ChannelMap = HashMap<(SocketAddr, u16), Arc<ChannelBinding>>;
+type PeerIndex = HashMap<(SocketAddr, SocketAddr), Arc<ChannelBinding>>;
+
 #[derive(Clone)]
 pub struct ChannelTable {
-    channels: Arc<RwLock<HashMap<(SocketAddr, u16), ChannelBinding>>>,
+    channels: Arc<RwLock<ChannelMap>>,
     /// Secondary index: (relayed_addr, peer_addr) → channel binding, for O(1)
     /// lookup on the per-packet peer→client relay path. Kept consistent with
     /// `channels` by bind/unbind/remove_for_relayed/cleanup_expired.
-    by_peer: Arc<RwLock<HashMap<(SocketAddr, SocketAddr), ChannelBinding>>>,
+    ///
+    /// Both indexes hold the _same_ `Arc<ChannelBinding>`, so an activity
+    /// refresh through either one is visible to the other. (They used to hold
+    /// independent copies, which let `by_peer` expire while `channels` stayed
+    /// alive and silently downgraded long calls to Data Indication.)
+    by_peer: Arc<RwLock<PeerIndex>>,
     next_channel: Arc<std::sync::atomic::AtomicU16>,
     default_lifetime: Duration,
 }
 
-#[derive(Clone)]
 pub struct ChannelBinding {
     pub channel_id: u16,
     pub peer_addr: SocketAddr,
     pub relayed_addr: SocketAddr,
-    pub created_at: Instant,
     pub lifetime: Duration,
+    /// Milliseconds of the last activity on this binding, measured on the
+    /// process-wide monotonic clock (`pacing::monotonic_ms`, the same clock the
+    /// pacing ring uses). Stored as an atomic so the media hot path (`touch`)
+    /// needs only a shared read lock on the table; `ChannelTable::refresh_binding*`
+    /// no longer take a write lock per packet.
+    last_touch_ms: AtomicU64,
+}
+
+/// The two indexes must describe exactly the same set of bindings. They are
+/// always mutated together (under both locks), so a mismatch is a bug — the
+/// 600s Data-Indication downgrade was exactly this class of divergence.
+#[cfg_attr(not(debug_assertions), allow(unused_variables))]
+fn debug_assert_indexes_consistent(channels: &ChannelMap, by_peer: &PeerIndex) {
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(
+        channels.len(),
+        by_peer.len(),
+        "channel index divergence: {} channels vs {} by_peer entries",
+        channels.len(),
+        by_peer.len()
+    );
+}
+
+impl Clone for ChannelBinding {
+    fn clone(&self) -> Self {
+        Self {
+            channel_id: self.channel_id,
+            peer_addr: self.peer_addr,
+            relayed_addr: self.relayed_addr,
+            lifetime: self.lifetime,
+            last_touch_ms: AtomicU64::new(self.last_touch_ms.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl ChannelBinding {
+    fn new(
+        channel_id: u16,
+        peer_addr: SocketAddr,
+        relayed_addr: SocketAddr,
+        lifetime: Duration,
+    ) -> Self {
+        Self {
+            channel_id,
+            peer_addr,
+            relayed_addr,
+            lifetime,
+            last_touch_ms: AtomicU64::new(monotonic_ms()),
+        }
+    }
+
     pub fn is_expired(&self) -> bool {
-        self.created_at.elapsed() > self.lifetime
+        self.is_expired_at(monotonic_ms())
+    }
+
+    fn is_expired_at(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.last_touch_ms.load(Ordering::Relaxed))
+            > self.lifetime.as_millis() as u64
     }
 
     pub fn remaining_lifetime(&self) -> u32 {
-        let elapsed = self.created_at.elapsed();
-        if elapsed >= self.lifetime {
+        let elapsed = monotonic_ms().saturating_sub(self.last_touch_ms.load(Ordering::Relaxed));
+        let lifetime_ms = self.lifetime.as_millis() as u64;
+        if elapsed >= lifetime_ms {
             return 0;
         }
-        (self.lifetime - elapsed).as_secs() as u32
+        ((lifetime_ms - elapsed) / 1000) as u32
+    }
+
+    /// Mark the binding as active. Costs one relaxed store, no table lock.
+    pub fn touch(&self) {
+        self.touch_at(monotonic_ms());
+    }
+
+    fn touch_at(&self, now_ms: u64) {
+        // `fetch_max` keeps a concurrent older timestamp from moving the
+        // activity mark backwards.
+        self.last_touch_ms.fetch_max(now_ms, Ordering::Relaxed);
+    }
+
+    pub fn last_touch_ms(&self) -> u64 {
+        self.last_touch_ms.load(Ordering::Relaxed)
+    }
+
+    /// Unix seconds of the last activity, for persistence snapshots.
+    pub fn last_touch_epoch_secs(&self) -> u64 {
+        let age_secs =
+            monotonic_ms().saturating_sub(self.last_touch_ms.load(Ordering::Relaxed)) / 1000;
+        crate::persist::epoch_secs_now().saturating_sub(age_secs)
     }
 }
 
@@ -2147,22 +2317,21 @@ impl ChannelTable {
         relayed_addr: SocketAddr,
     ) -> Result<(), Error> {
         let key = (relayed_addr, channel_id);
-        let binding = ChannelBinding {
+        let binding = Arc::new(ChannelBinding::new(
             channel_id,
             peer_addr,
             relayed_addr,
-            created_at: Instant::now(),
-            lifetime: self.default_lifetime,
-        };
+            self.default_lifetime,
+        ));
 
         // Lock order is always `channels` then `by_peer`.
         let mut channels = self.channels.write();
         let mut by_peer = self.by_peer.write();
 
-        if let Some(existing) = channels.get_mut(&key) {
+        if let Some(existing) = channels.get(&key) {
             if existing.peer_addr == peer_addr {
-                existing.created_at = Instant::now();
-                // Keep the secondary index in sync with the refreshed binding.
+                existing.touch();
+                // Same `Arc` in both indexes: refreshing one refreshes both.
                 by_peer.insert((relayed_addr, peer_addr), existing.clone());
                 return Ok(());
             }
@@ -2186,19 +2355,47 @@ impl ChannelTable {
         &self,
         relayed_addr: SocketAddr,
         channel_id: u16,
-    ) -> Option<ChannelBinding> {
+    ) -> Option<Arc<ChannelBinding>> {
+        self.channels
+            .read()
+            .get(&(relayed_addr, channel_id))
+            .cloned()
+    }
+
+    /// Look up a binding by channel id and mark it active, under a single
+    /// shared lock. This is the client→peer ChannelData hot path.
+    pub fn get_by_channel_touching(
+        &self,
+        relayed_addr: SocketAddr,
+        channel_id: u16,
+    ) -> Option<Arc<ChannelBinding>> {
+        self.get_by_channel_touching_at(relayed_addr, channel_id, monotonic_ms())
+    }
+
+    /// [`get_by_channel_touching`](Self::get_by_channel_touching) with a caller
+    /// supplied timestamp, so the media loop reads the clock only once per
+    /// packet (the same value feeds the pacing ring).
+    pub fn get_by_channel_touching_at(
+        &self,
+        relayed_addr: SocketAddr,
+        channel_id: u16,
+        now_ms: u64,
+    ) -> Option<Arc<ChannelBinding>> {
         let channels = self.channels.read();
-        channels.get(&(relayed_addr, channel_id)).cloned()
+        let binding = channels.get(&(relayed_addr, channel_id))?;
+        binding.touch_at(now_ms);
+        Some(binding.clone())
     }
 
     /// Refresh the activity timestamp of a channel binding (client→peer
     /// ChannelData path). Active bindings must not expire mid-session just
     /// because the client does not re-issue ChannelBind requests.
+    ///
+    /// O(1) and lock-shared: the timestamp is an atomic inside the binding.
     pub fn refresh_binding(&self, relayed_addr: SocketAddr, channel_id: u16) -> bool {
-        let mut channels = self.channels.write();
-        match channels.get_mut(&(relayed_addr, channel_id)) {
+        match self.channels.read().get(&(relayed_addr, channel_id)) {
             Some(binding) => {
-                binding.created_at = Instant::now();
+                binding.touch();
                 true
             }
             None => false,
@@ -2207,20 +2404,22 @@ impl ChannelTable {
 
     /// Refresh the activity timestamp of the binding for a peer on an
     /// allocation (peer→client relay path).
+    ///
+    /// Used to be an O(N) scan of every channel on the server under a global
+    /// write lock, once per relayed media packet. It now resolves through the
+    /// `by_peer` index and touches the shared `Arc<ChannelBinding>`.
     pub fn refresh_binding_for_peer(
         &self,
         relayed_addr: &SocketAddr,
         peer_addr: &SocketAddr,
     ) -> bool {
-        let mut channels = self.channels.write();
-        let mut refreshed = false;
-        for ((ra, _), binding) in channels.iter_mut() {
-            if ra == relayed_addr && binding.peer_addr == *peer_addr {
-                binding.created_at = Instant::now();
-                refreshed = true;
+        match self.by_peer.read().get(&(*relayed_addr, *peer_addr)) {
+            Some(binding) => {
+                binding.touch();
+                true
             }
+            None => false,
         }
-        refreshed
     }
 
     pub fn get_by_peer(&self, peer_addr: &SocketAddr) -> Option<u16> {
@@ -2246,6 +2445,32 @@ impl ChannelTable {
             .map(|b| b.channel_id)
     }
 
+    /// Resolve the channel for a peer→client packet and mark it active under a
+    /// single shared lock. This is the peer→client media hot path: it replaces
+    /// `get_by_peer_for_relayed` + `refresh_binding_for_peer` (two locks, one of
+    /// them an exclusive global write lock).
+    pub fn get_by_peer_for_relayed_touching(
+        &self,
+        relayed_addr: &SocketAddr,
+        peer_addr: &SocketAddr,
+    ) -> Option<u16> {
+        self.get_by_peer_for_relayed_touching_at(relayed_addr, peer_addr, monotonic_ms())
+    }
+
+    /// [`get_by_peer_for_relayed_touching`](Self::get_by_peer_for_relayed_touching)
+    /// with a caller supplied timestamp (one clock read per packet).
+    pub fn get_by_peer_for_relayed_touching_at(
+        &self,
+        relayed_addr: &SocketAddr,
+        peer_addr: &SocketAddr,
+        now_ms: u64,
+    ) -> Option<u16> {
+        let by_peer = self.by_peer.read();
+        let binding = by_peer.get(&(*relayed_addr, *peer_addr))?;
+        binding.touch_at(now_ms);
+        Some(binding.channel_id)
+    }
+
     pub fn get_relayed_by_peer(&self, peer_addr: &SocketAddr) -> Option<SocketAddr> {
         let channels = self.channels.read();
         for ch in channels.values() {
@@ -2256,7 +2481,7 @@ impl ChannelTable {
         None
     }
 
-    pub fn unbind(&self, relayed_addr: SocketAddr, channel_id: u16) -> Option<ChannelBinding> {
+    pub fn unbind(&self, relayed_addr: SocketAddr, channel_id: u16) -> Option<Arc<ChannelBinding>> {
         let mut channels = self.channels.write();
         let mut by_peer = self.by_peer.write();
         let removed = channels.remove(&(relayed_addr, channel_id));
@@ -2269,7 +2494,6 @@ impl ChannelTable {
     /// Snapshot live channel bindings for persistence. Expired bindings are
     /// skipped.
     pub fn export_bindings(&self) -> Vec<crate::persist::PersistedChannel> {
-        let now_epoch = crate::persist::epoch_secs_now();
         let channels = self.channels.read();
         channels
             .values()
@@ -2278,7 +2502,7 @@ impl ChannelTable {
                 channel_id: b.channel_id,
                 peer_addr: b.peer_addr,
                 relayed_addr: b.relayed_addr,
-                created_at_epoch: crate::persist::epoch_of_instant(b.created_at, now_epoch),
+                created_at_epoch: b.last_touch_epoch_secs(),
                 lifetime_secs: b.lifetime.as_secs(),
             })
             .collect()
@@ -2297,13 +2521,13 @@ impl ChannelTable {
         if age >= saved.lifetime_secs {
             return false;
         }
-        let binding = ChannelBinding {
+        let binding = Arc::new(ChannelBinding {
             channel_id: saved.channel_id,
             peer_addr: saved.peer_addr,
             relayed_addr: saved.relayed_addr,
-            created_at: crate::persist::instant_from_epoch(saved.created_at_epoch, now_epoch),
             lifetime: Duration::from_secs(saved.lifetime_secs),
-        };
+            last_touch_ms: AtomicU64::new(monotonic_ms().saturating_sub(age.saturating_mul(1000))),
+        });
 
         // Lock order is always `channels` then `by_peer` (same as `bind`).
         let mut channels = self.channels.write();
@@ -2350,6 +2574,7 @@ impl ChannelTable {
         let before = channels.len();
         channels.retain(|(ra, _), _| ra != relayed_addr);
         by_peer.retain(|(ra, _), _| ra != relayed_addr);
+        debug_assert_indexes_consistent(&channels, &by_peer);
         before.saturating_sub(channels.len())
     }
 
@@ -2361,12 +2586,21 @@ impl ChannelTable {
         let initial_count = channels.len();
         channels.retain(|_, binding| !binding.is_expired());
         by_peer.retain(|_, binding| !binding.is_expired());
+        debug_assert_indexes_consistent(&channels, &by_peer);
         initial_count.saturating_sub(channels.len())
     }
 
     /// Get the number of active channel bindings
     pub fn len(&self) -> usize {
         self.channels.read().len()
+    }
+
+    /// Number of entries in the secondary `(relayed_addr, peer_addr)` index.
+    ///
+    /// Invariant: this must always equal [`len`](Self::len). Used by tests and
+    /// admin diagnostics to catch one-sided expiry/teardown bugs.
+    pub fn by_peer_len(&self) -> usize {
+        self.by_peer.read().len()
     }
 
     /// Check if there are no channel bindings
@@ -2409,27 +2643,20 @@ mod tests {
     fn test_channel_binding_refreshed_by_activity_does_not_expire() {
         let relayed: SocketAddr = "127.0.0.1:40000".parse().unwrap();
         let peer: SocketAddr = "10.0.0.2:5000".parse().unwrap();
-        let table = ChannelTable::with_lifetime(Duration::from_secs(1));
+        let table = ChannelTable::with_lifetime(Duration::from_millis(30));
         table.bind(0x4000, peer, relayed).unwrap();
 
-        // Simulate an idle period longer than the binding lifetime.
-        {
-            let mut channels = table.channels.write();
-            let binding = channels.get_mut(&(relayed, 0x4000)).unwrap();
-            binding.created_at = Instant::now() - Duration::from_secs(2);
-        }
+        // Idle for longer than the binding lifetime: expired.
+        std::thread::sleep(Duration::from_millis(60));
         assert!(table.get_by_channel(relayed, 0x4000).unwrap().is_expired());
 
         // Client→peer activity refreshes the binding.
         assert!(table.refresh_binding(relayed, 0x4000));
         assert!(!table.get_by_channel(relayed, 0x4000).unwrap().is_expired());
 
-        // Expire again, then refresh via the peer→client path.
-        {
-            let mut channels = table.channels.write();
-            let binding = channels.get_mut(&(relayed, 0x4000)).unwrap();
-            binding.created_at = Instant::now() - Duration::from_secs(2);
-        }
+        // Idle again, then refresh via the peer→client path.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(table.get_by_channel(relayed, 0x4000).unwrap().is_expired());
         assert!(table.refresh_binding_for_peer(&relayed, &peer));
         assert!(!table.get_by_channel(relayed, 0x4000).unwrap().is_expired());
 
@@ -2437,6 +2664,72 @@ mod tests {
         let other_relayed: SocketAddr = "127.0.0.1:40001".parse().unwrap();
         assert!(!table.refresh_binding(other_relayed, 0x4000));
         assert!(!table.refresh_binding_for_peer(&relayed, &"10.0.0.3:5000".parse().unwrap()));
+    }
+
+    /// Regression: a channel kept alive by media traffic must stay in BOTH
+    /// indexes (`channels` + `by_peer`). When per-packet refreshes only updated
+    /// `channels`, `by_peer` expired after one lifetime and the peer→client
+    /// path silently degraded from ChannelData to Data Indication on calls
+    /// longer than the channel lifetime (600s in production).
+    #[test]
+    fn test_long_lived_channel_stays_in_both_indexes() {
+        let relayed: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let table = ChannelTable::with_lifetime(Duration::from_millis(60));
+        table.bind(0x4000, peer, relayed).unwrap();
+
+        // 8 ticks x 20ms = 160ms of sustained traffic, >2.5 lifetimes.
+        for tick in 0..8 {
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(
+                table.refresh_binding_for_peer(&relayed, &peer),
+                "tick {tick}: peer→client activity must refresh the binding"
+            );
+            table.cleanup_expired();
+            assert!(
+                table.get_by_channel(relayed, 0x4000).is_some(),
+                "tick {tick}: channel index lost an active binding"
+            );
+            assert_eq!(
+                table.get_by_peer_for_relayed(&relayed, &peer),
+                Some(0x4000),
+                "tick {tick}: by_peer index lost an active binding \
+                 (downlink would degrade to Data Indication)"
+            );
+        }
+    }
+
+    /// Regression: once traffic stops, both indexes must drop the binding
+    /// together — a one-sided expiry would leak either memory or a stale
+    /// peer→channel mapping.
+    #[test]
+    fn test_cleanup_expires_both_indexes_together() {
+        let relayed: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let table = ChannelTable::with_lifetime(Duration::from_millis(40));
+        table.bind(0x4000, peer, relayed).unwrap();
+        assert_eq!(table.get_by_peer_for_relayed(&relayed, &peer), Some(0x4000));
+
+        std::thread::sleep(Duration::from_millis(90));
+        assert_eq!(table.cleanup_expired(), 1);
+        assert!(table.get_by_channel(relayed, 0x4000).is_none());
+        assert_eq!(table.get_by_peer_for_relayed(&relayed, &peer), None);
+        assert_eq!(table.len(), 0);
+    }
+
+    /// Regression: a refreshed binding must still be removable by
+    /// `remove_for_relayed` (allocation teardown), and both indexes must go.
+    #[test]
+    fn test_remove_for_relayed_after_refresh_clears_both_indexes() {
+        let relayed: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let table = ChannelTable::with_lifetime(Duration::from_secs(600));
+        table.bind(0x4000, peer, relayed).unwrap();
+        assert!(table.refresh_binding_for_peer(&relayed, &peer));
+
+        assert_eq!(table.remove_for_relayed(&relayed), 1);
+        assert!(table.get_by_channel(relayed, 0x4000).is_none());
+        assert_eq!(table.get_by_peer_for_relayed(&relayed, &peer), None);
     }
 
     #[test]
@@ -2725,6 +3018,7 @@ mod tests {
 
         table.bind(0x4000, peer, relayed).unwrap();
         let ch1 = table.get_by_channel(relayed, 0x4000).unwrap();
+        let first_touch = ch1.last_touch_ms();
 
         std::thread::sleep(Duration::from_millis(10));
 
@@ -2732,7 +3026,10 @@ mod tests {
         let ch2 = table.get_by_channel(relayed, 0x4000).unwrap();
 
         assert_eq!(ch2.peer_addr, peer);
-        assert!(ch2.created_at > ch1.created_at);
+        assert!(
+            ch2.last_touch_ms() > first_touch,
+            "re-binding the same peer must refresh the activity timestamp"
+        );
     }
 
     #[test]

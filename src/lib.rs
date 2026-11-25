@@ -8,6 +8,7 @@ pub mod health;
 pub mod message;
 pub mod metrics;
 pub mod oauth;
+pub mod pacing;
 pub mod logfilter;
 pub mod persist;
 pub mod server;
