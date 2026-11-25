@@ -38,5 +38,8 @@ COPY --from=builder /app/static ./static
 COPY --from=builder /app/miuturn.toml ./miuturn.toml
 
 ENV CONFIG=/app/miuturn.toml
+# Log timestamps follow this timezone (RFC 3339 local offset, e.g. +08:00).
+# tzdata is priority:required in Debian so /usr/share/zoneinfo is present.
+ENV TZ=Asia/Shanghai
 
 ENTRYPOINT ["miuturn"]

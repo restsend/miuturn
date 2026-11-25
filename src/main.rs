@@ -8,6 +8,33 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 use tracing_subscriber::Layer as _;
 
+/// RFC 3339 timer for the tracing formatter that prints the OS local time:
+/// `2026-11-25T22:26:14.373899+08:00`. The offset comes from the process
+/// timezone (TZ env var / /etc/localtime), so deployments control it via the
+/// environment instead of a recompile — the Docker image pins
+/// `TZ=Asia/Shanghai`. Falls back to UTC when the offset cannot be
+/// determined.
+struct LocalTime;
+
+impl LocalTime {
+    fn offset() -> time::UtcOffset {
+        time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC)
+    }
+}
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
+    fn format_time(
+        &self,
+        w: &mut tracing_subscriber::fmt::format::Writer<'_>,
+    ) -> std::fmt::Result {
+        let now = time::OffsetDateTime::now_utc().to_offset(Self::offset());
+        match now.format(&time::format_description::well_known::Rfc3339) {
+            Ok(stamped) => w.write_str(&stamped),
+            Err(_) => Err(std::fmt::Error),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config_path = std::env::var("CONFIG").unwrap_or_else(|_| "miuturn.toml".to_string());
@@ -50,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let log_filter = miuturn::logfilter::DynamicLevelFilter::new(&config.log.log_level);
 
     let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_timer(LocalTime)
         .with_writer(writer)
         .with_ansi(config.log.log_file.is_none())
         .with_filter(log_filter.clone());
@@ -93,10 +121,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // to know exactly which binary has been running for how long.
     let build_time = option_env!("MIUTURN_BUILD_TIME").unwrap_or("unknown");
     let started_at = time::OffsetDateTime::now_utc()
+        .to_offset(LocalTime::offset())
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "unknown".into());
     println!(
-        "Version: {} (built {} UTC, git {}, started {} UTC)",
+        "Version: {} (built {} UTC, git {}, started {} local)",
         env!("CARGO_PKG_VERSION"),
         build_time,
         option_env!("MIUTURN_BUILD_GIT").unwrap_or("unknown"),
