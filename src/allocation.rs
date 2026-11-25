@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Fast xorshift64 PRNG for port randomization.
@@ -1503,7 +1503,7 @@ impl AllocationTable {
                     );
                     return None;
                 }
-                if let Err(err) = socket.send_to(data, &peer).await {
+                if let Err(err) = timed_send(&socket, data, &peer, "peer(relay)").await {
                     warn!(
                         %client_addr,
                         %peer,
@@ -1810,6 +1810,61 @@ fn is_fatal_recv_error(kind: io::ErrorKind) -> bool {
     matches!(kind, io::ErrorKind::PermissionDenied)
 }
 
+/// A relay `send_to` that takes at least this long means the kernel socket
+/// send buffer (or the host network path below it) backpressured the caller:
+/// while it lasts, the relay task cannot read its receive socket / drain its
+/// internal-delivery queue, which downstream looks exactly like the rx hole
+/// followed by a catch-up burst that the pacing diagnostics report. Healthy
+/// sends return in microseconds, so the hot path pays one `Instant::now()`
+/// pair per packet and logs nothing.
+const SLOW_SEND_WARN_MS: u128 = 50;
+/// Process-wide rate limit: at most one warn per second even if every send
+/// stalls, with the skipped count attached so the magnitude is still visible.
+const SLOW_SEND_LOG_INTERVAL_MS: u64 = 1_000;
+static SLOW_SEND_STREAK: AtomicU32 = AtomicU32::new(0);
+static SLOW_SEND_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+fn note_slow_send(via: &'static str, to: &SocketAddr, took: Duration) {
+    let streak = SLOW_SEND_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+    let now_ms = monotonic_ms();
+    let last = SLOW_SEND_LAST_LOG_MS.load(Ordering::Relaxed);
+    if last != 0 && now_ms.saturating_sub(last) < SLOW_SEND_LOG_INTERVAL_MS {
+        return;
+    }
+    if SLOW_SEND_LAST_LOG_MS
+        .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        SLOW_SEND_STREAK.store(0, Ordering::Relaxed);
+        warn!(
+            target: "miuturn::pacing",
+            via,
+            to = %to,
+            send_ms = took.as_millis() as u64,
+            slow_sends_since_last_log = streak,
+            "[SEND-STALL] relay send backpressured the forwarding loop"
+        );
+    }
+}
+
+/// Timed wrapper around a relayed `send_to`: zero-cost when the send is fast,
+/// one warn per second (with a streak counter) when the path stalls.
+#[inline]
+async fn timed_send(
+    socket: &UdpSocket,
+    payload: &[u8],
+    to: &SocketAddr,
+    via: &'static str,
+) -> io::Result<()> {
+    let started = Instant::now();
+    let result = socket.send_to(payload, to).await.map(|_| ());
+    let took = started.elapsed();
+    if took.as_millis() >= SLOW_SEND_WARN_MS {
+        note_slow_send(via, to, took);
+    }
+    result
+}
+
 /// Spawn a dedicated task for an allocation to handle relay traffic
 /// This eliminates lock contention by giving each allocation its own processing loop
 #[allow(clippy::too_many_arguments)] // internal plumbing; parameter set mirrors the relay task's context
@@ -1938,7 +1993,9 @@ async fn spawn_allocation_task(
                                     if let Err(e) = tx.try_send(framed) {
                                         warn!(%client_addr, "TCP forward to client failed: {}", e);
                                     }
-                                } else if let Err(e) = main_socket_clone.send_to(&channel_scratch, &client_addr).await {
+                                } else if let Err(e) =
+                                    timed_send(&main_socket_clone, &channel_scratch, &client_addr, "client(main)").await
+                                {
                                     warn!(
                                         %client_addr,
                                         peer = %effective_peer,
@@ -1956,7 +2013,9 @@ async fn spawn_allocation_task(
                                     if let Err(e) = tx.try_send(framed) {
                                         warn!(%client_addr, "TCP Data Indication forward failed: {}", e);
                                     }
-                                } else if let Err(e) = main_socket_clone.send_to(&indication, &client_addr).await {
+                                } else if let Err(e) =
+                                    timed_send(&main_socket_clone, &indication, &client_addr, "client(main)").await
+                                {
                                     warn!(
                                         %client_addr,
                                         peer = %effective_peer,
@@ -2037,7 +2096,7 @@ async fn spawn_allocation_task(
                         }
                         AllocationMessage::ChannelData { data, channel_num: _ } => {
                             // Forward channel data via main socket (not relay socket)
-                            if let Err(e) = main_socket_clone.send_to(&data, &client_addr).await {
+                            if let Err(e) = timed_send(&main_socket_clone, &data, &client_addr, "client(main)").await {
                                 warn!(
                                     %client_addr,
                                     payload_len = data.len(),
@@ -2097,7 +2156,7 @@ async fn spawn_allocation_task(
                                         warn!(%client_addr, "TCP forward to client failed: {}", e);
                                     }
                                 } else if let Err(e) =
-                                    main_socket_clone.send_to(&channel_scratch, &client_addr).await
+                                    timed_send(&main_socket_clone, &channel_scratch, &client_addr, "client(main)").await
                                 {
                                     warn!(
                                         %client_addr,
@@ -2116,7 +2175,7 @@ async fn spawn_allocation_task(
                                         warn!(%client_addr, "TCP Data Indication forward failed: {}", e);
                                     }
                                 } else if let Err(e) =
-                                    main_socket_clone.send_to(&indication, &client_addr).await
+                                    timed_send(&main_socket_clone, &indication, &client_addr, "client(main)").await
                                 {
                                     warn!(
                                         %client_addr,
